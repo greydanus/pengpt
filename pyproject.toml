@@ -1,0 +1,21 @@
+[project]
+name = "pengpt"
+version = "0.1.0"
+description = "A minimal transformer for pen strokes: handwriting generation and friends"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.1",
+    "numpy",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+wandb = ["wandb"]
+dev = ["pytest"]
+
+[tool.setuptools]
+packages = ["pengpt"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"

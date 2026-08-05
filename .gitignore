@@ -1,0 +1,16 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+build/
+dist/
+.venv/
+
+out/
+*.pt
+*.png
+!static/*.png
+data/*.json
+!data/*.json.zip
