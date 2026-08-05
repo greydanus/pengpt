@@ -1,13 +1,21 @@
 """Dataset loading, augmentation, and the PenDataset used for training.
 
-The on-disk format is a JSON list (optionally zipped) of examples:
+On-disk format is a JSON list (optionally zipped) of examples:
 
     {"text": "hello", "points": [[x, y, pen], ...]}
 
-Data collected with collect.html instead carries a ``metadata`` dict
-(``asciiSequence``, ``aspectRatio``); load_examples normalizes both forms.
-Each example is one *word*; training examples are made by stitching together
-random combinations of num_words words.
+Data from collect.html instead carries a metadata dict (asciiSequence,
+aspectRatio); both forms are normalized on load. Each example is one word, and
+training examples pack random words together until the block is full, so a few
+thousand words yield effectively unlimited distinct examples and no example is
+ever truncated mid-word.
+
+On resampling. Point density in raw pen data is often an artifact of capture
+hardware, and resampling to uniform arc length removes it. The bundled bigbank
+data does not need this: collect.html records a point every time the pen has
+moved a fixed distance, so its spacing is already uniform at ~0.011, and
+resampling only discards detail. Hence cfg.spacing defaults to 0. Set it for
+time-sampled sources such as IAM, where density really does vary with speed.
 """
 
 import json
@@ -17,14 +25,13 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from .tokenizer import StrokeTokenizer, CharTokenizer, word_to_offsets
+from .tokenizer import ScribeTokenizer, CharTokenizer, learn_merges
 
-IGNORE_INDEX = -1   # loss is not computed at these target positions
-Y_BASELINE = 0.65   # collect.html canvas baseline, as a fraction of its height
+IGNORE_INDEX = -1
+Y_BASELINE = 0.65
 
 
 def load_examples(path):
-    """Load a dataset file and return a list of {'text', 'points'} dicts."""
     if str(path).endswith(".zip"):
         with zipfile.ZipFile(path) as zf:
             with zf.open(zf.namelist()[0]) as f:
@@ -37,7 +44,7 @@ def load_examples(path):
     for item in raw:
         points = np.array(item["points"], dtype=float)
         meta = item.get("metadata", {})
-        if "aspectRatio" in meta:  # collect.html format: normalize to baseline coords
+        if "aspectRatio" in meta:
             points[:, 0] *= meta["aspectRatio"]
             points[:, 1] -= Y_BASELINE
         points[:, 0] -= points[0, 0]
@@ -47,137 +54,144 @@ def load_examples(path):
     return examples
 
 
-def make_combos(n_bank, n_combos, n_words, rng):
-    """Random index tuples into the word bank; words are stitched lazily."""
-    n_words = min(n_words, n_bank)
-    return [rng.choice(n_bank, size=n_words, replace=False) for _ in range(n_combos)]
+def resample(points, spacing):
+    """Place points at equal distances along each pen-down stroke.
 
-
-def downsample_word(points, fraction, drop_prob, rng):
-    """Remove ~fraction of the points inside each pen-down stroke.
-
-    Stroke endpoints are always kept: losing them creates gaps between strokes
-    that should join. drop_prob adds extra per-point dropout so that a letter's
-    position in the token sequence is decorrelated from its position on paper.
+    It is the path that is sampled uniformly, not the chords: the straight-line
+    distance between consecutive outputs is at most spacing, and less wherever
+    the path curves between them. Pen-up rows are lift markers, not movements,
+    so they pass through untouched.
     """
-    if fraction <= 0:
-        return points
-
-    def thin(stroke):
-        n_keep = max(2, int(len(stroke) * (1 - fraction)))
-        idx = np.linspace(0, len(stroke) - 1, n_keep, dtype=int)
-        kept = [stroke[i] for i in idx]
-        if drop_prob > 0:
-            kept = [p for j, p in enumerate(kept)
-                    if j in (0, len(kept) - 1) or rng.random() > drop_prob]
-        return kept
-
     out, stroke = [], []
+
+    def flush(stroke):
+        s = np.asarray(stroke)
+        if len(s) < 3:
+            return list(s)
+        dist = np.r_[0.0, np.cumsum(np.hypot(*np.diff(s[:, :2], axis=0).T))]
+        if dist[-1] < 1e-9:
+            return [s[0], s[-1]]
+        n = max(2, int(round(dist[-1] / spacing)) + 1)
+        t = np.linspace(0.0, dist[-1], n)
+        return list(np.column_stack([np.interp(t, dist, s[:, 0]),
+                                     np.interp(t, dist, s[:, 1]),
+                                     np.ones(n)]))
+
     for point in points:
         if point[2] == 1:
             stroke.append(point)
         else:
             if stroke:
-                out.extend(thin(stroke))
-                stroke = []
+                out.extend(flush(stroke)); stroke = []
             out.append(point)
     if stroke:
-        out.extend(thin(stroke))
+        out.extend(flush(stroke))
     return np.array(out)
 
 
+def normalize(points, cfg):
+    return resample(points, cfg.spacing) if cfg.spacing > 0 else points
+
+
 def augment_word(points, cfg, rng):
-    """Shear (slant), rescale, and downsample one word. Returns a new array."""
     points = points.copy()
     points[:, 0] += rng.uniform(cfg.shear_min, cfg.shear_max) * points[:, 1]
     points[:, 0] *= rng.uniform(1 - cfg.scale_jitter, 1 + cfg.scale_jitter)
     points[:, 1] *= rng.uniform(1 - cfg.scale_jitter, 1 + cfg.scale_jitter)
-    fraction = cfg.downsample_mean + cfg.downsample_width * (rng.random() - 0.5)
-    return downsample_word(points, fraction, cfg.drop_prob, rng)
+    if cfg.spacing > 0:
+        jitter = rng.uniform(1 - cfg.spacing_jitter, 1 + cfg.spacing_jitter)
+        points = resample(points, cfg.spacing * jitter)
+    return points
 
 
 class PenDataset(Dataset):
-    """Serves (stroke tokens, char context, shifted targets) triples.
 
-    Holds the word bank once and materializes each combo on the fly, so memory
-    stays proportional to the bank rather than to train_size.
-    """
-
-    def __init__(self, bank_points, bank_texts, combos, stroke_tok, char_tok, cfg,
-                 augment=True, name=""):
+    def __init__(self, bank_points, bank_texts, indices, stroke_tok, char_tok, cfg,
+                 length, augment=True, name="", seed=0):
         self.bank_points = bank_points
         self.bank_texts = bank_texts
-        self.combos = combos
+        self.indices = np.asarray(indices)
         self.stroke_tok = stroke_tok
         self.char_tok = char_tok
         self.cfg = cfg
+        self.length = length
         self.augment = augment
         self.name = name
-        self._counter = 0  # varies augmentation when an index repeats
+        self.seed = seed
 
     def __len__(self):
-        return len(self.combos)
+        return self.length
 
-    def text_for(self, idx):
-        return " ".join(self.bank_texts[i] for i in self.combos[idx])
-
-    def encode_points(self, word_points):
-        """List of per-word point arrays -> 1D stroke-token array."""
-        offsets = [word_to_offsets(w, word_points[i - 1] if i > 0 else None)
-                   for i, w in enumerate(word_points)]
-        return self.stroke_tok.encode_words(offsets)
+    def pick_words(self, rng):
+        block = self.cfg.max_seq_length
+        chosen, parts, total = [], [], 0
+        for i in rng.choice(self.indices, size=self.cfg.max_words, replace=False):
+            word = (augment_word(self.bank_points[i], self.cfg, rng) if self.augment
+                    else normalize(self.bank_points[i], self.cfg))
+            tokens = self.stroke_tok.encode_word(word)
+            extra = len(tokens) + (2 if parts else 0)
+            if parts and total + extra > block - 1:
+                break
+            if parts:
+                parts.append(np.array([self.stroke_tok.WORD] * 2, dtype=np.int64))
+            parts.append(tokens)
+            total += extra
+            chosen.append(i)
+        return np.concatenate(parts), " ".join(self.bank_texts[i] for i in chosen)
 
     def __getitem__(self, idx):
-        words = [self.bank_points[i] for i in self.combos[idx]]
-        if self.augment:
-            rng = np.random.default_rng([self.cfg.seed, idx, self._counter])
-            self._counter = (self._counter + 1) % 100_000
-            words = [augment_word(w, self.cfg, rng) for w in words]
-        tokens = self.encode_points(words)
+        rng = np.random.default_rng([self.seed, idx])
+        tokens, text = self.pick_words(rng)
+        st, block = self.stroke_tok, self.cfg.max_seq_length
 
-        st, L = self.stroke_tok, min(len(tokens), self.cfg.max_seq_length - 1)
-        x = torch.full((self.cfg.max_seq_length,), st.PAD, dtype=torch.long)
-        y = torch.full((self.cfg.max_seq_length,), IGNORE_INDEX, dtype=torch.long)
-        x[:L] = torch.from_numpy(tokens[:L])
-        x[L] = st.END
-        y[:L] = x[1:L + 1]  # next-token targets, ending with END; padding is ignored
-
-        c = torch.from_numpy(self.char_tok.encode(self.text_for(idx), self.cfg.max_text_length))
+        x = torch.full((block,), st.PAD, dtype=torch.long)
+        y = torch.full((block,), IGNORE_INDEX, dtype=torch.long)
+        n = min(len(tokens), block - 1)
+        x[:n] = torch.from_numpy(tokens[:n])
+        x[n] = st.END
+        y[:n] = x[1:n + 1]
+        y[n] = st.END
+        c = torch.from_numpy(self.char_tok.encode(text, self.cfg.max_text_length))
         return x, c, y
 
+    def text_for(self, idx):
+        return self.pick_words(np.random.default_rng([self.seed, idx]))[1]
 
-def create_datasets(cfg):
-    """Load the word bank, split it, and build train/test combo datasets."""
+
+def create_datasets(cfg, merges=None):
     examples = load_examples(cfg.dataset)
     bank_points = [e["points"] for e in examples]
     bank_texts = [e["text"] for e in examples]
 
-    # The character vocabulary comes from the data itself.
     alphabet = " " + "".join(sorted(set("".join(bank_texts)) - {" "}))
     char_tok = CharTokenizer(alphabet)
-    stroke_tok = StrokeTokenizer()
 
-    # Hold out whole words (not just combos) so test examples are truly unseen.
     rng = np.random.default_rng(cfg.seed)
     perm = rng.permutation(len(examples))
     n_test = min(1000, max(10, int(0.05 * len(examples))))
     train_ix, test_ix = perm[:-n_test], perm[-n_test:]
 
-    def build(ix, n_combos, augment, name):
-        combos = [ix[c] for c in make_combos(len(ix), n_combos, cfg.num_words, rng)]
-        return PenDataset(bank_points, bank_texts, combos, stroke_tok, char_tok,
-                          cfg, augment=augment and cfg.augment, name=name)
+    if merges is None:
+        base = ScribeTokenizer(grid=cfg.grid)
+        sample = rng.choice(train_ix, size=min(600, len(train_ix)), replace=False)
+        corpus = [base.encode_word(augment_word(bank_points[i], cfg, rng)) for i in sample]
+        merges = learn_merges(corpus, cfg.n_merges)
+        print(f"Learned {len(merges)} BPE merges")
+    stroke_tok = ScribeTokenizer(grid=cfg.grid, merges=merges)
 
-    train_dataset = build(train_ix, cfg.train_size, True, "train")
-    test_dataset = build(test_ix, cfg.test_size, True, "test")
+    def build(ix, n, augment, name, seed):
+        return PenDataset(bank_points, bank_texts, ix, stroke_tok, char_tok, cfg,
+                          length=n, augment=augment and cfg.augment, name=name, seed=seed)
+
+    train_dataset = build(train_ix, cfg.train_size, True, "train", cfg.seed)
+    test_dataset = build(test_ix, cfg.test_size, True, "test", cfg.seed + 1)
     print(f"Word bank: {len(train_ix)} train / {len(test_ix)} test words; "
-          f"{len(train_dataset)} train / {len(test_dataset)} test combos; "
+          f"stroke vocab {stroke_tok.vocab_size}; "
           f"alphabet ({len(alphabet)} chars): {alphabet!r}")
     return train_dataset, test_dataset, stroke_tok, char_tok
 
 
 class InfiniteDataLoader:
-    """A DataLoader that never runs out (random sampling with replacement)."""
 
     def __init__(self, dataset, **kwargs):
         sampler = torch.utils.data.RandomSampler(dataset, replacement=True,

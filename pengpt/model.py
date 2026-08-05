@@ -18,7 +18,7 @@ from .config import ModelConfig
 
 def _split_heads(t, n_head):
     B, T, C = t.shape
-    return t.view(B, T, n_head, C // n_head).transpose(1, 2)  # (B, nh, T, hs)
+    return t.view(B, T, n_head, C // n_head).transpose(1, 2)
 
 
 def _merge_heads(t):
@@ -49,10 +49,10 @@ class CrossAttention(nn.Module):
         self.proj = nn.Linear(cfg.n_embd, cfg.n_embd)
         self.n_head = cfg.n_head
 
-    def forward(self, x, context):
+    def forward(self, x, context, mask=None):
         q = _split_heads(self.q(x), self.n_head)
         k, v = (_split_heads(t, self.n_head) for t in self.kv(context).split(x.size(-1), dim=2))
-        y = F.scaled_dot_product_attention(q, k, v)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         return self.proj(_merge_heads(y))
 
 
@@ -70,9 +70,9 @@ class Block(nn.Module):
             nn.Linear(4 * cfg.n_embd, cfg.n_embd),
         )
 
-    def forward(self, x, context):
+    def forward(self, x, context, ctx_mask=None):
         x = x + self.attn(self.ln1(x))
-        x = x + self.cross_attn(self.ln2(x), context)
+        x = x + self.cross_attn(self.ln2(x), context, ctx_mask)
         x = x + self.mlp(self.ln3(x))
         return x
 
@@ -107,9 +107,10 @@ class PenTransformer(nn.Module):
 
         ctx_pos = torch.arange(context.size(1), device=idx.device)
         c = self.ctx_emb(context) + self.ctx_pos_emb(ctx_pos)
+        ctx_mask = (context != 0)[:, None, None, :] if context.dim() == 2 else None
 
         for block in self.blocks:
-            x = block(x, c)
+            x = block(x, c, ctx_mask)
         logits = self.head(self.ln_f(x))
 
         loss = None
@@ -148,13 +149,14 @@ class PenTransformer(nn.Module):
         return idx
 
 
-def save_checkpoint(path, model, alphabet, data_config, optimizer=None, scheduler=None,
-                    step=None, best_loss=None):
+def save_checkpoint(path, model, alphabet, data_config, merges=None, optimizer=None,
+                    scheduler=None, step=None, best_loss=None):
     checkpoint = {
         "model": model.state_dict(),
         "model_config": asdict(model.cfg),
         "alphabet": alphabet,
         "data_config": data_config,
+        "merges": merges,
         "step": step,
         "best_loss": best_loss,
     }

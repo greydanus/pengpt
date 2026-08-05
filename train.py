@@ -3,9 +3,10 @@
     python train.py --dataset data/bigbank_3500.json.zip --out_dir out
     python train.py --wandb --wandb_entity you --wandb_project pengpt
 
-Defaults reproduce the cursivetransformer paper recipe; see pengpt/config.py.
+See pengpt/config.py for the full set of options and their defaults.
 """
 
+import math
 import os
 import time
 from dataclasses import asdict
@@ -58,8 +59,12 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.learning_rate,
                                   weight_decay=train_cfg.weight_decay,
                                   betas=(0.9, 0.99), eps=1e-8)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=train_cfg.lr_decay_every,
-                                                gamma=train_cfg.lr_decay)
+    def lr_at(step):
+        if step < train_cfg.warmup:
+            return (step + 1) / train_cfg.warmup
+        t = (step - train_cfg.warmup) / max(1, train_cfg.steps - train_cfg.warmup)
+        return 0.5 * (1 + math.cos(math.pi * min(t, 1.0)))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_at)
 
     step, best_loss = 0, None
     if train_cfg.resume:
@@ -112,7 +117,7 @@ def main():
                 best_loss = test_loss
                 print(f"New best test loss; saving checkpoint to {checkpoint_path}")
                 save_checkpoint(checkpoint_path, model, char_tok.alphabet, asdict(data_cfg),
-                                optimizer, scheduler, step, best_loss)
+                                stroke_tok.merges, optimizer, scheduler, step, best_loss)
                 if run:
                     artifact = wandb.Artifact("best_checkpoint", type="model")
                     artifact.add_file(checkpoint_path)

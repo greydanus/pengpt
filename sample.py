@@ -1,9 +1,9 @@
 """Generate handwriting from a trained checkpoint.
 
-    python sample.py --checkpoint out/best.pt --text "The quick brown fox" --out sample.png
+    python sample.py --checkpoint out/best.pt --text "The quick brown fox"
 
-Regenerate specific words (by index, printed with --show_indices) in a second
-pass by re-running with --redo "3,7".
+Regenerate specific words (indices shown with --show_indices) in a second pass
+by re-running with --redo "3,7".
 """
 
 import argparse
@@ -32,19 +32,18 @@ def main():
     device = resolve_device(args.device)
     model, ckpt = load_checkpoint(args.checkpoint, device)
 
-    # Rebuild the dataset for warmup seeds; shrink it since we only need a few.
     data_cfg = DataConfig(**ckpt["data_config"])
-    data_cfg.train_size, data_cfg.test_size = 1000, 100
-    _, dataset, _, char_tok = create_datasets(data_cfg)
+    data_cfg.train_size, data_cfg.test_size = 100, 100
+    _, dataset, _, char_tok = create_datasets(data_cfg, merges=ckpt["merges"])
     assert char_tok.alphabet == ckpt["alphabet"], \
         "dataset alphabet does not match the checkpoint; use the training dataset file"
 
     params = SampleParams(temperature=args.temperature, top_k=args.top_k,
                           do_sample=not args.greedy, n_at_a_time=args.n_at_a_time,
-                          n_context_words=data_cfg.num_words, seed=args.seed)
-    word_offsets = generate_paragraph(model, dataset, args.text, params)
+                          max_tokens=data_cfg.max_seq_length - 1, seed=args.seed)
+    words = generate_paragraph(model, dataset, args.text, params)
 
-    fig, _ = plot_paragraph(word_offsets, args.text, params, show_indices=args.show_indices)
+    fig, _ = plot_paragraph(words, args.text, params, show_indices=args.show_indices)
     fig.savefig(args.out, bbox_inches="tight")
     print(f"Saved {args.out}")
 

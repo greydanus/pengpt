@@ -8,30 +8,28 @@ This is a ground-up rewrite of
 [cursivetransformer](https://github.com/greydanus/cursivetransformer)
 ([paper](https://arxiv.org/abs/2504.00051) ·
 [blog post](https://greydanus.github.io/2025/03/30/cursive-transformer/)),
-keeping the recipe that produced the paper results while making the code
-smaller, cleaner, and easier to point at new datasets.
+rebuilt around a representation that is not specific to one writer or one
+dataset.
 
 ![hero](static/hero.png)
 
 ## Quickstart
 
 ```bash
-git clone <this-repo> && cd pengpt
 pip install -e .          # torch, numpy, matplotlib
 pip install -e ".[dev]"   # + pytest
 pytest tests/             # ~1 second
 ```
 
-Train (defaults reproduce the paper recipe — a few hours on an A100):
+Train:
 
 ```bash
 python train.py --dataset data/bigbank_3500.json.zip --out_dir out
 ```
 
 Sample images and the best checkpoint land in `out/` as training goes. Add
-`--wandb --wandb_entity you --wandb_project pengpt` for Weights & Biases
-logging (optional; everything also logs locally). Resume with
-`--resume out/best.pt`.
+`--wandb --wandb_entity you` for Weights & Biases logging (optional). Resume
+with `--resume out/best.pt`.
 
 Generate handwriting from a trained model:
 
@@ -39,27 +37,63 @@ Generate handwriting from a trained model:
 python sample.py --checkpoint out/best.pt --text "The quick brown fox jumps over the lazy dog"
 ```
 
-If a word comes out misspelled, note its index (`--show_indices`) and
-regenerate just that word from Python with
-`generate_paragraph(..., word_offsets=prev, redo=[3, 7])`.
+If a word comes out misspelled, note its index (`--show_indices`) and regenerate
+just that word with `generate_paragraph(..., words=prev, redo=[3, 7])`.
 
 ## How it works
 
-- **Data**: each example is one handwritten word, an `(N, 3)` array of
-  `(x, y, pen)` points. Training examples are made by stitching random
-  combinations of `num_words` words, which turns a few thousand words into
-  hundreds of thousands of distinct examples.
-- **Tokenization** (`pengpt/tokenizer.py`): points → per-step offsets → polar
-  `(r, theta)` → two tokens per point: a direction token, then a combined
-  (magnitude, pen state) token — "point, then shoot". Words are separated by a
-  pair of `WORD` tokens; sequences end with `END`. Vocabulary: 525 tokens.
-- **Model** (`pengpt/model.py`): a small GPT-style decoder (~420k params at
-  default size) with cross-attention over the character embedding of the text
-  prompt, in the makemore/nanoGPT lineage.
-- **Augmentation** (`pengpt/data.py`): per-word shear (slant), x/y rescaling,
-  and randomized stroke downsampling that always preserves stroke endpoints.
-  The randomized downsampling rate decorrelates letter identity from token
-  position and matters a lot for generalization.
+**Tokenization** (`pengpt/tokenizer.py`) is
+[ScribeTokens](https://arxiv.org/abs/2603.02805). Pen coordinates are quantized
+to an integer grid, and motion becomes a walk on that grid: eight compass
+directions plus `DOWN` and `UP`. Movement between grid points is decomposed with
+Bresenham's line algorithm, so any path is representable by ten base symbols.
+Byte pair encoding then merges recurring runs — a common curve becomes a single
+token — which is what keeps sequences short.
+
+![roundtrip](static/roundtrip.png)
+
+*Grey is the original, red is decoded from tokens. `grid=0.012` is the default.*
+
+**Model** (`pengpt/model.py`): a small GPT-style decoder (~430k params at
+default size) with cross-attention over the character embedding of the text
+prompt, in the makemore/nanoGPT lineage.
+
+**Data** (`pengpt/data.py`): each example is one word, an `(N, 3)` array of
+`(x, y, pen)`. Training examples pack random words together until the block is
+full, so a few thousand words become effectively unlimited examples and nothing
+is ever truncated mid-word.
+
+## Why ScribeTokens
+
+The original used polar `(theta, r)` bins, two tokens per pen point. Measured on
+bigbank_3500, ScribeTokens is better on every axis at once:
+
+| | tokens/word | reconstruction error | bits/pen-point | vocab |
+|---|---|---|---|---|
+| polar bins | 184.8 | 0.0116 | 13.09 | 525 |
+| ScribeTokens | **82.3** | **0.0077** | **5.94** | **148** |
+
+Trained head to head at matched wall clock, ScribeTokens reached **3.43
+bits/pen-point against the polar tokenizer's 7.16** — a 2.1× advantage, while
+running *fewer* optimizer steps. BPE is doing real work here: at equal block
+sizes, 256 merges scored 1.29 against 2.12 with no merges at all.
+
+Two properties matter beyond the numbers:
+
+- **Sampling invariance.** Two recordings of the same shape tokenize
+  identically however densely the hardware sampled them. A mouse, a 100 Hz
+  digitizer, and a preprocessed public dataset all land in one representation,
+  so a single model can train across all of them.
+- **No out-of-vocabulary.** A grid walk always decomposes into base tokens. Bin
+  tables have to be retuned per dataset and silently clip whatever falls
+  outside them.
+
+This also removes machinery the old code needed. Because ScribeTokens encodes
+absolute grid position, words carry their own height and the hardcoded
+`STARTS_AT_BOTTOM` / `STARTS_AT_TOP` character tables — one writer's alphabet,
+meaningless on any other dataset — are gone, along with the inter-word carriage
+jump formula. Generation no longer needs to be seeded with real strokes from the
+training set.
 
 ## Training on your own pen data
 
@@ -69,51 +103,35 @@ The dataset format is a JSON list (optionally zipped), one item per word:
 {"text": "hello", "points": [[0.0, 0.1, 1], [0.01, 0.12, 1], ...]}
 ```
 
-`pen` is 1 while the pen is down; a `pen = 0` point is a move. y grows
-downward, the baseline sits near y = 0, and lowercase letters are roughly
-0.1–0.3 units tall (match the bundled data's scale).
+`pen` is 1 while the pen is down; a `pen = 0` point is a lift. y grows downward,
+the baseline sits near y = 0, and lowercase letters are roughly 0.1–0.3 units
+tall.
 
-- **Collect your own**: open `collect.html` in a browser, write words with a
+- **Collect your own**: open `collect.html` in a browser, write with a
   mouse/trackpad, export JSON. This is how the bundled `bigbank_3500` dataset
   (3,500 words, one author) was made.
-- **Convert existing datasets**: see `pengpt/convert.py` (includes a BRUSH
-  converter and a `--probe` mode for inspecting unknown pickle formats). For
-  sentence-level datasets, train with `--num_words 1` and a larger
-  `--max_text_length`.
-- The character vocabulary is derived from the dataset automatically and
-  stored in the checkpoint.
-
-## What changed vs. cursivetransformer
-
-Same tokenizer bins, architecture shape, and hyperparameters; the differences
-are engineering:
-
-- Attention uses `F.scaled_dot_product_attention` (flash attention) instead of
-  hand-rolled masks — faster and less memory.
-- Loss is masked after the `END` token instead of being computed over padding
-  (~40% of every batch was trivial pad-prediction), and generation stops at
-  `END` instead of always running the full window.
-- Word combos are stored as index tuples and materialized lazily: dataset
-  construction went from ~10 GB of RAM to ~16 MB, and startup from minutes to
-  seconds.
-- Augmentation uses a local `np.random.Generator` instead of reseeding global
-  numpy state per item.
-- wandb is optional, the alphabet is derived from data rather than hardcoded,
-  checkpoints are self-describing (config + alphabet included), and there is a
-  test suite.
+- **Convert existing datasets**: see `pengpt/convert.py`.
+- **Irregular point density?** Set `--spacing 0.02` to resample to uniform arc
+  length. The bundled data does not need this: `collect.html` records a point
+  every time the pen has moved a fixed distance, so its spacing is already
+  uniform at ~0.011 and resampling only discards detail. Time-sampled sources
+  like IAM do need it.
+- The character vocabulary is derived from the data and stored in the
+  checkpoint, along with the BPE merges.
 
 ## Repo map
 
 ```
 pengpt/config.py     dataclass configs + CLI
-pengpt/tokenizer.py  geometry + stroke/char tokenizers
+pengpt/tokenizer.py  ScribeTokens + BPE + char tokenizer
 pengpt/data.py       loading, augmentation, PenDataset
 pengpt/model.py      PenTransformer + checkpoint I/O
 pengpt/sampling.py   generation, paragraph layout, plotting
 pengpt/convert.py    external dataset converters
 train.py, sample.py  CLI entry points
 collect.html         self-contained data collection page
+deprecated/          the previous polar tokenizer
 ```
 
-By Sam Greydanus. Cursive model and dataset from the cursivetransformer
-project with Zachary Wimpee.
+By Sam Greydanus. Cursive model and dataset from the cursivetransformer project
+with Zachary Wimpee.

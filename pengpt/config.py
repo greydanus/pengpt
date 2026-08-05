@@ -10,19 +10,20 @@ from dataclasses import dataclass, fields
 
 @dataclass
 class DataConfig:
-    dataset: str = "data/bigbank_3500.json.zip"  # .json or .json.zip
-    train_size: int = 497_000     # number of generated word-combo examples
+    dataset: str = "data/bigbank_3500.json.zip"
+    train_size: int = 500_000
     test_size: int = 3_000
-    num_words: int = 4            # words stitched together per training example
-    max_seq_length: int = 1050    # stroke tokens per example (2 per pen point)
-    max_text_length: int = 50     # characters of ASCII context
+    max_words: int = 8
+    max_seq_length: int = 512
+    max_text_length: int = 50
+    grid: float = 0.012
+    n_merges: int = 512
     augment: bool = True
-    downsample_mean: float = 0.65  # mean fraction of interior stroke points removed
-    downsample_width: float = 0.10 # width of the uniform jitter on that fraction
-    drop_prob: float = 0.05        # per-point random drop during downsampling
-    shear_min: float = -0.22       # fixed negative shear = consistent italic slant
+    spacing: float = 0.0
+    spacing_jitter: float = 0.20
+    shear_min: float = -0.22
     shear_max: float = -0.18
-    scale_jitter: float = 0.10     # +/- fraction of random x and y rescaling
+    scale_jitter: float = 0.10
     seed: int = 1337
 
 
@@ -31,7 +32,6 @@ class ModelConfig:
     n_layer: int = 5
     n_head: int = 4
     n_embd: int = 64
-    # Derived from the dataset and tokenizers before the model is built:
     vocab_size: int = -1
     block_size: int = -1
     context_vocab_size: int = -1
@@ -43,20 +43,19 @@ DERIVED_FIELDS = {"vocab_size", "block_size", "context_vocab_size", "context_blo
 
 @dataclass
 class TrainConfig:
-    steps: int = 125_000
+    steps: int = 20_000
     batch_size: int = 32
-    learning_rate: float = 1e-2
+    learning_rate: float = 3e-3
     weight_decay: float = 1e-4
-    lr_decay: float = 0.5         # multiply lr by this ...
-    lr_decay_every: int = 20_000  # ... every this many steps
+    warmup: int = 200
     grad_clip: float = 1.0
-    eval_every: int = 2_500       # also saves checkpoints and sample images
+    eval_every: int = 1_000
     print_every: int = 100
     num_workers: int = 4
-    device: str = "auto"          # auto | cuda | mps | cpu
+    device: str = "auto"
     out_dir: str = "out"
-    resume: str = ""              # path to a checkpoint to resume from
-    wandb: bool = False           # optional; local logging always works
+    resume: str = ""
+    wandb: bool = False
     wandb_project: str = "pengpt"
     wandb_entity: str = ""
     wandb_run_name: str = ""
