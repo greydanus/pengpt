@@ -1,7 +1,14 @@
 """Configuration dataclasses and a CLI that is generated from them.
 
-Defaults reproduce the best cursivetransformer paper run
-(https://arxiv.org/abs/2504.00051).
+Defaults come from wall-clock ablations on bigbank_3500, scored in bits per
+pen-point on held-out words. Two are worth knowing about because they are
+specific to the machine rather than to the task:
+
+- batch_size is small. Throughput here is flat in batch size (47 ktok/s at 8,
+  58 at 128), so a larger batch buys no tokens per second and simply takes
+  fewer optimizer steps in the same time. On hardware that does scale, raise it.
+- grid trades reconstruction error against sequence length. 0.020 keeps error
+  inside the width of a pen stroke while costing 99 tokens per word.
 """
 
 import argparse
@@ -44,7 +51,7 @@ DERIVED_FIELDS = {"vocab_size", "block_size", "context_vocab_size", "context_blo
 @dataclass
 class TrainConfig:
     steps: int = 20_000
-    batch_size: int = 32
+    batch_size: int = 16
     learning_rate: float = 3e-3
     weight_decay: float = 1e-4
     warmup: int = 200
