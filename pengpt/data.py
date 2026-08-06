@@ -115,19 +115,16 @@ def resample(points, spacing):
     return np.array(out)
 
 
-def normalize(points, cfg):
-    return resample(points, cfg.spacing) if cfg.spacing > 0 else points
-
-
-def augment_word(points, cfg, rng):
-    points = points.copy()
-    points[:, 0] += rng.uniform(cfg.shear_min, cfg.shear_max) * points[:, 1]
-    points[:, 0] *= rng.uniform(1 - cfg.scale_jitter, 1 + cfg.scale_jitter)
-    points[:, 1] *= rng.uniform(1 - cfg.scale_jitter, 1 + cfg.scale_jitter)
-    if cfg.spacing > 0:
-        jitter = rng.uniform(1 - cfg.spacing_jitter, 1 + cfg.spacing_jitter)
-        points = resample(points, cfg.spacing * jitter)
-    return points
+def prepare_word(points, cfg, rng=None):
+    """Canonicalize one word, augmenting it when an rng is given."""
+    spacing = cfg.spacing
+    if rng is not None:
+        points = points.copy()
+        points[:, 0] += rng.uniform(cfg.shear_min, cfg.shear_max) * points[:, 1]
+        points[:, 0] *= rng.uniform(1 - cfg.scale_jitter, 1 + cfg.scale_jitter)
+        points[:, 1] *= rng.uniform(1 - cfg.scale_jitter, 1 + cfg.scale_jitter)
+        spacing *= rng.uniform(1 - cfg.spacing_jitter, 1 + cfg.spacing_jitter)
+    return resample(points, spacing) if spacing > 0 else points
 
 
 class PenDataset(Dataset):
@@ -160,8 +157,8 @@ class PenDataset(Dataset):
         limit = rng.integers(1, self.cfg.max_words + 1)
         chosen, parts, total = [], [], 0
         for i in rng.choice(self.indices, size=self.cfg.max_words, replace=False)[:limit]:
-            word = (augment_word(self.bank_points[i], self.cfg, rng) if self.augment
-                    else normalize(self.bank_points[i], self.cfg))
+            word = prepare_word(self.bank_points[i], self.cfg,
+                                rng if self.augment else None)
             tokens = self.stroke_tok.encode_word(word)
             extra = len(tokens) + (2 if parts else 0)
             if parts and total + extra > block - 1:
@@ -208,7 +205,7 @@ def create_datasets(cfg, merges=None):
     if merges is None:
         base = ScribeTokenizer(grid=cfg.grid)
         sample = rng.choice(train_ix, size=min(600, len(train_ix)), replace=False)
-        corpus = [base.encode_word(augment_word(bank_points[i], cfg, rng)) for i in sample]
+        corpus = [base.encode_word(prepare_word(bank_points[i], cfg, rng)) for i in sample]
         merges = learn_merges(corpus, cfg.n_merges)
         print(f"Learned {len(merges)} BPE merges")
     stroke_tok = ScribeTokenizer(grid=cfg.grid, merges=merges)

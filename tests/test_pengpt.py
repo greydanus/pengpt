@@ -4,7 +4,7 @@ import torch
 
 from pengpt import (DataConfig, ModelConfig, PenTransformer, PenDataset,
                     ScribeTokenizer, CharTokenizer, learn_merges)
-from pengpt.data import IGNORE_INDEX, augment_word, resample
+from pengpt.data import IGNORE_INDEX, prepare_word, resample
 from pengpt.tokenizer import bresenham_steps, DIRECTIONS, DOWN, UP
 
 
@@ -159,6 +159,19 @@ def test_empty_and_degenerate_input():
     assert len(st.encode_word(pen_up_only)) == 0
     single = np.array([[0.0, 0.0, 1.0]])
     assert len(st.decode(np.concatenate([st.encode_word(single), [st.END]]))) <= 1
+
+
+def test_prepare_word_is_deterministic_and_optional():
+    cfg = DataConfig(spacing=0.0)
+    word = make_word(n=50)
+    plain = prepare_word(word, cfg)
+    assert np.array_equal(plain, word)          # no rng means no change
+
+    a = prepare_word(word, cfg, np.random.default_rng(7))
+    b = prepare_word(word, cfg, np.random.default_rng(7))
+    assert np.array_equal(a, b)                 # same seed, same augmentation
+    assert not np.array_equal(a, word)
+    assert np.array_equal(a[:, 2], word[:, 2])  # pen states untouched
 
 
 def test_char_tokenizer():

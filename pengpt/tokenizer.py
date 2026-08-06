@@ -66,15 +66,7 @@ def bresenham_steps(x0, y0, x1, y1):
 def _walk(grid_xy):
     out = []
     for (x0, y0), (x1, y1) in zip(grid_xy[:-1], grid_xy[1:]):
-        dx, dy = int(x1 - x0), int(y1 - y0)
-        if dx == 0 and dy == 0:
-            continue
-        if dx == 0 or dy == 0 or abs(dx) == abs(dy):
-            n = max(abs(dx), abs(dy))
-            direction = _DIR_LOOKUP[(0 if dx == 0 else (1 if dx > 0 else -1)) + 1,
-                                    (0 if dy == 0 else (1 if dy > 0 else -1)) + 1]
-            out.extend([int(direction)] * n)
-        else:
+        if x0 != x1 or y0 != y1:
             out.extend(int(t) for t in bresenham_steps(x0, y0, x1, y1))
     return out
 
