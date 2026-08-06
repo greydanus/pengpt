@@ -9,7 +9,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from pengpt import DataConfig, create_datasets, load_checkpoint, SampleParams
+from pengpt import SampleParams
+from pengpt.model import load_for_sampling
 from pengpt.sampling import generate, plot_words
 from train import resolve_device
 
@@ -24,10 +25,8 @@ def main():
     args = p.parse_args()
 
     device = resolve_device(args.device)
-    model, ckpt = load_checkpoint(args.checkpoint, device)
-    cfg = DataConfig(**ckpt["data_config"])
-    cfg.train_size, cfg.test_size = 200, 200
-    _, test, stroke_tok, _ = create_datasets(cfg, merges=ckpt["merges"])
+    model, test, cfg, ckpt = load_for_sampling(args.checkpoint, device)
+    stroke_tok = test.stroke_tok
     params = SampleParams(temperature=args.temperature,
                           max_tokens=cfg.max_seq_length - 1)
 

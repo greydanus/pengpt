@@ -175,3 +175,22 @@ def load_checkpoint(path, device="cpu"):
     model.load_state_dict(checkpoint["model"])
     model.to(device)
     return model, checkpoint
+
+
+def load_for_sampling(path, device="cpu", n_examples=200):
+    """Rebuild everything a checkpoint needs to generate: model, dataset, config.
+
+    The dataset comes back because generation reads the tokenizers and the text
+    of held-out examples from it; the BPE merges and alphabet ride along in the
+    checkpoint, so the tokenizer always matches the trained model.
+    """
+    from .config import DataConfig
+    from .data import create_datasets
+
+    model, checkpoint = load_checkpoint(path, device)
+    cfg = DataConfig(**checkpoint["data_config"])
+    cfg.train_size = cfg.test_size = n_examples
+    _, dataset, stroke_tok, char_tok = create_datasets(cfg, merges=checkpoint["merges"])
+    assert char_tok.alphabet == checkpoint["alphabet"], \
+        "dataset alphabet does not match the checkpoint; use the training dataset"
+    return model, dataset, cfg, checkpoint

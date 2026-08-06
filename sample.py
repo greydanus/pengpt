@@ -2,16 +2,14 @@
 
     python sample.py --checkpoint out/best.pt --text "The quick brown fox"
 
-Regenerate specific words (indices shown with --show_indices) in a second pass
-by re-running with --redo "3,7".
+If a word comes out wrong, find its index with --show_indices and regenerate
+just that word: --redo 3,7
 """
 
 import argparse
 
-import torch
-
-from pengpt import (DataConfig, create_datasets, load_checkpoint,
-                    SampleParams, generate_paragraph, plot_paragraph)
+from pengpt import SampleParams, generate_paragraph, plot_paragraph
+from pengpt.model import load_for_sampling
 from train import resolve_device
 
 
@@ -24,24 +22,24 @@ def main():
     p.add_argument("--top_k", type=int, default=None)
     p.add_argument("--greedy", action="store_true")
     p.add_argument("--n_at_a_time", type=int, default=2)
+    p.add_argument("--redo", type=str, default="",
+                   help="comma-separated word indices to regenerate")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--show_indices", action="store_true")
     p.add_argument("--device", type=str, default="auto")
     args = p.parse_args()
 
     device = resolve_device(args.device)
-    model, ckpt = load_checkpoint(args.checkpoint, device)
-
-    data_cfg = DataConfig(**ckpt["data_config"])
-    data_cfg.train_size, data_cfg.test_size = 100, 100
-    _, dataset, _, char_tok = create_datasets(data_cfg, merges=ckpt["merges"])
-    assert char_tok.alphabet == ckpt["alphabet"], \
-        "dataset alphabet does not match the checkpoint; use the training dataset file"
+    model, dataset, cfg, _ = load_for_sampling(args.checkpoint, device, n_examples=100)
 
     params = SampleParams(temperature=args.temperature, top_k=args.top_k,
                           do_sample=not args.greedy, n_at_a_time=args.n_at_a_time,
-                          max_tokens=data_cfg.max_seq_length - 1, seed=args.seed)
+                          max_tokens=cfg.max_seq_length - 1, seed=args.seed)
     words = generate_paragraph(model, dataset, args.text, params)
+    if args.redo:
+        redo = [int(i) for i in args.redo.split(",") if i.strip()]
+        words = generate_paragraph(model, dataset, args.text, params,
+                                   words=words, redo=redo)
 
     fig, _ = plot_paragraph(words, args.text, params, show_indices=args.show_indices)
     fig.savefig(args.out, bbox_inches="tight")
