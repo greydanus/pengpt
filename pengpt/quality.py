@@ -26,14 +26,18 @@ against the judged tiers; the quarter it keeps is 83% good-or-better against a
 48% base rate with none of the 25 judged junk drawings surviving; and it agrees
 with the judge on 86% of pairs two tiers apart but only 71% of adjacent pairs.
 
-Do not train the probe on Quick, Draw!'s own `recognized` flag. It measures
-whether a classifier saw the expected category, not whether the drawing is good,
-and it correlates with judged quality at only +0.10 -- it rejects careful
-full-body cats for not being cat faces.
+Three things were tried and dropped, recorded here so they are not retried:
 
-Geometric features are kept as a fallback for when no vision model is available,
-but they are far weaker: +0.13 against judged quality where CLIP reaches +0.55,
-and they let four of those 25 junk drawings through the cut.
+  - Quick, Draw!'s own `recognized` flag as a training target. It measures
+    whether a classifier saw the expected category, not whether the drawing is
+    good, and agrees with judged quality at only +0.10 -- it rejects careful
+    full-body cats for not being cat faces.
+  - Hand-built stroke geometry (stroke count, ink ratio, coverage) instead of an
+    embedding: +0.13 against judged quality where CLIP reaches +0.55, and it
+    lets four of 25 junk drawings through the cut.
+  - A probe per class rather than one shared probe. It looked better on 90
+    judgements and worse on 210, where car fell from +0.36 shared to +0.18
+    per-class: too few examples per class for 512 dimensions.
 """
 
 JUDGE_RUBRIC = """Order these drawings from best to worst as training examples.
@@ -137,48 +141,6 @@ class Embedder:
         return np.concatenate(out)
 
 
-DinoEmbedder = Embedder
-
-
-def features(points):
-    """Cheap geometric descriptors, for use without a vision model."""
-    points = np.asarray(points, dtype=float)
-    down = points[points[:, 2] == 1]
-    if len(down) < 3:
-        return np.zeros(6)
-
-    spans = _stroke_slices(points[:, 2])
-    extent = max(np.ptp(down[:, 0]), np.ptp(down[:, 1]), 1e-6)
-    lengths = np.array([_arc_length(points[a:b, :2]) for a, b in spans]) if spans else np.zeros(1)
-    ink = lengths.sum()
-
-    grid = np.zeros((8, 8), dtype=bool)
-    ix = np.clip(((down[:, 0] - down[:, 0].min()) / extent * 7).astype(int), 0, 7)
-    iy = np.clip(((down[:, 1] - down[:, 1].min()) / extent * 7).astype(int), 0, 7)
-    grid[ix, iy] = True
-
-    return np.array([
-        len(spans),
-        ink / extent,
-        float((lengths < 0.05 * extent).sum()),
-        grid.mean(),
-        len(down) / max(ink / extent, 1e-6),
-        float(np.ptp(down[:, 0]) / max(np.ptp(down[:, 1]), 1e-6)),
-    ])
-
-
-def _stroke_slices(pen):
-    down = (np.asarray(pen) == 1).astype(np.int8)
-    if not down.any():
-        return []
-    edges = np.diff(np.r_[0, down, 0])
-    return list(zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)))
-
-
-def _arc_length(xy):
-    return float(np.hypot(*np.diff(xy, axis=0).T).sum()) if len(xy) > 1 else 0.0
-
-
 def bradley_terry(n_items, comparisons, iters=300, reg=1e-2, lr=0.1):
     """Latent quality from pairwise wins.
 
@@ -233,40 +195,6 @@ def spearman(a, b):
     ra = np.argsort(np.argsort(np.asarray(a, dtype=float))).astype(float)
     rb = np.argsort(np.argsort(np.asarray(b, dtype=float))).astype(float)
     return float(np.corrcoef(ra, rb)[0, 1])
-
-
-class PerClassProbe:
-    """One probe per class, falling back to a shared probe where data is thin.
-
-    What makes a good cat is not quite what makes a good car, so a probe per
-    class ranks better -- measured +0.66 within class against +0.61 for a single
-    shared probe. The gain is small and needs regularization near alpha=300,
-    because each class probe sees only its own judgements; below `min_per_class`
-    examples the shared probe is the safer estimate.
-    """
-
-    def __init__(self, alpha=300.0, min_per_class=20):
-        self.alpha = alpha
-        self.min_per_class = min_per_class
-        self.shared = None
-        self.probes = {}
-
-    def fit(self, X, scores, labels):
-        X, scores, labels = np.asarray(X), np.asarray(scores), np.asarray(labels)
-        self.shared = LinearProbe(self.alpha).fit(X, scores)
-        for cls in np.unique(labels):
-            idx = np.flatnonzero(labels == cls)
-            if len(idx) >= self.min_per_class:
-                self.probes[cls] = LinearProbe(self.alpha).fit(X[idx], scores[idx])
-        return self
-
-    def score(self, X, labels):
-        X, labels = np.asarray(X), np.asarray(labels)
-        out = np.empty(len(X))
-        for cls in np.unique(labels):
-            idx = np.flatnonzero(labels == cls)
-            out[idx] = self.probes.get(cls, self.shared).score(X[idx])
-        return out
 
 
 def load_probe(path="data/quickdraw_probe.npz"):

@@ -1,22 +1,19 @@
-"""My quality judgements over the 90-drawing sample, as ordered tiers.
+"""The hand judgements the shipped quality probe is calibrated on.
 
-Judged listwise from rendered sheets of 30, the way hkb's reranker works: a
-judge shown many items at once orders them far more cheaply than one shown
-pairs, and the ordering is what Bradley-Terry needs.
+Two samples of Quick, Draw! drawings, ordered into quality tiers by eye from
+rendered sheets: the first 90 in batches of thirty, the second 120 in batches of
+fifteen, which made each comparison more careful. Cross-tier pairs become the
+comparisons Bradley-Terry consumes; see pengpt.quality.
 
-Tiers rather than a strict total order, because judging "is 43 better than 44"
-is noise while "these five are excellent and those five are junk" is reliable.
-Pairwise comparisons are then generated between tiers, which is exactly the
-signal Bradley-Terry consumes.
-
-What I rewarded: a recognizable subject with its parts present and connected --
-a dog with legs and ears, a car with wheels and windows. What I penalized:
-disconnected fragments, drawings that are mostly a single line, and anything
-with words written on it.
+Indices refer to the sampling order recorded when the sheets were rendered, so
+these lists are a record of the judgements rather than something to re-run. The
+criteria are in pengpt.quality.JUDGE_RUBRIC: reward a recognizable subject whose
+parts are present and connected, penalize fragments, near-empty drawings, and
+anything with words written on it.
 """
 
 # best -> worst
-TIERS = [
+SAMPLE_A = [
     # excellent: complete subject, parts present, cleanly drawn
     [0, 21, 28, 6, 9, 55, 34, 78, 67, 60, 32, 38, 45, 87, 83],
     # good: clearly the subject, minor sloppiness
@@ -31,20 +28,37 @@ TIERS = [
     [20, 23, 25, 40, 61, 66, 77],
 ]
 
+SAMPLE_B = [
+    # excellent: complete subject, parts present, cleanly drawn
+    [7, 11, 17, 25, 34, 44, 53, 58, 69, 75, 83, 92, 95, 104, 106, 107, 110, 111,
+     116, 5, 3, 16, 20, 22, 27, 31, 46, 48, 61, 76, 87],
+    # good: clearly the subject, minor sloppiness
+    [0, 1, 6, 9, 10, 15, 21, 23, 26, 30, 32, 33, 40, 41, 45, 50, 52, 55, 56, 57,
+     63, 65, 66, 67, 70, 71, 72, 73, 74, 78, 80, 81, 82, 84, 85, 90, 91, 93, 94,
+     96, 98, 99, 102, 103, 105, 108, 113, 114, 115, 118, 119],
+    # fair: recognizable but crude or incomplete
+    [4, 8, 12, 13, 18, 19, 24, 29, 36, 37, 39, 42, 47, 51, 54, 59, 60, 62, 68,
+     77, 86, 88, 89, 97, 100, 101, 117],
+    # poor: barely a subject, fragmentary
+    [28, 38, 43, 49, 64, 79, 109],
+    # junk: scribble, or words written on the canvas
+    [2, 14, 35, 112],
+]
 
-def comparisons():
-    """Every cross-tier pair, better first."""
+
+def comparisons(tiers):
+    """Every cross-tier pair from one sample, better first."""
     out = []
-    for i, better in enumerate(TIERS):
-        for worse in TIERS[i + 1:]:
+    for i, better in enumerate(tiers):
+        for worse in tiers[i + 1:]:
             for a in better:
                 for b in worse:
                     out.append((a, b))
     return out
 
 
-def tier_of(idx):
-    for t, group in enumerate(TIERS):
-        if idx in group:
+def tier_of(tiers, index):
+    for t, group in enumerate(tiers):
+        if index in group:
             return t
-    raise KeyError(idx)
+    raise KeyError(index)

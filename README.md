@@ -177,6 +177,34 @@ Measured on the bundled cursive, the shear earns its place: removing it costs
 0.79 → 0.95 bits per pen-point even with 37% more optimizer steps. That is a
 statement about this dataset, not about pen data in general.
 
+## Quick, Draw!
+
+[Quick, Draw!](https://github.com/googlecreativelab/quickdraw-dataset) is 50M
+doodles across 345 categories under CC-BY-4.0. Its format is already what pengpt
+expects — strokes with pen lifts at the boundaries — so the converter is thin:
+
+```bash
+python -m pengpt.convert --quickdraw cat.ndjson --out data/cats.json
+python train.py --dataset data/cats.json --max_words 1 --augment general
+```
+
+Much of it is sloppy, and mean quality matters more than raw count, so
+`rank_quickdraw.py` keeps the best fraction of each category:
+
+```bash
+python rank_quickdraw.py --raw_dir qd_raw --out data/top25.jsonl --resume
+```
+
+It renders each drawing, embeds it with CLIP, and scores it with a probe
+calibrated on 210 hand-judged drawings (`pengpt/quality.py`). Held out, the
+quarter it keeps is 83% good-or-better against a 48% base rate, with none of the
+judged junk surviving — a good coarse filter, not a fine ranking. Selection is
+per category so class balance survives, output streams to JSON Lines, and
+`--resume` picks up after a crash.
+
+Throughput is 204 drawings/s here, so the full corpus is about 68 hours; a
+rented GPU does it in one to three, since 92% of the time is CLIP inference.
+
 ## Repo map
 
 ```
@@ -186,11 +214,13 @@ pengpt/data.py       loading, augmentation, PenDataset
 pengpt/model.py      PenTransformer + checkpoint I/O
 pengpt/sampling.py   generation, paragraph layout, plotting
 pengpt/convert.py    external dataset converters
+pengpt/quality.py    rank drawings, to filter a crowd-sourced corpus
 train.py             training loop
 sample.py            write arbitrary text
 iliad.py             write the Iliad opening
 compare.py           real handwriting beside generations
 progress.py          contact sheet of samples over a run
+rank_quickdraw.py    filter Quick, Draw! to its best drawings
 collect.html         self-contained data collection page
 ```
 
