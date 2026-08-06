@@ -22,6 +22,8 @@ import pickle
 
 import numpy as np
 
+from .data import INK_HEIGHT
+
 
 def to_absolute(points):
     """Return absolute (x, y, pen), converting from deltas when they look like it.
@@ -39,7 +41,12 @@ def to_absolute(points):
 
 
 def normalize(points, pen_down_is=1, height_quantile=0.95):
-    """Scale to the bundled data's conventions: x starts at 0, ink ~0.5 tall."""
+    """Scale to the bundled data's conventions: x starts at 0, baseline at y = 0.
+
+    Ink is scaled to INK_HEIGHT because token cost per word is proportional to
+    ink size: a corpus twice as large costs twice the sequence length for the
+    same shapes, and the tokenizer's grid is a fixed distance.
+    """
     points = to_absolute(points)
     if pen_down_is != 1:
         points[:, 2] = 1.0 - points[:, 2]
@@ -48,10 +55,9 @@ def normalize(points, pen_down_is=1, height_quantile=0.95):
         down = points
     height = (np.quantile(down[:, 1], height_quantile)
               - np.quantile(down[:, 1], 1 - height_quantile))
-    scale = 0.5 / max(height, 1e-6)
-    points[:, :2] *= scale
+    points[:, :2] *= INK_HEIGHT / max(height, 1e-6)
     points[:, 0] -= points[0, 0]
-    points[:, 1] -= np.median(down[:, 1])
+    points[:, 1] -= np.quantile(points[points[:, 2] == 1][:, 1], 0.95)
     return points
 
 

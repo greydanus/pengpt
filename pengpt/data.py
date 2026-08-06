@@ -31,6 +31,31 @@ IGNORE_INDEX = -1
 Y_BASELINE = 0.65
 
 
+INK_HEIGHT = 0.22
+
+
+def check_scale(examples, n=200):
+    """Warn if ink is not at the scale a fixed grid assumes.
+
+    Token cost per word is proportional to ink size, so a corpus scaled 2x
+    larger costs 2x the sequence length for the same shapes. Every dataset must
+    arrive normalized to roughly the same height; convert.py does this, and
+    this catches the cases that skipped it.
+    """
+    heights = []
+    for e in examples[:n]:
+        down = e["points"][e["points"][:, 2] == 1]
+        if len(down) > 2:
+            heights.append(np.quantile(down[:, 1], 0.95) - np.quantile(down[:, 1], 0.05))
+    if not heights:
+        return
+    median = float(np.median(heights))
+    if not 0.5 * INK_HEIGHT < median < 2 * INK_HEIGHT:
+        print(f"WARNING: median ink height is {median:.2f}, expected ~{INK_HEIGHT}. "
+              f"Sequences will be ~{median / INK_HEIGHT:.1f}x the usual length; "
+              f"rescale the data or set --grid {0.012 * median / INK_HEIGHT:.4f}")
+
+
 def load_examples(path):
     if str(path).endswith(".zip"):
         with zipfile.ZipFile(path) as zf:
@@ -51,6 +76,7 @@ def load_examples(path):
         text = item.get("text", meta.get("asciiSequence", ""))
         examples.append({"text": text, "points": points})
     print(f"Loaded {len(examples)} examples from {path}")
+    check_scale(examples)
     return examples
 
 
