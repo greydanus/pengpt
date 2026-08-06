@@ -1,35 +1,85 @@
-"""Rank drawings by quality, so a corpus can be filtered to its best fraction.
+"""Rank drawings by quality, so a crowd-sourced corpus can be filtered.
 
-Crowd-sourced drawing corpora are uneven: Quick, Draw! contains careful cats
-next to single scribbles. Keeping only the best few percent means ranking, and
-ranking needs *relative* judgements. Asked to rate drawings 1-5 in isolation, a
-judge puts almost everything at 3, which gives no resolution in the top tail
-where the filtering decision actually happens.
+Quick, Draw! contains careful cats next to single scribbles, and keeping only
+the best quarter means ranking. Ranking needs *relative* judgements: asked to
+rate drawings in isolation a judge puts almost everything in the middle, leaving
+no resolution in the top tail where the filtering decision happens.
 
-So the pipeline is:
+    1. Render a sample of drawings and embed them with a vision model.
+    2. Collect pairwise "which is better" judgements on that sample and fit
+       Bradley-Terry, turning wins and losses into a latent quality score.
+    3. Fit a linear probe from embedding to score. Embedding the rest of the
+       corpus is cheap and needs no further judgements.
 
-  1. Sample a few hundred drawings and collect pairwise "which is better"
-     judgements on them. Any judge works -- a person, a VLM, a classifier.
-  2. Fit Bradley-Terry to those comparisons, turning wins and losses into a
-     latent quality score per drawing.
-  3. Regress those scores onto cheap geometric features, which costs nothing to
-     evaluate. The result scores an entire corpus without further judgements.
+Judging is O(sample) rather than O(corpus), which is what makes this affordable
+at 50M drawings. Filtering is per class so class balance survives.
 
-Step 3 is what makes this affordable: judging is O(sample), not O(corpus).
-Quality is graded, so `select` takes a fraction rather than a threshold.
+Geometric features are kept as a fallback for when no vision model is available;
+they are much weaker (spearman +0.23 against an independent signal) but free.
 """
 
 import numpy as np
 
 
-def features(points):
-    """Cheap geometric descriptors of one trajectory.
+def render(points, px=64, linewidth=1.0):
+    """Draw one trajectory as a square greyscale image.
 
-    Chosen to separate a considered drawing from a scribble without knowing what
-    the subject is: how many strokes it took, how much ink relative to size,
-    whether it is littered with specks, and how much of the bounding box the ink
-    actually visits.
+    64 pixels is enough to tell a considered drawing from a scribble -- above
+    that only the line weight changes -- and small images keep embedding cheap.
     """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from PIL import Image
+    import io
+
+    points = np.asarray(points, dtype=float)
+    fig, ax = plt.subplots(figsize=(px / 100, px / 100), dpi=100)
+    down = points[:, 2] == 1
+    for chunk in np.split(points, np.flatnonzero(~down) + 1):
+        chunk = chunk[chunk[:, 2] == 1]
+        if len(chunk) > 1:
+            ax.plot(chunk[:, 0], -chunk[:, 1], "k-", linewidth=linewidth,
+                    solid_capstyle="round")
+    ax.set_aspect("equal")
+    ax.axis("off")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", pad_inches=0.02,
+                facecolor="white")
+    plt.close(fig)
+    buf.seek(0)
+    return Image.open(buf).convert("RGB").resize((px, px))
+
+
+class DinoEmbedder:
+    """Vision embeddings for rendered drawings."""
+
+    def __init__(self, name="facebook/dinov2-small", device=None, px=64):
+        import torch
+        from transformers import AutoImageProcessor, AutoModel
+        self.torch = torch
+        self.device = device or ("mps" if torch.backends.mps.is_available()
+                                 else "cuda" if torch.cuda.is_available() else "cpu")
+        self.processor = AutoImageProcessor.from_pretrained(name)
+        self.model = AutoModel.from_pretrained(name).to(self.device).eval()
+        self.px = px
+
+    def embed(self, points_list, batch_size=64, verbose=False):
+        images = [render(p, self.px) for p in points_list]
+        out = []
+        with self.torch.inference_mode():
+            for i in range(0, len(images), batch_size):
+                batch = self.processor(images=images[i:i + batch_size],
+                                       return_tensors="pt").to(self.device)
+                out.append(self.model(**batch).pooler_output.float().cpu().numpy())
+                if verbose:
+                    print(f"  embedded {min(i + batch_size, len(images))}/{len(images)}",
+                          flush=True)
+        return np.concatenate(out)
+
+
+def features(points):
+    """Cheap geometric descriptors, for use without a vision model."""
     points = np.asarray(points, dtype=float)
     down = points[points[:, 2] == 1]
     if len(down) < 3:
@@ -40,19 +90,18 @@ def features(points):
     lengths = np.array([_arc_length(points[a:b, :2]) for a, b in spans]) if spans else np.zeros(1)
     ink = lengths.sum()
 
-    # how much of the bounding box the ink visits, on a coarse grid
     grid = np.zeros((8, 8), dtype=bool)
     ix = np.clip(((down[:, 0] - down[:, 0].min()) / extent * 7).astype(int), 0, 7)
     iy = np.clip(((down[:, 1] - down[:, 1].min()) / extent * 7).astype(int), 0, 7)
     grid[ix, iy] = True
 
     return np.array([
-        len(spans),                                  # stroke count
-        ink / extent,                                # ink relative to size
-        float((lengths < 0.05 * extent).sum()),      # speck strokes
-        grid.mean(),                                 # spatial coverage
-        len(down) / max(ink / extent, 1e-6),         # points per unit ink
-        float(np.ptp(down[:, 0]) / max(np.ptp(down[:, 1]), 1e-6)),   # aspect ratio
+        len(spans),
+        ink / extent,
+        float((lengths < 0.05 * extent).sum()),
+        grid.mean(),
+        len(down) / max(ink / extent, 1e-6),
+        float(np.ptp(down[:, 0]) / max(np.ptp(down[:, 1]), 1e-6)),
     ])
 
 
@@ -68,12 +117,12 @@ def _arc_length(xy):
     return float(np.hypot(*np.diff(xy, axis=0).T).sum()) if len(xy) > 1 else 0.0
 
 
-def bradley_terry(n_items, comparisons, iters=200, reg=1e-2):
+def bradley_terry(n_items, comparisons, iters=300, reg=1e-2, lr=0.1):
     """Latent quality from pairwise wins.
 
-    comparisons: iterable of (winner, loser) index pairs. Returns a score per
-    item, standardized, where higher is better. The regularizer keeps items with
-    few or one-sided comparisons from running off to infinity.
+    comparisons: (winner, loser) index pairs. Returns one standardized score per
+    item, higher is better. The regularizer keeps items with few or one-sided
+    comparisons from running away.
     """
     wins = np.zeros(n_items)
     played = np.zeros((n_items, n_items))
@@ -85,46 +134,55 @@ def bradley_terry(n_items, comparisons, iters=200, reg=1e-2):
     scores = np.zeros(n_items)
     for _ in range(iters):
         expected = np.zeros(n_items)
-        for i in range(n_items):
+        for i in np.flatnonzero(played.any(1)):
             partners = np.flatnonzero(played[i])
-            if len(partners) == 0:
-                continue
-            p = 1.0 / (1.0 + np.exp(scores[partners] - scores[i]))
+            p = 1.0 / (1.0 + np.exp(np.clip(scores[partners] - scores[i], -30, 30)))
             expected[i] = (played[i, partners] * p).sum()
-        grad = wins - expected - reg * scores
-        scores += 0.1 * grad
+        scores += lr * (wins - expected - reg * scores)
     return (scores - scores.mean()) / (scores.std() + 1e-9)
 
 
-class QualityScorer:
-    """Learns to predict judged quality from geometry, then scores a whole corpus."""
+class LinearProbe:
+    """Ridge regression from embedding to judged quality."""
 
-    def __init__(self):
-        self.weights = None
-        self.mean = None
-        self.std = None
+    def __init__(self, alpha=1.0):
+        self.alpha = alpha
+        self.weights = self.mean = self.std = None
 
-    def fit(self, points_list, scores):
-        X = np.stack([features(p) for p in points_list])
+    def fit(self, X, scores):
+        X = np.asarray(X, dtype=float)
         self.mean, self.std = X.mean(0), X.std(0) + 1e-9
-        X = np.c_[(X - self.mean) / self.std, np.ones(len(X))]
-        self.weights, *_ = np.linalg.lstsq(X, np.asarray(scores), rcond=None)
+        Z = np.c_[(X - self.mean) / self.std, np.ones(len(X))]
+        A = Z.T @ Z + self.alpha * np.eye(Z.shape[1])
+        self.weights = np.linalg.solve(A, Z.T @ np.asarray(scores, dtype=float))
         return self
 
-    def score(self, points_list):
-        X = np.stack([features(p) for p in points_list])
-        X = np.c_[(X - self.mean) / self.std, np.ones(len(X))]
-        return X @ self.weights
+    def score(self, X):
+        X = np.asarray(X, dtype=float)
+        Z = np.c_[(X - self.mean) / self.std, np.ones(len(X))]
+        return Z @ self.weights
 
-    def agreement(self, points_list, scores):
-        """Spearman correlation with held-out judgements; the honest check."""
-        predicted = self.score(points_list)
-        a = np.argsort(np.argsort(predicted)).astype(float)
-        b = np.argsort(np.argsort(np.asarray(scores))).astype(float)
-        return float(np.corrcoef(a, b)[0, 1])
+    def agreement(self, X, scores):
+        """Spearman against held-out judgements; the number that matters."""
+        return spearman(self.score(X), np.asarray(scores))
 
 
-def select(points_list, scorer, fraction=0.05):
-    """Indices of the best `fraction` of a corpus, best first."""
-    order = np.argsort(scorer.score(points_list))[::-1]
-    return order[:max(1, int(round(fraction * len(order))))]
+def spearman(a, b):
+    ra = np.argsort(np.argsort(np.asarray(a, dtype=float))).astype(float)
+    rb = np.argsort(np.argsort(np.asarray(b, dtype=float))).astype(float)
+    return float(np.corrcoef(ra, rb)[0, 1])
+
+
+def select_per_class(scores, labels, fraction=0.25):
+    """Indices of the best `fraction` within each class, so balance survives.
+
+    Filtering a whole corpus at once would keep whichever classes the scorer
+    happens to rate highly and drop the rest.
+    """
+    scores, labels = np.asarray(scores), np.asarray(labels)
+    keep = []
+    for cls in np.unique(labels):
+        idx = np.flatnonzero(labels == cls)
+        order = idx[np.argsort(scores[idx])[::-1]]
+        keep.append(order[:max(1, int(round(fraction * len(order))))])
+    return np.sort(np.concatenate(keep))
