@@ -18,6 +18,7 @@ resampling only discards detail. Hence cfg.spacing defaults to 0. Set it for
 time-sampled sources such as IAM, where density really does vary with speed.
 """
 
+import gzip
 import json
 import zipfile
 
@@ -60,17 +61,35 @@ def check_scale(examples, grid, n=200):
               f"pass --grid {grid * ratio:.4f} to compensate, or rescale the data.")
 
 
-def load_examples(path):
-    if str(path).endswith(".zip"):
+def _read(path, limit=None):
+    """Yield raw items from .json, .zip, .jsonl, or either of the last gzipped.
+
+    JSON Lines matters at corpus scale: a 12M-drawing array cannot be parsed
+    into memory at once, but one line at a time can, and `limit` then caps how
+    much of a large corpus is used.
+    """
+    path = str(path)
+    if path.endswith(".zip"):
         with zipfile.ZipFile(path) as zf:
             with zf.open(zf.namelist()[0]) as f:
-                raw = json.load(f)
+                yield from json.load(f)
+        return
+    opener = gzip.open if path.endswith(".gz") else open
+    if ".jsonl" in path:
+        with opener(path, "rt") as f:
+            for n, line in enumerate(f):
+                if limit and n >= limit:
+                    return
+                if line.strip():
+                    yield json.loads(line)
     else:
-        with open(path) as f:
-            raw = json.load(f)
+        with opener(path, "rt") as f:
+            yield from json.load(f)
 
+
+def load_examples(path, limit=None):
     examples = []
-    for item in raw:
+    for item in _read(path, limit):
         points = np.array(item["points"], dtype=float)
         meta = item.get("metadata", {})
         if "aspectRatio" in meta:
@@ -206,7 +225,7 @@ class PenDataset(Dataset):
 
 
 def create_datasets(cfg, merges=None):
-    examples = load_examples(cfg.dataset)
+    examples = load_examples(cfg.dataset, getattr(cfg, 'max_examples', 0) or None)
     check_scale(examples, cfg.grid)
     bank_points = [e["points"] for e in examples]
     bank_texts = [e["text"] for e in examples]

@@ -18,6 +18,7 @@ from dataclasses import dataclass, fields
 @dataclass
 class DataConfig:
     dataset: str = "data/bigbank_3500.json.zip"
+    max_examples: int = 0
     train_size: int = 500_000
     test_size: int = 3_000
     max_words: int = 8
