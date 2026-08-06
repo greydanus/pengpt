@@ -15,7 +15,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from pengpt import (parse_configs, create_datasets, InfiniteDataLoader,
-                    PenTransformer, save_checkpoint, load_checkpoint, save_samples)
+                    PenTransformer, save_checkpoint, load_checkpoint, save_samples,
+                    save_progress)
 
 
 def resolve_device(device):
@@ -123,10 +124,14 @@ def main():
                     artifact.add_file(checkpoint_path)
                     run.log_artifact(artifact)
 
-            sample_dir = os.path.join(train_cfg.out_dir, "samples")
-            paths = (save_samples(model, test_dataset, sample_dir, num=6, do_sample=True) +
-                     save_samples(model, test_dataset, sample_dir, num=6, do_sample=False) +
-                     save_samples(model, train_dataset, sample_dir, num=3, do_sample=True))
+            progress = save_progress(model, test_dataset,
+                                     os.path.join(train_cfg.out_dir, "progress"), step)
+            paths = [progress]
+            if step % (train_cfg.eval_every * 4) == 0:
+                paths += save_samples(model, test_dataset,
+                                      os.path.join(train_cfg.out_dir, "samples"),
+                                      num=3, do_sample=True)
+            print(f"  wrote {progress}")
             if run:
                 run.log({os.path.basename(p): wandb.Image(p) for p in paths})
 

@@ -105,7 +105,7 @@ class ScribeTokenizer:
 
     def __init__(self, grid=0.012, merges=None):
         self.grid = grid
-        self.merges = list(merges or [])
+        self.merges = [(int(a), int(b), int(c)) for a, b, c in (merges or [])]
         self._pairs = {(a, b): c for a, b, c in self.merges}
         self._inverse = {c: (a, b) for a, b, c in self.merges}
         n = N_BASE + len(self.merges)

@@ -130,6 +130,44 @@ def generate_paragraph(model, dataset, text, params=None, words=None, redo=None)
     return words
 
 
+PROGRESS_PROMPTS = ["the quick brown", "hope and 2926", "Sing of anger"]
+
+
+def save_progress(model, dataset, out_dir, step, prompts=None, temperature=1.0):
+    """Render the same prompts at every eval, so the strip tracks the model."""
+    prompts = prompts or PROGRESS_PROMPTS
+    st, ct = dataset.stroke_tok, dataset.char_tok
+    device = next(model.parameters()).device
+    os.makedirs(out_dir, exist_ok=True)
+    params = SampleParams(max_tokens=dataset.cfg.max_seq_length - 1)
+
+    torch.manual_seed(0)
+    fig, axes = plt.subplots(1, len(prompts), figsize=(4.2 * len(prompts), 1.4))
+    axes = [axes] if len(prompts) == 1 else axes
+    for ax, text in zip(axes, prompts):
+        context = torch.from_numpy(
+            ct.encode(text, dataset.cfg.max_text_length)).unsqueeze(0).to(device)
+        idx = torch.full((1, 1), st.PAD, dtype=torch.long, device=device)
+        out = model.generate(idx, context, max_new_tokens=params.max_tokens,
+                             temperature=temperature, do_sample=True,
+                             end_token=st.END, pad_token=st.PAD)
+        words = st.decode(out[0].cpu().numpy()[1:])
+        if words:
+            points = np.vstack(layout_words(words, params))
+            pen_down = points[:, 2] == 1
+            for chunk in np.split(points, np.flatnonzero(~pen_down) + 1):
+                chunk = chunk[chunk[:, 2] == 1]
+                if len(chunk) > 1:
+                    ax.plot(chunk[:, 0], -chunk[:, 1], "b-", linewidth=1.3,
+                            solid_capstyle="round")
+        ax.set_aspect("equal"); ax.axis("off")
+        ax.set_title(f'"{text}"', fontsize=8)
+    path = os.path.join(out_dir, f"step_{step:06d}.png")
+    fig.savefig(path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 def save_samples(model, dataset, out_dir=".", num=3, do_sample=True):
     """Generate from test prompts and save one PNG per example."""
     st = dataset.stroke_tok

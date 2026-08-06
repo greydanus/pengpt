@@ -156,9 +156,9 @@ def save_checkpoint(path, model, alphabet, data_config, merges=None, optimizer=N
         "model_config": asdict(model.cfg),
         "alphabet": alphabet,
         "data_config": data_config,
-        "merges": merges,
-        "step": step,
-        "best_loss": best_loss,
+        "merges": [[int(a), int(b), int(c)] for a, b, c in (merges or [])],
+        "step": int(step) if step is not None else None,
+        "best_loss": float(best_loss) if best_loss is not None else None,
     }
     if optimizer is not None:
         checkpoint["optimizer"] = optimizer.state_dict()
