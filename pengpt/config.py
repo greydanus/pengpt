@@ -28,7 +28,7 @@ class DataConfig:
     augment: str = "handwriting"
     spacing: float = 0.0
     spacing_jitter: float = 0.20
-    scale_jitter: float = 0.10
+    scale_jitter: float = 0.15
     rotate: float = 0.0
     shear_min: float = -0.22
     shear_max: float = -0.18
