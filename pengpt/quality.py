@@ -51,10 +51,14 @@ import numpy as np
 
 
 def render(points, px=64, linewidth=1.0):
-    """Draw one trajectory as a square greyscale image.
+    """Draw one trajectory as a square image.
 
-    64 pixels is enough to tell a considered drawing from a scribble -- above
-    that only the line weight changes -- and small images keep embedding cheap.
+    Small and thin wins, which is not obvious: 64px with hairline strokes scores
+    +0.44 against judged quality where the same drawings at linewidth 2.5 score
+    +0.19 and at 4.0 score +0.30. Thick strokes merge a dog's legs and fill in a
+    cat's face, destroying the detail the ranking depends on. Bigger canvases
+    and inverted polarity do not help either, and small images keep embedding
+    cheap.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -80,10 +84,17 @@ def render(points, px=64, linewidth=1.0):
     return Image.open(buf).convert("RGB").resize((px, px))
 
 
-class DinoEmbedder:
-    """Vision embeddings for rendered drawings."""
+class Embedder:
+    """Vision embeddings for rendered drawings.
 
-    def __init__(self, name="facebook/dinov2-small", device=None, px=64):
+    CLIP is the default. Measured against hand-judged tiers it reaches spearman
+    +0.59 where dinov2-small reaches +0.44 and dinov2-base +0.30, which is what
+    you would expect: CLIP's training data is full of line art and clip art,
+    while DINOv2's is photographs.
+    """
+
+    def __init__(self, name="openai/clip-vit-base-patch32", device=None, px=64,
+                 linewidth=1.0):
         import torch
         from transformers import AutoImageProcessor, AutoModel
         self.torch = torch
@@ -91,20 +102,27 @@ class DinoEmbedder:
                                  else "cuda" if torch.cuda.is_available() else "cpu")
         self.processor = AutoImageProcessor.from_pretrained(name)
         self.model = AutoModel.from_pretrained(name).to(self.device).eval()
+        self.is_clip = "clip" in name.lower()
         self.px = px
+        self.linewidth = linewidth
 
     def embed(self, points_list, batch_size=64, verbose=False):
-        images = [render(p, self.px) for p in points_list]
+        images = [render(p, self.px, self.linewidth) for p in points_list]
         out = []
         with self.torch.inference_mode():
             for i in range(0, len(images), batch_size):
                 batch = self.processor(images=images[i:i + batch_size],
                                        return_tensors="pt").to(self.device)
-                out.append(self.model(**batch).pooler_output.float().cpu().numpy())
+                feats = (self.model.get_image_features(**batch) if self.is_clip
+                         else self.model(**batch).pooler_output)
+                out.append(feats.float().cpu().numpy())
                 if verbose:
                     print(f"  embedded {min(i + batch_size, len(images))}/{len(images)}",
                           flush=True)
         return np.concatenate(out)
+
+
+DinoEmbedder = Embedder
 
 
 def features(points):
@@ -202,13 +220,48 @@ def spearman(a, b):
     return float(np.corrcoef(ra, rb)[0, 1])
 
 
+class PerClassProbe:
+    """One probe per class, falling back to a shared probe where data is thin.
+
+    What makes a good cat is not quite what makes a good car, so a probe per
+    class ranks better -- measured +0.66 within class against +0.61 for a single
+    shared probe. The gain is small and needs regularization near alpha=300,
+    because each class probe sees only its own judgements; below `min_per_class`
+    examples the shared probe is the safer estimate.
+    """
+
+    def __init__(self, alpha=300.0, min_per_class=20):
+        self.alpha = alpha
+        self.min_per_class = min_per_class
+        self.shared = None
+        self.probes = {}
+
+    def fit(self, X, scores, labels):
+        X, scores, labels = np.asarray(X), np.asarray(scores), np.asarray(labels)
+        self.shared = LinearProbe(self.alpha).fit(X, scores)
+        for cls in np.unique(labels):
+            idx = np.flatnonzero(labels == cls)
+            if len(idx) >= self.min_per_class:
+                self.probes[cls] = LinearProbe(self.alpha).fit(X[idx], scores[idx])
+        return self
+
+    def score(self, X, labels):
+        X, labels = np.asarray(X), np.asarray(labels)
+        out = np.empty(len(X))
+        for cls in np.unique(labels):
+            idx = np.flatnonzero(labels == cls)
+            out[idx] = self.probes.get(cls, self.shared).score(X[idx])
+        return out
+
+
 def load_probe(path="data/quickdraw_probe.npz"):
     """A probe already calibrated on judged Quick, Draw! drawings.
 
-    Fitted on 90 drawings ordered into quality tiers by hand, embedded with
-    dinov2-small at 64px. Five-fold cross-validation against those tiers gives
-    spearman +0.42, against +0.24 for geometric features. Re-fit rather than
-    reuse this if you change the embedder or the render size.
+    Fitted on 90 drawings ordered into quality tiers by hand, embedded with CLIP
+    at 64px. Held out, it ranks +0.59 against those tiers, and the quarter it
+    keeps is 82% good-or-better against a 48% base rate with none of the judged
+    junk surviving. Re-fit rather than reuse this if you change the embedder or
+    the render settings, which the file records.
     """
     data = np.load(path)
     probe = LinearProbe(alpha=float(data["alpha"]))
