@@ -119,11 +119,24 @@ def resample(points, spacing):
 
 
 def prepare_word(points, cfg, rng=None):
-    """Canonicalize one word, augmenting it when an rng is given."""
+    """Canonicalize one trajectory, augmenting it when an rng is given.
+
+    Augmentations come in two tiers. The general ones -- rescaling, rotation,
+    and jittered resampling -- make sense for any pen data, since a drawing is
+    still the same drawing slightly larger or slightly turned. Shear is
+    handwriting-only: it is always negative, so it imposes an italic slant
+    rather than jittering, and it presumes a baseline to slant about. On a
+    sketch it is a distortion, so cfg.augment selects the tier.
+    """
     spacing = cfg.spacing
-    if rng is not None:
+    if rng is not None and cfg.augment != "none":
         points = points.copy()
-        points[:, 0] += rng.uniform(cfg.shear_min, cfg.shear_max) * points[:, 1]
+        if cfg.augment == "handwriting":
+            points[:, 0] += rng.uniform(cfg.shear_min, cfg.shear_max) * points[:, 1]
+        if cfg.rotate:
+            a = np.deg2rad(rng.uniform(-cfg.rotate, cfg.rotate))
+            c, s = np.cos(a), np.sin(a)
+            points[:, :2] = points[:, :2] @ np.array([[c, s], [-s, c]])
         points[:, 0] *= rng.uniform(1 - cfg.scale_jitter, 1 + cfg.scale_jitter)
         points[:, 1] *= rng.uniform(1 - cfg.scale_jitter, 1 + cfg.scale_jitter)
         spacing *= rng.uniform(1 - cfg.spacing_jitter, 1 + cfg.spacing_jitter)
@@ -214,12 +227,12 @@ def create_datasets(cfg, merges=None):
         print(f"Learned {len(merges)} BPE merges")
     stroke_tok = ScribeTokenizer(grid=cfg.grid, merges=merges)
 
-    def build(ix, n, augment, name, seed):
+    def build(ix, n, name, seed):
         return PenDataset(bank_points, bank_texts, ix, stroke_tok, char_tok, cfg,
-                          length=n, augment=augment and cfg.augment, name=name, seed=seed)
+                          length=n, augment=cfg.augment != "none", name=name, seed=seed)
 
-    train_dataset = build(train_ix, cfg.train_size, True, "train", cfg.seed)
-    test_dataset = build(test_ix, cfg.test_size, True, "test", cfg.seed + 1)
+    train_dataset = build(train_ix, cfg.train_size, "train", cfg.seed)
+    test_dataset = build(test_ix, cfg.test_size, "test", cfg.seed + 1)
     print(f"Word bank: {len(train_ix)} train / {len(test_ix)} test words; "
           f"stroke vocab {stroke_tok.vocab_size}; "
           f"alphabet ({len(alphabet)} chars): {alphabet!r}")

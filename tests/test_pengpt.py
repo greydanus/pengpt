@@ -174,6 +174,39 @@ def test_prepare_word_is_deterministic_and_optional():
     assert np.array_equal(a[:, 2], word[:, 2])  # pen states untouched
 
 
+def test_works_without_word_structure():
+    """Data that is not handwriting: one trajectory per example, no words.
+
+    A sketch or a signature has no word boundaries, so the WORD token and the
+    packing loop must be inert rather than in the way. Nothing here should need
+    a code path of its own -- only max_words=1.
+    """
+    rng = np.random.default_rng(0)
+    t = np.linspace(0, 4 * np.pi, 200)
+    shapes = []
+    for s in range(6):
+        r = np.random.default_rng(s)
+        xy = np.column_stack([np.cos(t) * 0.1 + r.normal(0, 0.005, 200),
+                              np.sin(2 * t) * 0.1 + r.normal(0, 0.005, 200)])
+        pen = np.ones(200); pen[100] = 0
+        shapes.append(np.column_stack([xy, pen]))
+    labels = [f"shape{s}" for s in range(6)]
+
+    cfg = DataConfig(max_seq_length=512, max_words=1, max_text_length=20, grid=0.012)
+    st = ScribeTokenizer(grid=cfg.grid)
+    st = ScribeTokenizer(grid=cfg.grid,
+                         merges=learn_merges([st.encode_word(p) for p in shapes],
+                                             64, min_count=2))
+    ct = CharTokenizer(" " + "".join(sorted(set("".join(labels)) - {" "})))
+    ds = PenDataset(shapes, labels, np.arange(6), st, ct, cfg, length=6,
+                    augment=False, name="sketch")
+
+    x, c, _ = ds[0]
+    assert (x != st.PAD).sum() > 20
+    assert st.WORD not in set(x.tolist())      # no word separators at all
+    assert len(st.decode(x.numpy())) == 1      # one trajectory back
+
+
 def test_char_tokenizer():
     ct = CharTokenizer(" abcdefgh")
     ids = ct.encode("bad cafe", length=12)

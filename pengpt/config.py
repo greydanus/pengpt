@@ -25,12 +25,13 @@ class DataConfig:
     max_text_length: int = 50
     grid: float = 0.020
     n_merges: int = 512
-    augment: bool = True
+    augment: str = "handwriting"
     spacing: float = 0.0
     spacing_jitter: float = 0.20
+    scale_jitter: float = 0.10
+    rotate: float = 0.0
     shear_min: float = -0.22
     shear_max: float = -0.18
-    scale_jitter: float = 0.10
     seed: int = 1337
 
 
@@ -46,6 +47,8 @@ class ModelConfig:
 
 
 DERIVED_FIELDS = {"vocab_size", "block_size", "context_vocab_size", "context_block_size"}
+
+CHOICES = {"augment": ("none", "general", "handwriting")}
 
 
 @dataclass
@@ -79,7 +82,8 @@ def parse_configs(argv=None, description="pengpt"):
                 parser.add_argument(f"--{f.name}", action=argparse.BooleanOptionalAction,
                                     default=f.default)
             else:
-                parser.add_argument(f"--{f.name}", type=type(f.default), default=f.default)
+                parser.add_argument(f"--{f.name}", type=type(f.default),
+                                    default=f.default, choices=CHOICES.get(f.name))
     args = vars(parser.parse_args(argv))
 
     def build(cls):
