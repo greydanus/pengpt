@@ -13,6 +13,14 @@ dataset.
 
 ![hero](static/hero.png)
 
+## Quality over a training run
+
+![progress](static/progress.png)
+
+The same three prompts, rendered at each eval. Stroke control and slant arrive
+almost immediately; spelling follows. All three prompts are correct by step
+10,000, about 25 minutes in, and the rest of the run sharpens the penmanship.
+
 ## Quickstart
 
 ```bash
@@ -107,6 +115,18 @@ absolute grid position, words carry their own height and the hardcoded
 meaningless on any other dataset — are gone, along with the inter-word carriage
 jump formula. Generation no longer needs to be seeded with real strokes from the
 training set.
+
+## Writing a paragraph
+
+```bash
+python iliad.py --checkpoint out/best.pt
+```
+
+![iliad](static/iliad.png)
+
+Long text is generated a few words per model call and laid out with wrapping.
+If a word comes out wrong, find its index with `--show_indices` and regenerate
+only that word with `--redo 3,7`.
 
 ## Training on your own pen data
 
