@@ -30,30 +30,34 @@ from .tokenizer import ScribeTokenizer, CharTokenizer, learn_merges
 IGNORE_INDEX = -1
 Y_BASELINE = 0.65
 
-
 INK_HEIGHT = 0.22
 
 
-def check_scale(examples, n=200):
-    """Warn if ink is not at the scale a fixed grid assumes.
+def ink_height(examples, n=200):
+    """Median vertical extent of the ink, ignoring outliers."""
+    heights = [np.quantile(d[:, 1], 0.95) - np.quantile(d[:, 1], 0.05)
+               for d in (e["points"][e["points"][:, 2] == 1] for e in examples[:n])
+               if len(d) > 2]
+    return float(np.median(heights)) if heights else 0.0
 
-    Token cost per word is proportional to ink size, so a corpus scaled 2x
-    larger costs 2x the sequence length for the same shapes. Every dataset must
-    arrive normalized to roughly the same height; convert.py does this, and
-    this catches the cases that skipped it.
+
+def check_scale(examples, grid, n=200):
+    """Warn when ink size and grid size disagree.
+
+    The grid is a fixed distance, so tokens per example scale with how large the
+    drawing is: the same shapes at twice the size cost twice the sequence. What
+    matters is the ratio of ink size to grid, not either alone. INK_HEIGHT is
+    simply the scale the bundled data happens to use; a dataset at a different
+    scale is fine as long as --grid moves with it.
     """
-    heights = []
-    for e in examples[:n]:
-        down = e["points"][e["points"][:, 2] == 1]
-        if len(down) > 2:
-            heights.append(np.quantile(down[:, 1], 0.95) - np.quantile(down[:, 1], 0.05))
-    if not heights:
+    height = ink_height(examples, n)
+    if height <= 0:
         return
-    median = float(np.median(heights))
-    if not 0.5 * INK_HEIGHT < median < 2 * INK_HEIGHT:
-        print(f"WARNING: median ink height is {median:.2f}, expected ~{INK_HEIGHT}. "
-              f"Sequences will be ~{median / INK_HEIGHT:.1f}x the usual length; "
-              f"rescale the data or set --grid {0.012 * median / INK_HEIGHT:.4f}")
+    ratio = height / INK_HEIGHT
+    if not 0.5 < ratio < 2:
+        print(f"WARNING: ink is {ratio:.1f}x the usual size (height {height:.2f}). "
+              f"Sequences will be about {ratio:.1f}x as long; "
+              f"pass --grid {grid * ratio:.4f} to compensate, or rescale the data.")
 
 
 def load_examples(path):
@@ -76,7 +80,6 @@ def load_examples(path):
         text = item.get("text", meta.get("asciiSequence", ""))
         examples.append({"text": text, "points": points})
     print(f"Loaded {len(examples)} examples from {path}")
-    check_scale(examples)
     return examples
 
 
@@ -191,6 +194,7 @@ class PenDataset(Dataset):
 
 def create_datasets(cfg, merges=None):
     examples = load_examples(cfg.dataset)
+    check_scale(examples, cfg.grid)
     bank_points = [e["points"] for e in examples]
     bank_texts = [e["text"] for e in examples]
 
