@@ -13,11 +13,14 @@ Movement between grid points is decomposed with Bresenham's line algorithm, so
 any path is representable. Byte pair encoding then merges recurring runs, which
 is what makes sequences short.
 
-Two properties matter. Sampling invariance: two recordings of the same shape
-tokenize identically however densely the hardware sampled them, so a mouse, a
-digitizer and a public dataset all land in one representation. No
-out-of-vocabulary: a grid walk always decomposes into base tokens, unlike bin
-tables that must be retuned per dataset and silently clip outliers.
+Two properties matter. Insensitivity to sampling rate: recording the same shape
+more finely barely changes the tokens, and changes them not at all once samples
+land in adjacent grid cells, since both recordings then walk the same cells and
+Bresenham has no gap to bridge. Point density in raw pen data is an artifact of
+the recorder, so this is what lets a mouse, a digitizer and a public dataset
+share one representation. No out-of-vocabulary: a grid walk always decomposes
+into base tokens, unlike bin tables that must be retuned per dataset and
+silently clip outliers.
 
 A word is an (N, 3) array of (x, y, pen); pen == 1 while touching the paper, and
 rows with pen == 0 mark a lift, so strokes are the maximal runs of pen == 1.

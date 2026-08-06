@@ -92,6 +92,75 @@ def test_word_separation_and_end():
     assert len(st.decode(tokens)) == 3
 
 
+def curve(n, freq=3.0, amp=0.2):
+    t = np.linspace(0, 1, n)
+    return np.column_stack([t, amp * np.sin(freq * t), np.ones(n)])
+
+
+def test_sampling_invariance_when_samples_do_not_skip_cells():
+    """Identical tokens for two samplings of one shape.
+
+    Invariance requires consecutive samples to land in the same or an adjacent
+    grid cell. Then both recordings walk the same cells in the same order and
+    Bresenham has no gap to bridge. Sampling more finely than that changes
+    nothing, which is the property that lets one model see data from recorders
+    of different rates.
+    """
+    st = ScribeTokenizer(grid=0.05)
+    t = np.linspace(0, 1, 120)
+    at_cell_scale = np.column_stack([t, 0.5 * t, np.ones(len(t))])
+    t2 = np.linspace(0, 1, 1200)
+    ten_times_denser = np.column_stack([t2, 0.5 * t2, np.ones(len(t2))])
+    assert np.array_equal(st.encode_word(at_cell_scale),
+                          st.encode_word(ten_times_denser))
+
+
+def test_sampling_density_changes_tokens_when_grid_is_fine():
+    """The converse, pinned down so the limit is not forgotten."""
+    st = ScribeTokenizer(grid=0.008)
+    assert not np.array_equal(st.encode_word(curve(60)), st.encode_word(curve(600)))
+
+
+def test_sampling_density_stays_close_at_the_default_grid():
+    """Even without exact invariance, both encodings track the same curve."""
+    st = ScribeTokenizer(grid=0.012)
+    a = st.decode(np.concatenate([st.encode_word(curve(60)), [st.END]]))[0]
+    b = st.decode(np.concatenate([st.encode_word(curve(600)), [st.END]]))[0]
+    a, b = a[a[:, 2] == 1][:, :2], b[b[:, 2] == 1][:, :2]
+    d = np.hypot(a[:, None, 0] - b[None, :, 0], a[:, None, 1] - b[None, :, 1])
+    assert 0.5 * (d.min(1).mean() + d.min(0).mean()) < 2 * st.grid
+
+
+def test_scale_changes_token_count_proportionally():
+    """Token cost tracks ink size, which is why datasets must be normalized."""
+    st = ScribeTokenizer(grid=0.01)
+    word = make_word(n=60)
+    small = len(st.encode_word(word * np.array([1.0, 1.0, 1.0])))
+    large = len(st.encode_word(word * np.array([2.0, 2.0, 1.0])))
+    assert 1.6 * small < large < 2.5 * small
+
+
+def test_decode_survives_random_tokens():
+    """Model output early in training is noise; decoding must not raise."""
+    st = ScribeTokenizer(grid=0.01)
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        junk = rng.integers(0, st.vocab_size, size=rng.integers(1, 200))
+        words = st.decode(junk)
+        assert isinstance(words, list)
+        for w in words:
+            assert w.ndim == 2 and w.shape[1] == 3
+
+
+def test_empty_and_degenerate_input():
+    st = ScribeTokenizer(grid=0.01)
+    assert len(st.encode_word(np.zeros((0, 3)))) == 0
+    pen_up_only = np.array([[0.0, 0.0, 0.0], [0.1, 0.1, 0.0]])
+    assert len(st.encode_word(pen_up_only)) == 0
+    single = np.array([[0.0, 0.0, 1.0]])
+    assert len(st.decode(np.concatenate([st.encode_word(single), [st.END]]))) <= 1
+
+
 def test_char_tokenizer():
     ct = CharTokenizer(" abcdefgh")
     ids = ct.encode("bad cafe", length=12)

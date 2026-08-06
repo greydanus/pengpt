@@ -80,10 +80,14 @@ sizes, 256 merges scored 1.29 against 2.12 with no merges at all.
 
 Two properties matter beyond the numbers:
 
-- **Sampling invariance.** Two recordings of the same shape tokenize
-  identically however densely the hardware sampled them. A mouse, a 100 Hz
-  digitizer, and a preprocessed public dataset all land in one representation,
-  so a single model can train across all of them.
+- **Insensitivity to sampling rate.** Recording the same shape more finely
+  changes the tokens little, and changes them not at all once samples are
+  dense enough to land in adjacent grid cells. Point density in raw pen data is
+  an artifact of the recorder, so a mouse, a 100 Hz digitizer, and a
+  preprocessed public dataset land in nearly the same representation. Measured
+  at the default grid, two samplings of one curve reconstruct to within two
+  grid cells of each other; exact token equality needs a coarser grid than the
+  default.
 - **No out-of-vocabulary.** A grid walk always decomposes into base tokens. Bin
   tables have to be retuned per dataset and silently clip whatever falls
   outside them.
