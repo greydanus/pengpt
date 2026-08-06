@@ -6,16 +6,45 @@ rate drawings in isolation a judge puts almost everything in the middle, leaving
 no resolution in the top tail where the filtering decision happens.
 
     1. Render a sample of drawings and embed them with a vision model.
-    2. Collect pairwise "which is better" judgements on that sample and fit
-       Bradley-Terry, turning wins and losses into a latent quality score.
+    2. Have a judge order that sample, and fit Bradley-Terry to the resulting
+       comparisons, turning wins and losses into a latent quality score.
     3. Fit a linear probe from embedding to score. Embedding the rest of the
        corpus is cheap and needs no further judgements.
 
 Judging is O(sample) rather than O(corpus), which is what makes this affordable
 at 50M drawings. Filtering is per class so class balance survives.
 
+Show a judge many drawings at once and ask for an ordering, rather than asking
+about pairs: one call orders thirty items where pairwise needs hundreds. Coarse
+tiers beat a strict total order, since "these five are excellent and those five
+are junk" is reliable where "is #43 better than #44" is noise. JUDGE_RUBRIC is
+the criteria those judgements should follow.
+
+Do not train the probe on Quick, Draw!'s own `recognized` flag. It measures
+whether a classifier saw the expected category, not whether the drawing is good,
+and it correlates with human quality judgements at only +0.10 -- it rejects
+careful full-body cats for not being cat faces.
+
 Geometric features are kept as a fallback for when no vision model is available;
-they are much weaker (spearman +0.23 against an independent signal) but free.
+they are much weaker (+0.24 against judged quality, against +0.42 for DINOv2).
+"""
+
+JUDGE_RUBRIC = """Order these drawings from best to worst as training examples.
+
+Reward: the subject is recognizable, its parts are present and connected (a dog
+with legs and ears, a car with wheels and windows), and the strokes are
+deliberate.
+
+Penalize, hardest first:
+  - any drawing with letters or words written on it, however neat the rest is
+  - scribbles, and drawings that are one line or a few disconnected fragments
+  - missing essential parts, so the subject is only guessable from the label
+
+Words on the canvas need to be called out explicitly like this. A vision
+embedding ranks such drawings anywhere from the 22nd to the 76th percentile,
+because a cat with "MEOW" written over it still looks largely like a cat, and a
+stroke-geometry rule that catches them flags a fifth of clean drawings too. The
+judge is the only reliable filter for writing, so the rubric has to ask.
 """
 
 import numpy as np
@@ -171,6 +200,20 @@ def spearman(a, b):
     ra = np.argsort(np.argsort(np.asarray(a, dtype=float))).astype(float)
     rb = np.argsort(np.argsort(np.asarray(b, dtype=float))).astype(float)
     return float(np.corrcoef(ra, rb)[0, 1])
+
+
+def load_probe(path="data/quickdraw_probe.npz"):
+    """A probe already calibrated on judged Quick, Draw! drawings.
+
+    Fitted on 90 drawings ordered into quality tiers by hand, embedded with
+    dinov2-small at 64px. Five-fold cross-validation against those tiers gives
+    spearman +0.42, against +0.24 for geometric features. Re-fit rather than
+    reuse this if you change the embedder or the render size.
+    """
+    data = np.load(path)
+    probe = LinearProbe(alpha=float(data["alpha"]))
+    probe.weights, probe.mean, probe.std = data["weights"], data["mean"], data["std"]
+    return probe
 
 
 def select_per_class(scores, labels, fraction=0.25):
