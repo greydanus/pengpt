@@ -6,7 +6,7 @@ per-word point arrays, and `draw` puts point arrays on a matplotlib axis.
 
 import os
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -116,10 +116,19 @@ def plot_paragraph(words, text="", params=None, figsize=(12, 8), dpi=200,
 def generate_paragraph(model, dataset, text, params=None, words=None, redo=None):
     """Generate a paragraph, n_at_a_time words per model call.
 
+    Words are generated in small groups because neighbours act as context: a
+    group of two to four recovers every word, while asking for six overflows the
+    block and silently drops about half of them.
+
     Pass a previous result as `words` plus indices as `redo` to regenerate only
     the words that came out wrong.
     """
     params = params or SampleParams()
+    fits = max(1, (params.max_tokens - 1) // 120)
+    if params.n_at_a_time > fits:
+        print(f"  n_at_a_time={params.n_at_a_time} likely overflows a "
+              f"{params.max_tokens}-token block; using {fits}")
+        params = replace(params, n_at_a_time=fits)
     torch.manual_seed(params.seed)
     prompt_words = text.strip().split()
 
