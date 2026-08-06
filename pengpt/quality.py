@@ -104,7 +104,7 @@ class Embedder:
     """
 
     def __init__(self, name="openai/clip-vit-base-patch32", device=None, px=64,
-                 linewidth=1.0):
+                 linewidth=1.0, fp16=False):
         import torch
         from transformers import AutoImageProcessor, AutoModel
         self.torch = torch
@@ -113,6 +113,9 @@ class Embedder:
         self.processor = AutoImageProcessor.from_pretrained(name)
         self.model = AutoModel.from_pretrained(name).to(self.device).eval()
         self.is_clip = "clip" in name.lower()
+        self.fp16 = fp16 and self.device != "cpu"
+        if self.fp16:
+            self.model = self.model.half()
         self.px = px
         self.linewidth = linewidth
 
@@ -123,6 +126,8 @@ class Embedder:
             for i in range(0, len(images), batch_size):
                 batch = self.processor(images=images[i:i + batch_size],
                                        return_tensors="pt").to(self.device)
+                if self.fp16:
+                    batch["pixel_values"] = batch["pixel_values"].half()
                 feats = (self.model.get_image_features(**batch) if self.is_clip
                          else self.model(**batch).pooler_output)
                 out.append(feats.float().cpu().numpy())
