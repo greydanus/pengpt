@@ -105,6 +105,9 @@ def main():
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True,
                    help="half precision embedding; 1.7x faster, same ranking")
+    p.add_argument("--workers", type=int, default=0,
+                   help="processes rendering batches ahead of the GPU; "
+                        "0 picks a default from the device")
     p.add_argument("--resume", action="store_true",
                    help="skip categories already present in the output")
     p.add_argument("--overwrite", action="store_true",
@@ -115,7 +118,9 @@ def main():
 
     settings = np.load(args.probe)
     embedder = Embedder(name=str(settings["embedder"]), px=int(settings["px"]),
-                        linewidth=float(settings["linewidth"]), fp16=args.fp16)
+                        linewidth=float(settings["linewidth"]), fp16=args.fp16,
+                        workers=args.workers)
+    print(f"{embedder.device}, fp16={embedder.fp16}, {embedder.workers} render workers")
     probe = load_probe(args.probe)
 
     paths = sorted(glob.glob(os.path.join(args.raw_dir, "*.ndjson")))
@@ -167,6 +172,7 @@ def main():
     if done:
         print(f"plus {len(done)} categories from an earlier run")
     print(f"-> {args.out}")
+    embedder.close()
 
     if args.to_json:
         target = os.path.splitext(args.out)[0] + ".json"

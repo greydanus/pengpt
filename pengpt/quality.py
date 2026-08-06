@@ -98,6 +98,34 @@ def render(points, px=64, linewidth=2, supersample=8, pad=2):
     return image.resize((px, px), Image.LANCZOS).convert("RGB")
 
 
+_WORKER = {}
+
+
+def _default_workers(device):
+    """Workers only where the GPU actually outruns one CPU core.
+
+    Measured: an H100 runs the model at ~25k images/s while a core renders and
+    normalizes at ~700, so it needs feeding. MPS runs it at ~400, which one core
+    already keeps up with, and there the pool costs more in start-up and
+    pickling than it returns -- 260 images/s becomes 94.
+    """
+    import os
+    if device != "cuda":
+        return 1
+    return max(1, min(16, (os.cpu_count() or 4) - 2))
+
+
+def _init_worker(name, px, linewidth):
+    from transformers import AutoImageProcessor
+    _WORKER["processor"] = AutoImageProcessor.from_pretrained(name)
+    _WORKER["px"], _WORKER["linewidth"] = px, linewidth
+
+
+def _prepare_worker(chunk):
+    images = [render(p, _WORKER["px"], _WORKER["linewidth"]) for p in chunk]
+    return _WORKER["processor"](images=images, return_tensors="pt")["pixel_values"]
+
+
 class Embedder:
     """Vision embeddings for rendered drawings.
 
@@ -108,12 +136,14 @@ class Embedder:
     """
 
     def __init__(self, name="openai/clip-vit-base-patch32", device=None, px=64,
-                 linewidth=1.0, fp16=False):
+                 linewidth=1.0, fp16=False, workers=0):
         import torch
         from transformers import AutoImageProcessor, AutoModel
         self.torch = torch
-        self.device = device or ("mps" if torch.backends.mps.is_available()
-                                 else "cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or ("cuda" if torch.cuda.is_available()
+                                 else "mps" if torch.backends.mps.is_available()
+                                 else "cpu")
+        self.name = name
         self.processor = AutoImageProcessor.from_pretrained(name)
         self.model = AutoModel.from_pretrained(name).to(self.device).eval()
         self.is_clip = "clip" in name.lower()
@@ -122,23 +152,63 @@ class Embedder:
             self.model = self.model.half()
         self.px = px
         self.linewidth = linewidth
+        self.workers = workers if workers else _default_workers(self.device)
+        self._pool = None
 
-    def embed(self, points_list, batch_size=64, verbose=False):
-        images = [render(p, self.px, self.linewidth) for p in points_list]
+    def embed(self, points_list, batch_size=256, verbose=False):
+        """Embed drawings, preparing batches on worker processes.
+
+        On a fast GPU the bottleneck is entirely CPU-side: an H100 runs the
+        model at ~25k images/s while one core renders at ~900/s and the
+        processor normalizes at ~700/s. Workers do both, so the GPU sees a
+        queue rather than one core feeding it.
+        """
         out = []
         with self.torch.inference_mode():
-            for i in range(0, len(images), batch_size):
-                batch = self.processor(images=images[i:i + batch_size],
-                                       return_tensors="pt").to(self.device)
+            for pixels, n in self._batches(points_list, batch_size):
+                pixels = pixels.to(self.device, non_blocking=True)
                 if self.fp16:
-                    batch["pixel_values"] = batch["pixel_values"].half()
-                feats = (self.model.get_image_features(**batch) if self.is_clip
-                         else self.model(**batch).pooler_output)
+                    pixels = pixels.half()
+                feats = (self.model.get_image_features(pixel_values=pixels)
+                         if self.is_clip else self.model(pixel_values=pixels))
+                # transformers 5 returns an output object where 4 returned a
+                # tensor, and non-CLIP models pool separately
+                if not hasattr(feats, "float"):
+                    feats = getattr(feats, "image_embeds", None) or feats.pooler_output
                 out.append(feats.float().cpu().numpy())
                 if verbose:
-                    print(f"  embedded {min(i + batch_size, len(images))}/{len(images)}",
-                          flush=True)
-        return np.concatenate(out)
+                    print(f"  embedded {n}", flush=True)
+        return np.concatenate(out) if out else np.zeros((0, 1))
+
+    def _batches(self, points_list, batch_size):
+        """Yield (pixel_values, count) batches, rendered and normalized ahead.
+
+        The pool is created once and reused, since a caller scoring a corpus
+        calls embed() per chunk and paying process start-up each time would
+        cost more than the parallelism returns.
+        """
+        chunks = [points_list[i:i + batch_size]
+                  for i in range(0, len(points_list), batch_size)]
+        if self.workers <= 1 or len(chunks) <= 1:
+            for chunk in chunks:
+                yield self._prepare(chunk), len(chunk)
+            return
+        if self._pool is None:
+            from concurrent.futures import ProcessPoolExecutor
+            self._pool = ProcessPoolExecutor(
+                self.workers, initializer=_init_worker,
+                initargs=(self.name, self.px, self.linewidth))
+        for pixels in self._pool.map(_prepare_worker, chunks, chunksize=1):
+            yield pixels, len(pixels)
+
+    def close(self):
+        if self._pool is not None:
+            self._pool.shutdown()
+            self._pool = None
+
+    def _prepare(self, chunk):
+        images = [render(p, self.px, self.linewidth) for p in chunk]
+        return self.processor(images=images, return_tensors="pt")["pixel_values"]
 
 
 def bradley_terry(n_items, comparisons, iters=300, reg=1e-2, lr=0.1):
