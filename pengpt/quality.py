@@ -14,19 +14,26 @@ no resolution in the top tail where the filtering decision happens.
 Judging is O(sample) rather than O(corpus), which is what makes this affordable
 at 50M drawings. Filtering is per class so class balance survives.
 
-Show a judge many drawings at once and ask for an ordering, rather than asking
-about pairs: one call orders thirty items where pairwise needs hundreds. Coarse
-tiers beat a strict total order, since "these five are excellent and those five
-are junk" is reliable where "is #43 better than #44" is noise. JUDGE_RUBRIC is
-the criteria those judgements should follow.
+Show a judge fifteen drawings at once and ask for an ordering, rather than
+asking about pairs: one look orders the batch where pairwise needs hundreds of
+questions. Coarse tiers beat a strict total order, since "these five are
+excellent and those five are junk" is reliable where "is #43 better than #44" is
+noise. JUDGE_RUBRIC is the criteria those judgements should follow.
+
+Calibrated on 210 drawings judged this way, the probe is a good coarse filter
+and a poor fine ranking, which is all filtering needs. Held out it ranks +0.55
+against the judged tiers; the quarter it keeps is 83% good-or-better against a
+48% base rate with none of the 25 judged junk drawings surviving; and it agrees
+with the judge on 86% of pairs two tiers apart but only 71% of adjacent pairs.
 
 Do not train the probe on Quick, Draw!'s own `recognized` flag. It measures
 whether a classifier saw the expected category, not whether the drawing is good,
-and it correlates with human quality judgements at only +0.10 -- it rejects
-careful full-body cats for not being cat faces.
+and it correlates with judged quality at only +0.10 -- it rejects careful
+full-body cats for not being cat faces.
 
-Geometric features are kept as a fallback for when no vision model is available;
-they are much weaker (+0.24 against judged quality, against +0.42 for DINOv2).
+Geometric features are kept as a fallback for when no vision model is available,
+but they are far weaker: +0.13 against judged quality where CLIP reaches +0.55,
+and they let four of those 25 junk drawings through the cut.
 """
 
 JUDGE_RUBRIC = """Order these drawings from best to worst as training examples.
@@ -50,38 +57,41 @@ judge is the only reliable filter for writing, so the rubric has to ask.
 import numpy as np
 
 
-def render(points, px=64, linewidth=1.0):
-    """Draw one trajectory as a square image.
+def render(points, px=64, linewidth=2, supersample=8, pad=2):
+    """Draw one trajectory as a square image, ready to embed.
 
-    Small and thin wins, which is not obvious: 64px with hairline strokes scores
-    +0.44 against judged quality where the same drawings at linewidth 2.5 score
-    +0.19 and at 4.0 score +0.30. Thick strokes merge a dog's legs and fill in a
-    cat's face, destroying the detail the ranking depends on. Bigger canvases
-    and inverted polarity do not help either, and small images keep embedding
-    cheap.
+    Small and thin wins, which is not obvious: 64px with fine strokes ranks
+    +0.59 against judged quality, where the same drawings rendered with thick
+    strokes score +0.19. Heavy strokes merge a dog's legs and fill in a cat's
+    face, destroying the detail the ranking depends on. Bigger canvases and
+    inverted polarity do not help either.
+
+    Antialiasing does matter, so this draws large and downsamples rather than
+    rasterizing directly at 64px, which costs ranking quality (+0.47). Going
+    through PIL rather than matplotlib is 13x faster for the same result, and
+    rendering is otherwise half the cost of scoring a corpus.
     """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from PIL import Image
-    import io
+    from PIL import Image, ImageDraw
 
     points = np.asarray(points, dtype=float)
-    fig, ax = plt.subplots(figsize=(px / 100, px / 100), dpi=100)
-    down = points[:, 2] == 1
-    for chunk in np.split(points, np.flatnonzero(~down) + 1):
+    down = points[points[:, 2] == 1]
+    if len(down) < 2:
+        return Image.new("RGB", (px, px), "white")
+
+    big = px * supersample
+    margin = pad * supersample
+    x0, y0 = down[:, 0].min(), down[:, 1].min()
+    scale = (big - 2 * margin) / max(np.ptp(down[:, 0]), np.ptp(down[:, 1]), 1e-6)
+
+    image = Image.new("L", (big, big), 255)
+    draw = ImageDraw.Draw(image)
+    for chunk in np.split(points, np.flatnonzero(points[:, 2] == 0) + 1):
         chunk = chunk[chunk[:, 2] == 1]
         if len(chunk) > 1:
-            ax.plot(chunk[:, 0], -chunk[:, 1], "k-", linewidth=linewidth,
-                    solid_capstyle="round")
-    ax.set_aspect("equal")
-    ax.axis("off")
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", pad_inches=0.02,
-                facecolor="white")
-    plt.close(fig)
-    buf.seek(0)
-    return Image.open(buf).convert("RGB").resize((px, px))
+            draw.line([(margin + (x - x0) * scale, margin + (y - y0) * scale)
+                       for x, y in chunk[:, :2]],
+                      fill=0, width=int(linewidth * supersample))
+    return image.resize((px, px), Image.LANCZOS).convert("RGB")
 
 
 class Embedder:
@@ -257,11 +267,11 @@ class PerClassProbe:
 def load_probe(path="data/quickdraw_probe.npz"):
     """A probe already calibrated on judged Quick, Draw! drawings.
 
-    Fitted on 90 drawings ordered into quality tiers by hand, embedded with CLIP
-    at 64px. Held out, it ranks +0.59 against those tiers, and the quarter it
-    keeps is 82% good-or-better against a 48% base rate with none of the judged
-    junk surviving. Re-fit rather than reuse this if you change the embedder or
-    the render settings, which the file records.
+    Fitted on 210 drawings ordered into quality tiers by hand, embedded with
+    CLIP at 64px. Held out it ranks +0.55 against those tiers, and the quarter
+    it keeps is 83% good-or-better against a 48% base rate, with none of the 25
+    judged junk drawings surviving. Re-fit rather than reuse this if you change
+    the embedder or the render settings, which the file records.
     """
     data = np.load(path)
     probe = LinearProbe(alpha=float(data["alpha"]))
