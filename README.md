@@ -51,7 +51,7 @@ python sample.py --checkpoint out/best.pt --text "The quick brown fox jumps over
 ```
 
 If a word comes out misspelled, note its index (`--show_indices`) and regenerate
-just that word with `generate_paragraph(..., words=prev, redo=[3, 7])`.
+just that word with `--redo 3,7`.
 
 ## How it works
 
@@ -65,7 +65,8 @@ token — which is what keeps sequences short.
 
 ![roundtrip](static/roundtrip.png)
 
-*Grey is the original, red is decoded from tokens. `grid=0.012` is the default.*
+*Grey is the original, red is decoded from tokens. `grid=0.020` is the default:
+reconstruction error stays inside the width of a pen stroke at 99 tokens per word.*
 
 **Model** (`pengpt/model.py`): a small GPT-style decoder (~430k params at
 default size) with cross-attention over the character embedding of the text
@@ -83,8 +84,8 @@ bigbank_3500, ScribeTokens is better on every axis at once:
 
 | | tokens/word | reconstruction error | bits/pen-point | vocab |
 |---|---|---|---|---|
-| polar bins | 184.8 | 0.0116 | 13.09 | 525 |
-| ScribeTokens | **82.3** | **0.0077** | **5.94** | **148** |
+| polar bins | 185 | 0.0116 | 13.09 | 525 |
+| ScribeTokens | **99** | **0.0061** | **5.94** | **306** |
 
 Trained head to head at matched wall clock, ScribeTokens reached **3.43
 bits/pen-point against the polar tokenizer's 7.16** — a 2.1× advantage, while
@@ -92,7 +93,7 @@ running *fewer* optimizer steps. BPE is doing real work here: at equal block
 sizes, 256 merges scored 1.29 against 2.12 with no merges at all.
 
 Together with a coarser grid and a shorter block, this took a full training run
-from **21.5 hours to about 45 minutes** on an M-series laptop. No rented GPU is
+from **21.5 hours to under an hour** on an M-series laptop. No rented GPU is
 needed at this scale.
 
 Two properties matter beyond the numbers:
@@ -161,9 +162,12 @@ pengpt/data.py       loading, augmentation, PenDataset
 pengpt/model.py      PenTransformer + checkpoint I/O
 pengpt/sampling.py   generation, paragraph layout, plotting
 pengpt/convert.py    external dataset converters
-train.py, sample.py  CLI entry points
+train.py             training loop
+sample.py            write arbitrary text
+iliad.py             write the Iliad opening
+compare.py           real handwriting beside generations
+progress.py          contact sheet of samples over a run
 collect.html         self-contained data collection page
-deprecated/          the previous polar tokenizer
 ```
 
 By Sam Greydanus. Cursive model and dataset from the cursivetransformer project

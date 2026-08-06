@@ -207,6 +207,11 @@ def learn_merges(token_sequences, n_merges=512, min_count=20):
 
     DOWN and UP are never merged, so stroke boundaries stay explicit and every
     merged token still decomposes into base tokens.
+
+    Fewer than n_merges may come back: merging stops once no pair occurs
+    min_count times, since a rule that fires on a handful of words costs a
+    vocabulary entry without shortening anything. On the bundled data this
+    settles around 350 merges however many are asked for.
     """
     sequences = [list(s) for s in token_sequences]
     merges, next_id = [], N_BASE
