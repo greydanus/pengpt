@@ -149,9 +149,17 @@ class PenDataset(Dataset):
         return self.length
 
     def pick_words(self, rng):
+        """Pack words until the block is full, sometimes stopping short.
+
+        Filling greedily every time teaches the model that END arrives when the
+        block is nearly full, rather than when the prompt runs out: it then runs
+        on past a short prompt, repeating strokes to fill the space. Choosing a
+        word count up front decorrelates END from position in the block.
+        """
         block = self.cfg.max_seq_length
+        limit = rng.integers(1, self.cfg.max_words + 1)
         chosen, parts, total = [], [], 0
-        for i in rng.choice(self.indices, size=self.cfg.max_words, replace=False):
+        for i in rng.choice(self.indices, size=self.cfg.max_words, replace=False)[:limit]:
             word = (augment_word(self.bank_points[i], self.cfg, rng) if self.augment
                     else normalize(self.bank_points[i], self.cfg))
             tokens = self.stroke_tok.encode_word(word)

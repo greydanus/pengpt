@@ -21,15 +21,20 @@ pip install -e ".[dev]"   # + pytest
 pytest tests/             # ~1 second
 ```
 
-Train:
+Train — about 45 minutes on an M-series laptop, no GPU rental needed:
 
 ```bash
 python train.py --dataset data/bigbank_3500.json.zip --out_dir out
 ```
 
-Sample images and the best checkpoint land in `out/` as training goes. Add
-`--wandb --wandb_entity you` for Weights & Biases logging (optional). Resume
-with `--resume out/best.pt`.
+The best checkpoint lands in `out/`, and `out/progress/` gets one image per
+eval: the same prompts every time, so the strip tracks the model rather than
+the prompt. Stack them with `python progress.py`, or put real handwriting
+beside generations for the same text with `python compare.py`.
+
+Add `--wandb --wandb_entity you` for Weights & Biases logging (optional).
+Resume with `--resume out/best.pt`. For a faster run, `--n_layer 3` roughly
+halves the time and scored within noise of the default in ablations.
 
 Generate handwriting from a trained model:
 
@@ -77,6 +82,10 @@ Trained head to head at matched wall clock, ScribeTokens reached **3.43
 bits/pen-point against the polar tokenizer's 7.16** — a 2.1× advantage, while
 running *fewer* optimizer steps. BPE is doing real work here: at equal block
 sizes, 256 merges scored 1.29 against 2.12 with no merges at all.
+
+Together with a coarser grid and a shorter block, this took a full training run
+from **21.5 hours to about 45 minutes** on an M-series laptop. No rented GPU is
+needed at this scale.
 
 Two properties matter beyond the numbers:
 
