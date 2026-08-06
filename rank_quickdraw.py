@@ -107,6 +107,8 @@ def main():
                    help="half precision embedding; 1.7x faster, same ranking")
     p.add_argument("--resume", action="store_true",
                    help="skip categories already present in the output")
+    p.add_argument("--overwrite", action="store_true",
+                   help="discard an existing output file and start again")
     p.add_argument("--to_json", action="store_true",
                    help="also write a single JSON array (must fit in memory)")
     args = p.parse_args()
@@ -120,13 +122,21 @@ def main():
     if not paths:
         raise SystemExit(f"no .ndjson files in {args.raw_dir}")
 
-    done = set()
-    if args.resume and os.path.exists(args.out):
-        with open(args.out) as f:
-            done = {json.loads(line)["text"] for line in f if line.strip()}
-        print(f"resuming: {len(done)} categories already done")
-
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    done = set()
+    if os.path.exists(args.out) and os.path.getsize(args.out):
+        if args.overwrite:
+            open(args.out, "w").close()
+        elif args.resume:
+            with open(args.out) as f:
+                done = {json.loads(line)["text"] for line in f if line.strip()}
+            print(f"resuming: {len(done)} categories already done")
+        else:
+            raise SystemExit(
+                f"{args.out} already exists. Pass --resume to continue it, or "
+                f"--overwrite to start again; appending to it silently would "
+                f"duplicate every category it already holds.")
+
     todo = [p for p in paths
             if os.path.basename(p).split(".")[0] not in done]
     print(f"{len(todo)} of {len(paths)} categories to score, "
@@ -135,21 +145,28 @@ def main():
     kept_total, seen_total, t0 = 0, 0, time.time()
     with open(args.out, "a") as out:
         for n, path in enumerate(todo, 1):
+            label = os.path.basename(path).split(".")[0]
             examples, seen = score_category(path, embedder, probe, args.fraction,
                                             args.limit_per_class, args.batch_size)
             for example in examples:
                 out.write(json.dumps(example) + "\n")
             out.flush()
+            os.fsync(out.fileno())
             kept_total += len(examples)
             seen_total += seen
-            rate = seen_total / (time.time() - t0)
-            remaining = (len(todo) - n) * (seen_total / n)
-            print(f"[{n}/{len(todo)}] {examples[0]['text'] if examples else '?':22s} "
-                  f"{seen:7,} -> {len(examples):6,} | {rate:5.0f}/s | "
-                  f"eta {remaining / rate / 60:5.0f} min", flush=True)
+            elapsed = time.time() - t0
+            rate = seen_total / elapsed
+            eta = (len(todo) - n) * (seen_total / n) / rate / 60
+            print(f"[{n}/{len(todo)}] {label:22s} {seen:7,} -> {len(examples):6,}"
+                  f" | {rate:5.0f}/s | {elapsed / 60:5.1f} min elapsed"
+                  f" | eta {eta:5.0f} min", flush=True)
 
-    print(f"\nkept {kept_total:,} of {seen_total:,} in "
-          f"{(time.time() - t0) / 60:.1f} min -> {args.out}")
+    print(f"\nkept {kept_total:,} of {seen_total:,} scored "
+          f"({kept_total / max(seen_total, 1):.0%}) in "
+          f"{(time.time() - t0) / 60:.1f} min")
+    if done:
+        print(f"plus {len(done)} categories from an earlier run")
+    print(f"-> {args.out}")
 
     if args.to_json:
         target = os.path.splitext(args.out)[0] + ".json"
