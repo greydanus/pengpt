@@ -113,12 +113,19 @@ class ScribeTokenizer:
         self.vocab_size = n + 3
 
     def encode_word(self, points):
+        """Tokens for one word, starting from the baseline at x = 0.
+
+        The walk begins at the origin rather than at the word's first point, so
+        the initial pen-up move carries the word's height above or below the
+        baseline. Words that start at the cap line (digits, most capitals) and
+        words that start on the baseline are then distinguishable from the
+        tokens alone, with no per-alphabet table.
+        """
         points = np.asarray(points, dtype=float)
         grid_xy = np.rint(points[:, :2] / self.grid).astype(np.int64)
-        out, previous_end = [], None
+        out, previous_end = [], np.array([0, 0], dtype=np.int64)
         for start, stop in _stroke_spans(points[:, 2]):
-            if previous_end is not None:
-                out.extend(_walk([previous_end, grid_xy[start]]))
+            out.extend(_walk([previous_end, grid_xy[start]]))
             out.append(DOWN)
             out.extend(_walk(grid_xy[start:stop]))
             out.append(UP)

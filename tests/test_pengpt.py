@@ -43,6 +43,25 @@ def test_encode_decode_roundtrip():
     assert d.min(1).mean() < 3 * st.grid
 
 
+def test_baseline_height_survives_roundtrip():
+    """A word's height above the baseline is carried by the tokens.
+
+    Words that start at the cap line (digits) and words that start on the
+    baseline must stay distinguishable after decoding, with no per-alphabet
+    table to tell them apart.
+    """
+    st = ScribeTokenizer(grid=0.01)
+    high = make_word(seed=1)
+    high[:, 1] -= 0.20
+    low = make_word(seed=1)
+    for word in (high, low):
+        decoded = st.decode(np.concatenate([st.encode_word(word), [st.END]]))[0]
+        ink_in = word[word[:, 2] == 1][:, 1]
+        ink_out = decoded[decoded[:, 2] == 1][:, 1]
+        assert abs(ink_out.min() - ink_in.min()) < 5 * st.grid
+        assert abs(ink_out.max() - ink_in.max()) < 5 * st.grid
+
+
 def test_pen_state_structure():
     """Every stroke is delimited by DOWN ... UP, and only by those."""
     st = ScribeTokenizer(grid=0.01)
