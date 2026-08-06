@@ -16,7 +16,7 @@ class DataConfig:
     max_words: int = 8
     max_seq_length: int = 512
     max_text_length: int = 50
-    grid: float = 0.012
+    grid: float = 0.020
     n_merges: int = 512
     augment: bool = True
     spacing: float = 0.0
