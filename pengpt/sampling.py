@@ -21,7 +21,7 @@ class SampleParams:
     top_k: int = None
     do_sample: bool = True
     max_tokens: int = 512
-    n_at_a_time: int = 2
+    n_at_a_time: int = 4
     space_width: float = 0.16
     line_width: float = 8.0
     line_height: float = 0.55
@@ -116,9 +116,10 @@ def plot_paragraph(words, text="", params=None, figsize=(12, 8), dpi=200,
 def generate_paragraph(model, dataset, text, params=None, words=None, redo=None):
     """Generate a paragraph, n_at_a_time words per model call.
 
-    Words are generated in small groups because neighbours act as context: a
-    group of two to four recovers every word, while asking for six overflows the
-    block and silently drops about half of them.
+    Words come in small groups because neighbours act as context. Groups of up
+    to four recover every word; larger groups overflow the block -- six words
+    cost more than 512 tokens about 70% of the time -- and the words that do not
+    fit are silently dropped.
 
     Pass a previous result as `words` plus indices as `redo` to regenerate only
     the words that came out wrong.
