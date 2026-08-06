@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
-PROGRESS_PROMPTS = ["the quick brown", "hope and 2926", "Sing of anger"]
+HANDWRITING_PROMPTS = ["the quick brown", "hope and 2926", "Sing of anger"]
 
 
 @dataclass
@@ -150,9 +150,39 @@ def generate_paragraph(model, dataset, text, params=None, words=None, redo=None)
     return words
 
 
+def progress_prompts(dataset, n=3):
+    """Prompts drawn from the dataset's own text, so they are always in vocabulary.
+
+    Hardcoded prompts silently break on a new corpus: the handwriting defaults
+    contain digits and a capital S, and Quick, Draw!'s 35-character alphabet has
+    neither, so those characters encoded as padding and two of three progress
+    panels showed nothing meaningful for a whole run.
+    """
+    seen, out = set(), []
+    for i in range(min(len(dataset), 2000)):
+        text = dataset.text_for(i)
+        if text and text not in seen:
+            seen.add(text)
+            out.append(text)
+        if len(out) >= n:
+            break
+    return out or HANDWRITING_PROMPTS[:n]
+
+
+_PROMPT_CACHE = {}
+
+
+def _cached_prompts(dataset):
+    """Same prompts every eval, so the strip tracks the model not the prompt."""
+    key = id(dataset)
+    if key not in _PROMPT_CACHE:
+        _PROMPT_CACHE[key] = progress_prompts(dataset)
+    return _PROMPT_CACHE[key]
+
+
 def save_progress(model, dataset, out_dir, step, prompts=None, temperature=1.0):
     """Render the same prompts at every eval, so the strip tracks the model."""
-    prompts = prompts or PROGRESS_PROMPTS
+    prompts = prompts or _cached_prompts(dataset)
     os.makedirs(out_dir, exist_ok=True)
     params = SampleParams(temperature=temperature,
                           max_tokens=dataset.cfg.max_seq_length - 1)
