@@ -153,6 +153,30 @@ tall.
 - The character vocabulary is derived from the data and stored in the
   checkpoint, along with the BPE merges.
 
+## Pen data that is not handwriting
+
+Nothing in the tokenizer knows about letters or words — it encodes pen motion on
+a grid. Sketches, signatures, diagrams and gestures work with two settings:
+
+```bash
+python train.py --dataset data/sketches.json --max_words 1 --augment general
+```
+
+`--max_words 1` treats each example as one trajectory, which makes the `WORD`
+separator inert. `--augment general` drops the shear: it is always negative, so
+it imposes an italic slant rather than jittering, and it presumes a baseline to
+slant about. `--augment none` disables augmentation entirely, and `--rotate 10`
+adds rotation, which suits data with no canonical upright.
+
+Ink scale is the one thing to get right. The grid is a fixed distance, so tokens
+per example scale with how large the drawing is; `convert.py` normalizes to the
+bundled data's scale, and `train.py` warns with a suggested `--grid` if a dataset
+arrives at a different one.
+
+Measured on the bundled cursive, the shear earns its place: removing it costs
+0.79 → 0.95 bits per pen-point even with 37% more optimizer steps. That is a
+statement about this dataset, not about pen data in general.
+
 ## Repo map
 
 ```
