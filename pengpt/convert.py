@@ -61,6 +61,42 @@ def normalize(points, pen_down_is=1, height_quantile=0.95):
     return points
 
 
+def convert_quickdraw(path, max_items=None, categories=None):
+    """Google Quick, Draw! simplified ndjson -> pengpt format.
+
+    Each line holds one drawing as a list of strokes, each stroke a pair of
+    coordinate arrays. Pen lifts are implicit in the stroke boundaries, which is
+    already how pengpt reads a trajectory, so the conversion is mostly a matter
+    of flattening and inserting a lift marker between strokes.
+
+    The label is the category, so a model trained on this draws a named object
+    rather than a word. Train with --max_words 1 --augment general.
+    """
+    examples = []
+    for line in open(path):
+        line = line.strip()
+        if not line:
+            continue
+        item = json.loads(line)
+        if categories and item.get("word") not in categories:
+            continue
+        points = []
+        for stroke in item["drawing"]:
+            xs, ys = stroke[0], stroke[1]
+            for x, y in zip(xs, ys):
+                points.append([float(x), float(y), 1.0])
+            points.append([float(xs[-1]), float(ys[-1]), 0.0])
+        if len(points) < 4:
+            continue
+        examples.append({
+            "text": str(item.get("word", "")),
+            "points": normalize(np.array(points)).round(4).tolist(),
+        })
+        if max_items and len(examples) >= max_items:
+            break
+    return examples
+
+
 def convert_brush(root, max_items=None, pen_down_is=1):
     examples = []
     for dirpath, _, filenames in os.walk(root):
@@ -107,6 +143,10 @@ def probe(path):
 
 def main():
     p = argparse.ArgumentParser(description="Convert datasets to pengpt format")
+    p.add_argument("--quickdraw", type=str,
+                   help="Quick, Draw! simplified .ndjson (one category per file)")
+    p.add_argument("--categories", type=str, default="",
+                   help="comma-separated Quick, Draw! categories to keep")
     p.add_argument("--brush_dir", type=str, help="root of an extracted BRUSH dataset")
     p.add_argument("--probe", type=str, help="print the structure of one file")
     p.add_argument("--out", type=str, default="data/converted.json")
@@ -117,14 +157,18 @@ def main():
     if args.probe:
         probe(args.probe)
         return
-    if args.brush_dir:
+    if args.quickdraw:
+        cats = {c.strip() for c in args.categories.split(",") if c.strip()}
+        examples = convert_quickdraw(args.quickdraw, args.max_items, cats or None)
+    elif args.brush_dir:
         examples = convert_brush(args.brush_dir, args.max_items, args.pen_down_is)
-        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-        with open(args.out, "w") as f:
-            json.dump(examples, f)
-        print(f"Wrote {len(examples)} examples to {args.out}")
     else:
         p.print_help()
+        return
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    with open(args.out, "w") as f:
+        json.dump(examples, f)
+    print(f"Wrote {len(examples)} examples to {args.out}")
 
 
 if __name__ == "__main__":
