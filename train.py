@@ -14,7 +14,7 @@ from dataclasses import asdict
 import torch
 from torch.utils.data import DataLoader
 
-from pengpt import (parse_configs, create_datasets, InfiniteDataLoader,
+from pengpt import (DataConfig, parse_configs, create_datasets, InfiniteDataLoader,
                     PenTransformer, save_checkpoint, load_checkpoint, save_samples,
                     save_progress)
 
@@ -45,12 +45,34 @@ def evaluate(model, dataset, device, batch_size=100, max_batches=10):
 
 def main():
     data_cfg, model_cfg, train_cfg = parse_configs(description="Train a pengpt model")
-    torch.manual_seed(data_cfg.seed)
     device = resolve_device(train_cfg.device)
     os.makedirs(train_cfg.out_dir, exist_ok=True)
     checkpoint_path = os.path.join(train_cfg.out_dir, "best.pt")
 
-    train_dataset, test_dataset, stroke_tok, char_tok = create_datasets(data_cfg)
+    # Resuming has to rebuild the *checkpoint's* tokenizer, not one re-derived
+    # from the command line. Merges and alphabet decide what every token id
+    # means, so re-learning them from a config that differs in --n_merges,
+    # --grid, --dataset or --seed loads weights against a vocabulary they were
+    # never trained on -- silently, whenever the sizes happen to still match.
+    ckpt = None
+    if train_cfg.resume:
+        _, ckpt = load_checkpoint(train_cfg.resume, device)
+        resumed_cfg = DataConfig(**ckpt["data_config"])
+        if asdict(resumed_cfg) != asdict(data_cfg):
+            changed = {k: (v, getattr(data_cfg, k))
+                       for k, v in asdict(resumed_cfg).items()
+                       if getattr(data_cfg, k) != v}
+            print(f"Using the checkpoint's data config; ignoring {changed} "
+                  f"(checkpoint value, command-line value)")
+        data_cfg = resumed_cfg
+
+    torch.manual_seed(data_cfg.seed)   # after resume, so it is the run's own seed
+
+    train_dataset, test_dataset, stroke_tok, char_tok = create_datasets(
+        data_cfg, merges=ckpt["merges"] if ckpt else None)
+    if ckpt:
+        assert char_tok.alphabet == ckpt["alphabet"], \
+            "dataset alphabet does not match the checkpoint; resume needs its dataset"
     model_cfg.vocab_size = stroke_tok.vocab_size
     model_cfg.block_size = data_cfg.max_seq_length
     model_cfg.context_vocab_size = char_tok.vocab_size
@@ -68,8 +90,7 @@ def main():
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_at)
 
     step, best_loss = 0, None
-    if train_cfg.resume:
-        _, ckpt = load_checkpoint(train_cfg.resume, device)
+    if ckpt:
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])

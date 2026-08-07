@@ -38,7 +38,7 @@ def generate(model, dataset, text, params=None):
     device = next(model.parameters()).device
     context = torch.from_numpy(
         ct.encode(text, dataset.cfg.max_text_length)).unsqueeze(0).to(device)
-    idx = torch.full((1, 1), st.PAD, dtype=torch.long, device=device)
+    idx = torch.full((1, 1), st.BOS, dtype=torch.long, device=device)
     out = model.generate(idx, context, max_new_tokens=params.max_tokens,
                          temperature=params.temperature, top_k=params.top_k,
                          do_sample=params.do_sample, end_token=st.END, pad_token=st.PAD)

@@ -83,6 +83,44 @@ def test_merges_are_lossless():
         assert list(st2.expand(merged)) == list(b)      # and exactly reversible
 
 
+def test_merges_apply_in_learned_order():
+    """Encoding must reproduce what learn_merges produced, not just something
+    reversible.
+
+    Rule order is priority order. A left-to-right scan that takes whichever
+    rule matches first is reversible and shorter than the base sequence, so
+    losslessness alone does not catch it -- but it is a different encoding, and
+    it leaves a third of the compression on the table.
+    """
+    st = ScribeTokenizer(grid=0.01, merges=[(0, 1, 10), (2, 0, 11)])
+    # rule (0,1) was learned first, so it wins the shared 0.
+    assert list(st.apply_merges(np.array([2, 0, 1]))) == [2, 10]
+
+
+def test_merges_match_sequential_application():
+    """The same check against learned merges on many words."""
+    st0 = ScribeTokenizer(grid=0.01)
+    words = [make_word(n=60, seed=s) for s in range(20)]
+    base = [st0.encode_word(w) for w in words]
+    merges = learn_merges(base, n_merges=128, min_count=2)
+    st = ScribeTokenizer(grid=0.01, merges=merges)
+
+    def sequential(seq):
+        s = [int(t) for t in seq]
+        for a, b, c in merges:                      # one pass per rule, in order
+            out, j = [], 0
+            while j < len(s):
+                if j + 1 < len(s) and s[j] == a and s[j + 1] == b:
+                    out.append(c); j += 2
+                else:
+                    out.append(s[j]); j += 1
+            s = out
+        return s
+
+    for b in base:
+        assert list(st.apply_merges(b)) == sequential(b)
+
+
 def test_word_separation_and_end():
     st = ScribeTokenizer(grid=0.01)
     words = [make_word(seed=s) for s in range(3)]
@@ -271,11 +309,32 @@ def test_dataset_item(tiny_dataset):
     x, c, y = tiny_dataset[0]
     st, cfg = tiny_dataset.stroke_tok, tiny_dataset.cfg
     assert x.shape == (cfg.max_seq_length,) and c.shape == (cfg.max_text_length,)
+    assert x[0] == st.BOS                         # generation starts here too
     end = (x == st.END).nonzero().item()          # exactly one END in the input
-    assert y[end] == st.END                       # targets end with END...
-    assert (y[end + 1:] == IGNORE_INDEX).all()    # ...then loss is masked
+    assert y[end - 1] == st.END                   # END is the last thing predicted...
+    assert (y[end:] == IGNORE_INDEX).all()        # ...and nothing is predicted from it
     assert (x[end + 1:] == st.PAD).all()
     assert tiny_dataset.char_tok.decode(c) == tiny_dataset.text_for(0)
+
+
+def test_targets_are_inputs_shifted_by_one(tiny_dataset):
+    """The supervised span must line up exactly, or every token is off by one."""
+    x, _, y = tiny_dataset[0]
+    st = tiny_dataset.stroke_tok
+    end = (x == st.END).nonzero().item()
+    assert torch.equal(y[:end], x[1:end + 1])
+
+
+def test_generation_prefix_occurs_in_training(tiny_dataset):
+    """What generate() seeds with has to be what position 0 saw in training.
+
+    Seeding from a token the model never saw first leaves the opening move --
+    the pen's entry point and the word's height above the baseline -- to a
+    prefix with no training support.
+    """
+    st = tiny_dataset.stroke_tok
+    firsts = {tiny_dataset[i][0][0].item() for i in range(len(tiny_dataset))}
+    assert firsts == {st.BOS}
 
 
 def test_dataset_never_truncates_mid_word(tiny_dataset):
@@ -286,6 +345,26 @@ def test_dataset_never_truncates_mid_word(tiny_dataset):
         end = (x == st.END).nonzero()
         assert len(end) == 1, "exactly one END expected"
         assert end.item() < tiny_dataset.cfg.max_seq_length
+
+
+def test_bank_smaller_than_max_words():
+    """max_words is a ceiling, not a requirement.
+
+    The test split is 5% of a corpus and floors at ten words, so a bank with
+    fewer words than max_words is ordinary rather than exotic; drawing without
+    replacement must not ask for more than exists.
+    """
+    cfg = DataConfig(max_seq_length=256, max_text_length=20, max_words=8,
+                     grid=0.01, seed=0)
+    st, ct = ScribeTokenizer(grid=0.01), CharTokenizer(" abcdefg")
+    for n_bank in (1, 2, 7):
+        bank = [make_word(seed=s) for s in range(n_bank)]
+        texts = ["cab", "face", "bag", "dad", "egg", "fed", "gag"][:n_bank]
+        ds = PenDataset(bank, texts, np.arange(n_bank), st, ct, cfg, length=4,
+                        augment=False)
+        x, c, _ = ds[0]
+        assert (x != st.PAD).sum() > 2
+        assert len(ct.decode(c).split()) <= n_bank
 
 
 def test_model_forward_and_generate(tiny_dataset):

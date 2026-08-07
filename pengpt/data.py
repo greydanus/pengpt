@@ -189,14 +189,18 @@ class PenDataset(Dataset):
         word count up front decorrelates END from position in the block.
         """
         block = self.cfg.max_seq_length
-        limit = rng.integers(1, self.cfg.max_words + 1)
+        # A bank smaller than max_words is normal on the test split, which is
+        # only 5% of the corpus; drawing without replacement must not ask for
+        # more words than exist.
+        draw = min(self.cfg.max_words, len(self.indices))
+        limit = rng.integers(1, draw + 1)
         chosen, parts, total = [], [], 0
-        for i in rng.choice(self.indices, size=self.cfg.max_words, replace=False)[:limit]:
+        for i in rng.choice(self.indices, size=draw, replace=False)[:limit]:
             word = prepare_word(self.bank_points[i], self.cfg,
                                 rng if self.augment else None)
             tokens = self.stroke_tok.encode_word(word)
             extra = len(tokens) + (2 if parts else 0)
-            if parts and total + extra > block - 1:
+            if parts and total + extra > block - 2:   # room for BOS and END
                 break
             if parts:
                 parts.append(np.array([self.stroke_tok.WORD] * 2, dtype=np.int64))
@@ -210,13 +214,16 @@ class PenDataset(Dataset):
         tokens, text = self.pick_words(rng)
         st, block = self.stroke_tok, self.cfg.max_seq_length
 
+        # x is [BOS, tokens..., END]; y is x shifted left, so position 0 learns
+        # to predict the first real token from BOS alone. Generation seeds with
+        # that same BOS, so its first step is one the model has seen.
         x = torch.full((block,), st.PAD, dtype=torch.long)
         y = torch.full((block,), IGNORE_INDEX, dtype=torch.long)
-        n = min(len(tokens), block - 1)
-        x[:n] = torch.from_numpy(tokens[:n])
-        x[n] = st.END
-        y[:n] = x[1:n + 1]
-        y[n] = st.END
+        n = min(len(tokens), block - 2)
+        x[0] = st.BOS
+        x[1:n + 1] = torch.from_numpy(tokens[:n])
+        x[n + 1] = st.END
+        y[:n + 1] = x[1:n + 2]
         c = torch.from_numpy(self.char_tok.encode(text, self.cfg.max_text_length))
         return x, c, y
 

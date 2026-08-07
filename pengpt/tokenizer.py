@@ -104,8 +104,12 @@ class ScribeTokenizer:
         self._pairs = {(a, b): c for a, b, c in self.merges}
         self._inverse = {c: (a, b) for a, b, c in self.merges}
         n = N_BASE + len(self.merges)
-        self.PAD, self.END, self.WORD = n, n + 1, n + 2
-        self.vocab_size = n + 3
+        # BOS is what generation starts from. Without it the first sampled token
+        # is conditioned on a prefix that never occurs in training, and that
+        # token fixes the pen's entry point and the word's height above the
+        # baseline -- the two things a whole sample hangs on.
+        self.PAD, self.END, self.WORD, self.BOS = n, n + 1, n + 2, n + 3
+        self.vocab_size = n + 4
 
     def encode_word(self, points):
         """Tokens for one word, starting from the baseline at x = 0.
@@ -136,20 +140,35 @@ class ScribeTokenizer:
         return np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
 
     def apply_merges(self, tokens):
+        """Apply merges in the order they were learned, as BPE requires.
+
+        One pass per rule, mirroring learn_merges, so encoding reproduces what
+        training produced. Taking whichever rule happens to match first in a
+        left-to-right scan is a different algorithm: on a rule set holding
+        (0,1)->10 and (2,0)->11, the sequence [2, 0, 1] greedily becomes
+        [11, 1], where BPE gives [2, 10]. Priority order is what makes the
+        earlier, more frequent rule win. The two disagreed on every word of the
+        bundled corpus, and the greedy reading cost a third of the compression
+        the merges were learned to provide (99 tokens per word against 67).
+
+        Rules whose pair is absent are skipped rather than scanned for, which is
+        most of them once a sequence is partly merged.
+        """
         if not self._pairs:
             return tokens
-        pairs, out, i, n = self._pairs, [], 0, len(tokens)
-        while i < n:
-            token = int(tokens[i])
-            j = i + 1
-            while j < n:
-                merged = pairs.get((token, int(tokens[j])))
-                if merged is None:
-                    break
-                token = merged
-                j += 1
-            out.append(token)
-            i = j
+        out = [int(t) for t in tokens]
+        present = set(zip(out, out[1:]))
+        for a, b, merged in self.merges:
+            if (a, b) not in present:
+                continue
+            nxt, i, n = [], 0, len(out)
+            while i < n:
+                if i + 1 < n and out[i] == a and out[i + 1] == b:
+                    nxt.append(merged); i += 2
+                else:
+                    nxt.append(out[i]); i += 1
+            out = nxt
+            present = set(zip(out, out[1:]))
         return np.array(out, dtype=np.int64)
 
     def decode(self, tokens):
@@ -157,7 +176,7 @@ class ScribeTokenizer:
         end = np.flatnonzero(tokens == self.END)
         if end.size:
             tokens = tokens[:end[0]]
-        tokens = tokens[tokens != self.PAD]
+        tokens = tokens[(tokens != self.PAD) & (tokens != self.BOS)]
         words = []
         for chunk in np.split(tokens, np.flatnonzero(tokens == self.WORD)):
             chunk = chunk[chunk != self.WORD]
