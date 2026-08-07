@@ -211,7 +211,10 @@ def learn_merges(token_sequences, n_merges=512, min_count=20):
     Fewer than n_merges may come back: merging stops once no pair occurs
     min_count times, since a rule that fires on a handful of words costs a
     vocabulary entry without shortening anything. On the bundled data this
-    settles around 350 merges however many are asked for.
+    settles around 350 merges however many are asked for, and on Quick, Draw!
+    around 170 -- sketch strokes are shorter and less repetitive than cursive,
+    so there is simply less to merge. Raising --n_merges past that does
+    nothing.
     """
     sequences = [list(s) for s in token_sequences]
     merges, next_id = [], N_BASE
