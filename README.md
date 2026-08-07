@@ -71,12 +71,18 @@ The defaults are tuned for cursive. A drawing corpus needs three of them
 changed, because its samples are single objects with short labels:
 
 ```bash
-python train.py --dataset data/quickdraw_balanced.jsonl.gz \
+python train.py --dataset data/quickdraw_balanced_fixed.jsonl.gz \
   --max_words 1 --augment general \
-  --max_text_length 24 --max_seq_length 384 \
-  --n_layer 6 --n_embd 128 --learning_rate 1e-3 \
+  --max_text_length 24 --max_seq_length 192 \
+  --n_layer 6 --n_embd 128 --learning_rate 1e-3 --batch_size 32 \
   --out_dir out/quickdraw
 ```
+
+`quickdraw_balanced_fixed` is `quickdraw_balanced` after `repair_quickdraw.py`:
+the original was written through a delta-detection bug that cumsum'd 24% of
+drawings into diagonal staircases (see `normalize` in `pengpt/convert.py`).
+At the repaired token statistics (p50 = 39, p99 = 136), a 192-token block
+covers 99.6% of drawings; 384 spent most of every sequence on padding.
 
 `--augment general` drops shear, which is an italic slant that presumes a
 baseline and is a distortion on a sketch. Set `--max_text_length` near the

@@ -89,7 +89,7 @@ def score_category(path, embedder, probe, fraction, limit, batch_size):
             kept.extend(flush(chunk))
             chunk = []
     kept.extend(flush(chunk))
-    examples = [{"text": label, "points": normalize(p).round(4).tolist()}
+    examples = [{"text": label, "points": normalize(p, absolute=True).round(4).tolist()}
                 for p in kept]
     return examples, seen
 

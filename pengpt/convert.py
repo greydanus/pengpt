@@ -40,14 +40,22 @@ def to_absolute(points):
     return points
 
 
-def normalize(points, pen_down_is=1, height_quantile=0.95):
+def normalize(points, pen_down_is=1, height_quantile=0.95, absolute=False):
     """Scale to the bundled data's conventions: x starts at 0, baseline at y = 0.
 
     Ink is scaled to INK_HEIGHT because token cost per word is proportional to
     ink size: a corpus twice as large costs twice the sequence length for the
     same shapes, and the tokenizer's grid is a fixed distance.
+
+    Pass absolute=True when the source format is known to store absolute
+    coordinates. The delta autodetection in to_absolute reads sparse absolute
+    drawings -- a square is five points after RDP simplification, so its span is
+    small relative to its mean step -- as delta-encoded, and cumsum turns them
+    into a diagonal staircase. That corrupted 24% of a filtered Quick, Draw!
+    corpus before it was caught, concentrated in exactly the categories whose
+    drawings are few straight lines.
     """
-    points = to_absolute(points)
+    points = np.asarray(points, dtype=float).copy() if absolute else to_absolute(points)
     if pen_down_is != 1:
         points[:, 2] = 1.0 - points[:, 2]
     down = points[points[:, 2] == 1]
@@ -90,7 +98,7 @@ def convert_quickdraw(path, max_items=None, categories=None):
             continue
         examples.append({
             "text": str(item.get("word", "")),
-            "points": normalize(np.array(points)).round(4).tolist(),
+            "points": normalize(np.array(points), absolute=True).round(4).tolist(),
         })
         if max_items and len(examples) >= max_items:
             break

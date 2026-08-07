@@ -100,7 +100,7 @@ def main():
                 for points in points_list:
                     out.write(json.dumps({
                         "text": label,
-                        "points": normalize(points).round(4).tolist()}) + "\n")
+                        "points": normalize(points, absolute=True).round(4).tolist()}) + "\n")
                     kept_total += 1
 
             for points, _ in iter_drawings(path):
