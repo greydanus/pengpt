@@ -10,6 +10,13 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
+import matplotlib
+# Every figure here is written to a file, never shown. Left to choose for
+# itself, matplotlib picks an interactive backend where one is available, which
+# on macOS opens a GUI window per eval from inside a headless training run: it
+# logs ApplePersistenceIgnoreState, takes about thirty seconds to write what Agg
+# writes in one, and can block the run outright when no session is attached.
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 @dataclass
