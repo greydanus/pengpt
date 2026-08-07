@@ -94,7 +94,7 @@ python conditioning.py --checkpoint out/quickdraw/best.pt --per_label 8
 Generate handwriting from a trained model:
 
 ```bash
-python sample.py --checkpoint out/best.pt --text "The quick brown fox jumps over the lazy dog"
+python sample.py --checkpoint out/cursive/best.pt --text "The quick brown fox jumps over the lazy dog"
 ```
 
 If a word comes out misspelled, note its index (`--show_indices`) and regenerate
@@ -115,9 +115,13 @@ token — which is what keeps sequences short.
 *Grey is the original, red is decoded from tokens. `grid=0.020` is the default:
 reconstruction error stays inside the width of a pen stroke at 99 tokens per word.*
 
-**Model** (`pengpt/model.py`): a small GPT-style decoder (~430k params at
-default size) with cross-attention over the character embedding of the text
-prompt, in the makemore/nanoGPT lineage.
+**Model** (`pengpt/model.py`): a small GPT-style decoder (~410k params at the
+cursive default, ~1.7M at the drawing settings above) with cross-attention over
+the character embedding of the text prompt, in the makemore/nanoGPT lineage.
+
+The prompt reaches the model only through that cross-attention, never as a class
+index, so the same architecture takes a word to write or the name of an object
+to draw, and an unseen label still says something through its characters.
 
 **Data** (`pengpt/data.py`): each example is one word, an `(N, 3)` array of
 `(x, y, pen)`. Training examples pack random words together until the block is
@@ -167,7 +171,7 @@ training set.
 ## Writing a paragraph
 
 ```bash
-python iliad.py --checkpoint out/best.pt
+python iliad.py --checkpoint out/cursive/best.pt
 ```
 
 ![iliad](static/iliad.png)
