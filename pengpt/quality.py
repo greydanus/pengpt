@@ -267,6 +267,33 @@ def spearman(a, b):
     return float(np.corrcoef(ra, rb)[0, 1])
 
 
+def cross_label_similarity(embedder, points_by_label):
+    """Mean similarity between drawings of different labels, at a matched seed.
+
+    Answers the question loss cannot: is the model drawing the same thing for
+    every prompt? Take one sample per label from a shared seed, embed them, and
+    average the similarity across label pairs. Higher means more collapsed.
+
+    Read it against real drawings from the same labels rather than on its own.
+    Real Quick, Draw! sits near 0.87; a model at 0.92 is visibly less
+    differentiated, and one approaching 0.87 has learned the categories apart.
+
+    Use an embedding, not pixels. Raw pixel cosine on sparse line art scores
+    real penguins against real pizzas at 0.93 -- the same as two drawings of one
+    object -- because the shared white background dominates the dot product. It
+    reports no collapse whatever the model does, which reads as reassurance.
+    """
+    labels = sorted(points_by_label)
+    per = min(len(v) for v in points_by_label.values())
+    flat = [points_by_label[l][k] for k in range(per) for l in labels]
+    E = embedder.embed(flat)
+    E = E / np.linalg.norm(E, axis=1, keepdims=True)
+    n = len(labels)
+    sims = [float(E[k * n + i] @ E[k * n + j])
+            for k in range(per) for i in range(n) for j in range(i + 1, n)]
+    return float(np.mean(sims))
+
+
 def load_probe(path="data/quickdraw_probe.npz"):
     """A probe already calibrated on judged Quick, Draw! drawings.
 
