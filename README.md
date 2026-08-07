@@ -53,8 +53,17 @@ handwriting beside generations for the same text with `python compare.py`.
 
 Add `--wandb --wandb_entity you` for Weights & Biases logging (optional).
 Resume with `--resume out/cursive/last.pt` -- `last.pt`, not `best.pt`, which
-lags whenever test loss has stopped improving. For a faster run, `--n_layer 3`
-roughly halves the time and scored within noise of the default in ablations.
+lags whenever test loss has stopped improving. Resuming rebuilds the tokenizer
+from the checkpoint rather than from the command line, and says so when a data
+flag disagrees: merges and alphabet decide what every token id means, so a
+re-derived vocabulary would load the weights against ids they were never
+trained on. For a faster run, `--n_layer 3` roughly halves the time and scored
+within noise of the default in ablations.
+
+Checkpoints from before commit `1693c3f` no longer load. That commit is titled
+for a change to `conditioning.py` but also rewrote the token stream: BPE merges
+now apply in learned order, and a BOS token was added. Both change what the ids
+mean and shift `vocab_size`, so a model from before it has to be retrained.
 
 ### Drawings rather than handwriting
 
@@ -79,7 +88,7 @@ post a falling loss while drawing the corpus average for every prompt. Measure
 it directly:
 
 ```bash
-python conditioning.py --checkpoint out/quickdraw/best.pt --n 25
+python conditioning.py --checkpoint out/quickdraw/best.pt --per_label 8
 ```
 
 Generate handwriting from a trained model:
