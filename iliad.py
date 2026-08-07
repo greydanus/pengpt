@@ -1,6 +1,6 @@
 """Write the opening of the Iliad, the paragraph the original project used.
 
-    python iliad.py --checkpoint out/best.pt
+    python iliad.py --checkpoint out/cursive/best.pt
 
 Butler's translation, the same passage as cursivetransformer's sample_v70.
 """
@@ -19,7 +19,7 @@ TEXT = ("Sing, O goddess, the anger of Achilles son of Peleus, that brought "
 
 def main():
     p = argparse.ArgumentParser(description="Generate the Iliad opening")
-    p.add_argument("--checkpoint", type=str, default="out/best.pt")
+    p.add_argument("--checkpoint", type=str, default="out/cursive/best.pt")
     p.add_argument("--out", type=str, default="static/iliad.png")
     p.add_argument("--text", type=str, default=TEXT)
     p.add_argument("--temperature", type=float, default=1.0)

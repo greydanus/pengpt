@@ -1,6 +1,6 @@
 """How strongly does the text prompt determine what the model draws?
 
-    python conditioning.py --checkpoint out/best.pt --labels cat,apple,car,fish
+    python conditioning.py --checkpoint out/quickdraw/best.pt --labels cat,apple,car,fish
 
 Score one real drawing under every candidate label and see where its true label
 ranks. If conditioning works the true label fits best, and the rank is
@@ -37,7 +37,7 @@ DEFAULT_LABELS = ("cat,apple,car,fish,tree,house,star,umbrella,clock,ladder,"
 
 def main():
     p = argparse.ArgumentParser(description="Measure prompt conditioning")
-    p.add_argument("--checkpoint", type=str, default="out/best.pt")
+    p.add_argument("--checkpoint", type=str, default="out/quickdraw/best.pt")
     p.add_argument("--labels", type=str, default=DEFAULT_LABELS)
     p.add_argument("--n", type=int, default=25,
                    help="drawings to score; below about 20 the rank is noise")

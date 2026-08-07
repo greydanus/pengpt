@@ -1,6 +1,6 @@
 """Train a PenTransformer.
 
-    python train.py --dataset data/bigbank_3500.json.zip --out_dir out
+    python train.py --dataset data/bigbank_3500.json.zip --out_dir out/cursive
     python train.py --wandb --wandb_entity you --wandb_project pengpt
 
 See pengpt/config.py for the full set of options and their defaults.

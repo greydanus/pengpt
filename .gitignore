@@ -8,7 +8,9 @@ build/
 dist/
 .venv/
 
+# One subfolder per run: out/<experiment>/{best.pt,last.pt,progress/,samples/}
 out/
+*.log
 *.pt
 *.png
 !static/*.png

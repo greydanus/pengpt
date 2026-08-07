@@ -1,6 +1,6 @@
 """Render real handwriting beside what the model generates for the same text.
 
-    python compare.py --checkpoint out/best.pt --out static/compare.png
+    python compare.py --checkpoint out/cursive/best.pt --out static/compare.png
 """
 
 import argparse
@@ -17,7 +17,7 @@ from train import resolve_device
 
 def main():
     p = argparse.ArgumentParser(description="Compare real handwriting to generations")
-    p.add_argument("--checkpoint", type=str, default="out/best.pt")
+    p.add_argument("--checkpoint", type=str, default="out/cursive/best.pt")
     p.add_argument("--out", type=str, default="static/compare.png")
     p.add_argument("--num", type=int, default=6)
     p.add_argument("--temperature", type=float, default=1.0)

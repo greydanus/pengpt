@@ -1,9 +1,9 @@
 """Track sample quality over training as a single contact sheet.
 
-train.py writes out/progress/step_NNNNNN.png at each eval. This stacks them so
+train.py writes out/cursive/progress/step_NNNNNN.png at each eval. This stacks them so
 quality over time is visible at a glance.
 
-    python progress.py --dir out/progress --out static/progress.png
+    python progress.py --dir out/cursive/progress --out static/progress.png
 """
 
 import argparse
@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--dir", type=str, default="out/progress")
+    p.add_argument("--dir", type=str, default="out/cursive/progress")
     p.add_argument("--out", type=str, default="static/progress.png")
     p.add_argument("--max_rows", type=int, default=10)
     args = p.parse_args()

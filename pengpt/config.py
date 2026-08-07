@@ -9,6 +9,14 @@ specific to the machine rather than to the task:
   fewer optimizer steps in the same time. On hardware that does scale, raise it.
 - grid trades reconstruction error against sequence length. 0.020 keeps error
   inside the width of a pen stroke while costing 99 tokens per word.
+
+Every run writes to out/<experiment>/, holding best.pt, last.pt, progress/, and
+samples/. Keeping them under one ignored parent is what stops a run's outputs
+from being committed by accident.
+
+The defaults suit handwriting. A drawing corpus such as Quick, Draw! wants
+--max_words 1 --augment general, a max_text_length near its longest label, and
+a max_seq_length near the p99 token count -- see README.
 """
 
 import argparse
@@ -64,7 +72,7 @@ class TrainConfig:
     print_every: int = 100
     num_workers: int = 4
     device: str = "auto"
-    out_dir: str = "out"
+    out_dir: str = "out/default"
     resume: str = ""
     wandb: bool = False
     wandb_project: str = "pengpt"

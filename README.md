@@ -32,17 +32,55 @@ pytest tests/             # ~1 second
 Train — about 45 minutes on an M-series laptop, no GPU rental needed:
 
 ```bash
-python train.py --dataset data/bigbank_3500.json.zip --out_dir out
+python train.py --dataset data/bigbank_3500.json.zip --out_dir out/cursive
 ```
 
-The best checkpoint lands in `out/`, and `out/progress/` gets one image per
-eval: the same prompts every time, so the strip tracks the model rather than
-the prompt. Stack them with `python progress.py`, or put real handwriting
-beside generations for the same text with `python compare.py`.
+Each run owns a folder under `out/`:
+
+```
+out/cursive/
+  best.pt        lowest test loss so far
+  last.pt        the most recent eval, for --resume
+  progress/      one grid per eval: 8 prompts across, 4 samples down
+  samples/       full-size renders, every fourth eval
+```
+
+Progress images use the same prompts and seeds every time, so consecutive
+images differ only by the model. Four samples per prompt is what makes them
+readable: one sample cannot tell a model ignoring its prompt from a model
+having a bad draw. Stack them with `python progress.py`, or put real
+handwriting beside generations for the same text with `python compare.py`.
 
 Add `--wandb --wandb_entity you` for Weights & Biases logging (optional).
-Resume with `--resume out/best.pt`. For a faster run, `--n_layer 3` roughly
-halves the time and scored within noise of the default in ablations.
+Resume with `--resume out/cursive/last.pt` -- `last.pt`, not `best.pt`, which
+lags whenever test loss has stopped improving. For a faster run, `--n_layer 3`
+roughly halves the time and scored within noise of the default in ablations.
+
+### Drawings rather than handwriting
+
+The defaults are tuned for cursive. A drawing corpus needs three of them
+changed, because its samples are single objects with short labels:
+
+```bash
+python train.py --dataset data/quickdraw_balanced.jsonl.gz \
+  --max_words 1 --augment general \
+  --max_text_length 24 --max_seq_length 384 \
+  --n_layer 6 --n_embd 128 --learning_rate 1e-3 \
+  --out_dir out/quickdraw
+```
+
+`--augment general` drops shear, which is an italic slant that presumes a
+baseline and is a distortion on a sketch. Set `--max_text_length` near the
+longest label and `--max_seq_length` near the p99 token count; leaving them at
+the cursive defaults spends most of every sequence on padding.
+
+Loss alone will not tell you whether the prompt is being read -- a model can
+post a falling loss while drawing the corpus average for every prompt. Measure
+it directly:
+
+```bash
+python conditioning.py --checkpoint out/quickdraw/best.pt --n 25
+```
 
 Generate handwriting from a trained model:
 

@@ -1,6 +1,6 @@
 """Generate handwriting from a trained checkpoint.
 
-    python sample.py --checkpoint out/best.pt --text "The quick brown fox"
+    python sample.py --checkpoint out/cursive/best.pt --text "The quick brown fox"
 
 If a word comes out wrong, find its index with --show_indices and regenerate
 just that word: --redo 3,7
@@ -15,7 +15,7 @@ from train import resolve_device
 
 def main():
     p = argparse.ArgumentParser(description="Sample handwriting from a pengpt model")
-    p.add_argument("--checkpoint", type=str, default="out/best.pt")
+    p.add_argument("--checkpoint", type=str, default="out/cursive/best.pt")
     p.add_argument("--text", type=str, required=True)
     p.add_argument("--out", type=str, default="sample.png")
     p.add_argument("--temperature", type=float, default=1.0)
