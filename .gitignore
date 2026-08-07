@@ -14,3 +14,8 @@ out/
 !static/*.png
 data/*.json
 !data/*.json.zip
+
+# Corpora are rebuilt by download_quickdraw.py and rank_quickdraw.py, and the
+# filtered set is 4.7 GB -- past the 100 MB file GitHub will accept.
+data/*.jsonl
+data/*.jsonl.gz
