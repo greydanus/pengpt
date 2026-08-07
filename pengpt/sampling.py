@@ -150,7 +150,7 @@ def generate_paragraph(model, dataset, text, params=None, words=None, redo=None)
     return words
 
 
-def progress_prompts(dataset, n=3):
+def progress_prompts(dataset, n=8):
     """Prompts drawn from the dataset's own text, so they are always in vocabulary.
 
     Hardcoded prompts silently break on a new corpus: the handwriting defaults
@@ -180,19 +180,44 @@ def _cached_prompts(dataset):
     return _PROMPT_CACHE[key]
 
 
-def save_progress(model, dataset, out_dir, step, prompts=None, temperature=1.0):
-    """Render the same prompts at every eval, so the strip tracks the model."""
+def save_progress(model, dataset, out_dir, step, prompts=None, temperature=1.0,
+                  rows=4):
+    """A grid of samples: one column per prompt, `rows` samples down each.
+
+    Several samples per prompt is what makes the picture readable. One sample
+    cannot distinguish a model that ignores its prompt from one that drew a
+    poor sample, and a column of four shows immediately whether the prompt
+    controls the shape or the model is drawing the corpus average whatever it
+    is asked for.
+
+    Prompts and seeds are fixed across evals, so consecutive images differ only
+    by the model.
+    """
     prompts = prompts or _cached_prompts(dataset)
     os.makedirs(out_dir, exist_ok=True)
     params = SampleParams(temperature=temperature,
                           max_tokens=dataset.cfg.max_seq_length - 1)
-    torch.manual_seed(0)
-    fig, axes = plt.subplots(1, len(prompts), figsize=(4.2 * len(prompts), 1.4))
-    axes = [axes] if len(prompts) == 1 else axes
-    for ax, text in zip(axes, prompts):
-        plot_words(generate(model, dataset, text, params), params,
-                   title=f'"{text}"', ax=ax)
-        ax.set_title(f'"{text}"', fontsize=8)
+
+    fig, axes = plt.subplots(rows, len(prompts),
+                             figsize=(1.9 * len(prompts), 1.9 * rows),
+                             squeeze=False)
+    for col, text in enumerate(prompts):
+        for row in range(rows):
+            torch.manual_seed(row * 31 + 3)
+            plot_words(generate(model, dataset, text, params), params,
+                       ax=axes[row][col], color="k")
+    fig.suptitle(f"step {step:,}", fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+
+    # Label the columns on the figure rather than per axis. An axis title sits
+    # relative to that axis's contents, so a column of short drawings puts its
+    # label lower than the rest; placing them at one figure height keeps them
+    # aligned however tall the samples happen to be.
+    top = max(ax.get_position().y1 for ax in axes[0])
+    for col, text in enumerate(prompts):
+        box = axes[0][col].get_position()
+        fig.text(box.x0 + box.width / 2, top + 0.012, text,
+                 ha="center", va="bottom", fontsize=10)
     path = os.path.join(out_dir, f"step_{step:06d}.png")
     fig.savefig(path, dpi=100, bbox_inches="tight")
     plt.close(fig)
