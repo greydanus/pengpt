@@ -174,7 +174,8 @@ class Embedder:
                 # transformers 5 returns an output object where 4 returned a
                 # tensor, and non-CLIP models pool separately
                 if not hasattr(feats, "float"):
-                    feats = getattr(feats, "image_embeds", None) or feats.pooler_output
+                    feats = (feats.image_embeds if getattr(feats, "image_embeds", None)
+                             is not None else feats.pooler_output)
                 out.append(feats.float().cpu().numpy())
                 if verbose:
                     print(f"  embedded {n}", flush=True)

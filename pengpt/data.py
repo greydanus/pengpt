@@ -224,6 +224,11 @@ class PenDataset(Dataset):
         x[1:n + 1] = torch.from_numpy(tokens[:n])
         x[n + 1] = st.END
         y[:n + 1] = x[1:n + 2]
+        # A word longer than the block is cut, and the cut is not where the
+        # drawing ends: supervising END there teaches that drawings stop
+        # wherever the block does. Everything before the cut is still real.
+        if len(tokens) > n:
+            y[n] = IGNORE_INDEX
         c = torch.from_numpy(self.char_tok.encode(text, self.cfg.max_text_length))
         return x, c, y
 

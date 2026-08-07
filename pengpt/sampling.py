@@ -179,15 +179,11 @@ def progress_prompts(dataset, n=8):
     return out
 
 
-_PROMPT_CACHE = {}
-
-
 def _cached_prompts(dataset):
     """Same prompts every eval, so the strip tracks the model not the prompt."""
-    key = id(dataset)
-    if key not in _PROMPT_CACHE:
-        _PROMPT_CACHE[key] = progress_prompts(dataset)
-    return _PROMPT_CACHE[key]
+    if not hasattr(dataset, "_progress_prompts"):
+        dataset._progress_prompts = progress_prompts(dataset)
+    return dataset._progress_prompts
 
 
 def save_progress(model, dataset, out_dir, step, prompts=None, temperature=1.0,

@@ -245,6 +245,22 @@ def test_works_without_word_structure():
     assert len(st.decode(x.numpy())) == 1      # one trajectory back
 
 
+def test_normalize_absolute_bypasses_delta_detection():
+    """Sparse absolute drawings must not be read as deltas.
+
+    A square is five points after RDP simplification, so its span is small
+    relative to its mean step and the delta heuristic fires; cumsum then turns
+    it into a diagonal staircase. This corrupted 24% of a filtered Quick, Draw!
+    corpus. absolute=True is how a caller that knows its format opts out.
+    """
+    from pengpt.convert import normalize
+    square = np.array([[0, 0, 1], [255, 0, 1], [255, 255, 1],
+                       [0, 255, 1], [0, 0, 1]], dtype=float)
+    out = normalize(square.copy(), absolute=True)
+    assert np.allclose(out[0, :2], out[-1, :2])       # the square stays closed
+    assert (np.diff(out[:, 0]) < 0).any()             # a cumsum'd square is monotone
+
+
 def test_bradley_terry_recovers_an_ordering():
     from pengpt.quality import bradley_terry, spearman
     truth = np.arange(20, dtype=float)
@@ -345,6 +361,21 @@ def test_dataset_never_truncates_mid_word(tiny_dataset):
         end = (x == st.END).nonzero()
         assert len(end) == 1, "exactly one END expected"
         assert end.item() < tiny_dataset.cfg.max_seq_length
+
+
+def test_truncated_word_does_not_supervise_end():
+    """When a word overflows the block, the END written at the cut must not be
+    a training target: the drawing did not actually end there."""
+    cfg = DataConfig(max_seq_length=16, max_text_length=8, max_words=1, grid=0.005)
+    st, ct = ScribeTokenizer(grid=cfg.grid), CharTokenizer(" abc")
+    long_word = make_word(n=200)
+    ds = PenDataset([long_word], ["cab"], np.arange(1), st, ct, cfg, length=1,
+                    augment=False)
+    x, _, y = ds[0]
+    end = (x == st.END).nonzero().item()
+    assert end == cfg.max_seq_length - 1          # cut at the block edge
+    assert y[end - 1] == IGNORE_INDEX             # END not supervised
+    assert (y[:end - 1] != IGNORE_INDEX).all()    # everything before it is
 
 
 def test_bank_smaller_than_max_words():

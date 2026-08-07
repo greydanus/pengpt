@@ -107,7 +107,13 @@ class PenTransformer(nn.Module):
 
         ctx_pos = torch.arange(context.size(1), device=idx.device)
         c = self.ctx_emb(context) + self.ctx_pos_emb(ctx_pos)
-        ctx_mask = (context != 0)[:, None, None, :] if context.dim() == 2 else None
+        ctx_mask = None
+        if context.dim() == 2:
+            ctx_mask = (context != 0)[:, None, None, :]
+            # A prompt of only padding (every char outside the alphabet) would
+            # mask every key, and softmax over an empty row is NaN. Attending
+            # uniformly to padding instead degrades to unconditional generation.
+            ctx_mask = ctx_mask | ~ctx_mask.any(-1, keepdim=True)
 
         for block in self.blocks:
             x = block(x, c, ctx_mask)
