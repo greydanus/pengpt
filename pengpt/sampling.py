@@ -12,9 +12,6 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
-HANDWRITING_PROMPTS = ["the quick brown", "hope and 2926", "Sing of anger"]
-
-
 @dataclass
 class SampleParams:
     temperature: float = 1.0
@@ -157,6 +154,9 @@ def progress_prompts(dataset, n=8):
     contain digits and a capital S, and Quick, Draw!'s 35-character alphabet has
     neither, so those characters encoded as padding and two of three progress
     panels showed nothing meaningful for a whole run.
+
+    A dataset with no usable text raises rather than falling back to those
+    defaults, which would reintroduce exactly that failure somewhere quieter.
     """
     seen, out = set(), []
     for i in range(min(len(dataset), 2000)):
@@ -166,7 +166,10 @@ def progress_prompts(dataset, n=8):
             out.append(text)
         if len(out) >= n:
             break
-    return out or HANDWRITING_PROMPTS[:n]
+    if not out:
+        raise ValueError(f"{dataset.name or 'dataset'} yielded no text to prompt "
+                         "with; progress images need labelled examples")
+    return out
 
 
 _PROMPT_CACHE = {}
