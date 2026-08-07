@@ -124,6 +124,13 @@ def main():
                     artifact.add_file(checkpoint_path)
                     run.log_artifact(artifact)
 
+            # Resuming needs where the run stopped, which is not where it was
+            # last best: on a long run those diverge by thousands of steps, and
+            # --resume best.pt silently replays them.
+            save_checkpoint(os.path.join(train_cfg.out_dir, "last.pt"), model,
+                            char_tok.alphabet, asdict(data_cfg), stroke_tok.merges,
+                            optimizer, scheduler, step, best_loss)
+
             progress = save_progress(model, test_dataset,
                                      os.path.join(train_cfg.out_dir, "progress"), step)
             paths = [progress]
