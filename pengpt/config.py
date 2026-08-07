@@ -14,6 +14,14 @@ Every run writes to out/<experiment>/, holding best.pt, last.pt, progress/, and
 samples/. Keeping them under one ignored parent is what stops a run's outputs
 from being committed by accident.
 
+Comparing two runs. Reported loss is nats per token, which is only comparable
+between runs whose tokenizers agree. Anything that changes tokens per example --
+grid, n_merges, how merges apply -- rescales it, so the run packing more
+information per token posts a higher loss for identical performance. Multiply by
+tokens per example first: a merge-order change here moved 52.1 tokens at 2.3964
+nats and 42.8 at 2.9197, which reads as a large regression and is 180.1 against
+180.3 bits per example, the same number twice.
+
 The defaults suit handwriting. A drawing corpus such as Quick, Draw! wants
 --max_words 1 --augment general, a max_text_length near its longest label, and
 a max_seq_length near the p99 token count -- see README.
