@@ -79,7 +79,7 @@ def main():
             scored = []
             for label in labels:
                 context = torch.from_numpy(
-                    char_tok.encode(label, cfg.max_text_length)).unsqueeze(0).to(device)
+                    dataset.encode_text(label)).unsqueeze(0).to(device)
                 with torch.inference_mode():
                     _, loss = model(x, context, y)
                 scored.append((label, loss.item()))

@@ -126,6 +126,54 @@ def convert_brush(root, max_items=None, pen_down_is=1):
     return examples
 
 
+def convert_fscoco(root, max_items=None):
+    """FS-COCO scene sketches -> pengpt format.
+
+    Layout is raw_data/{user}/{coco_id}.json with a caption in
+    text/{user}/{coco_id}.txt. Each point is {"coordinates": [x, y],
+    "pen_state": one-hot, "timestamp": ms}, coordinates normalized to [0, 1]
+    with y downward. pen_state (0,1,0) is drawing and (1,0,0) marks a stroke
+    end at that coordinate -- the same lift convention pengpt uses, so the
+    flag maps directly. Points are time-sampled at high rate; ScribeTokens
+    is density-insensitive, so no resampling is needed, but nearly-duplicate
+    consecutive points are dropped to keep files small.
+    """
+    examples = []
+    raw_root = os.path.join(root, "raw_data")
+    for user in sorted(os.listdir(raw_root), key=str):
+        user_dir = os.path.join(raw_root, user)
+        if not os.path.isdir(user_dir):
+            continue
+        for name in sorted(os.listdir(user_dir)):
+            if not name.endswith(".json"):
+                continue
+            caption_path = os.path.join(root, "text", user, name[:-5] + ".txt")
+            if not os.path.exists(caption_path):
+                continue
+            caption = open(caption_path).read().strip()
+            with open(os.path.join(user_dir, name)) as f:
+                raw = json.load(f)
+            points = np.array([[p["coordinates"][0], p["coordinates"][1],
+                                1.0 if p["pen_state"][1] == 1 else 0.0]
+                               for p in raw])
+            if len(points) < 4 or not caption:
+                continue
+            # Drop consecutive points that quantize to the same 1e-3 cell,
+            # except lift markers, which carry the stroke boundary.
+            cells = np.rint(points[:, :2] * 1000)
+            same = np.r_[False, (np.diff(cells, axis=0) == 0).all(1)]
+            keep = ~same | (points[:, 2] == 0)
+            points = points[keep]
+            examples.append({
+                "text": caption,
+                "points": normalize(points, absolute=True).round(4).tolist(),
+                "meta": {"user": user, "id": name[:-5]},
+            })
+            if max_items and len(examples) >= max_items:
+                return examples
+    return examples
+
+
 def probe(path):
     """Print what a file holds and how this converter would read it."""
     with open(path, "rb") as f:
@@ -156,6 +204,7 @@ def main():
     p.add_argument("--categories", type=str, default="",
                    help="comma-separated Quick, Draw! categories to keep")
     p.add_argument("--brush_dir", type=str, help="root of an extracted BRUSH dataset")
+    p.add_argument("--fscoco_dir", type=str, help="root of an extracted FS-COCO dataset")
     p.add_argument("--probe", type=str, help="print the structure of one file")
     p.add_argument("--out", type=str, default="data/converted.json")
     p.add_argument("--max_items", type=int, default=None)
@@ -170,6 +219,8 @@ def main():
         examples = convert_quickdraw(args.quickdraw, args.max_items, cats or None)
     elif args.brush_dir:
         examples = convert_brush(args.brush_dir, args.max_items, args.pen_down_is)
+    elif args.fscoco_dir:
+        examples = convert_fscoco(args.fscoco_dir, args.max_items)
     else:
         p.print_help()
         return

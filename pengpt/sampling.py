@@ -41,10 +41,10 @@ def generate(model, dataset, text, params=None):
     the prompt alone drives it, so a sample cannot copy strokes it was shown.
     """
     params = params or SampleParams()
-    st, ct = dataset.stroke_tok, dataset.char_tok
+    st = dataset.stroke_tok
     device = next(model.parameters()).device
     context = torch.from_numpy(
-        ct.encode(text, dataset.cfg.max_text_length)).unsqueeze(0).to(device)
+        dataset.encode_text(text)).unsqueeze(0).to(device)
     idx = torch.full((1, 1), st.BOS, dtype=torch.long, device=device)
     out = model.generate(idx, context, max_new_tokens=params.max_tokens,
                          temperature=params.temperature, top_k=params.top_k,
@@ -207,11 +207,26 @@ def save_progress(model, dataset, out_dir, step, prompts=None, temperature=1.0,
     fig, axes = plt.subplots(rows, len(prompts),
                              figsize=(1.9 * len(prompts), 1.9 * rows),
                              squeeze=False)
-    for col, text in enumerate(prompts):
+    # One batched generate for the whole grid instead of rows x cols separate
+    # calls: at long block sizes the sequential version dominated eval time
+    # (each call re-runs its full prefix every token). A fixed seed keeps the
+    # grid deterministic per eval, so consecutive images still differ only by
+    # the model.
+    st = dataset.stroke_tok
+    device = next(model.parameters()).device
+    contexts = torch.stack([
+        torch.from_numpy(dataset.encode_text(text))
+        for text in prompts for _ in range(rows)]).to(device)
+    torch.manual_seed(3)
+    idx = torch.full((len(contexts), 1), st.BOS, dtype=torch.long, device=device)
+    out = model.generate(idx, contexts, max_new_tokens=params.max_tokens,
+                         temperature=params.temperature, top_k=params.top_k,
+                         do_sample=params.do_sample, end_token=st.END,
+                         pad_token=st.PAD)
+    for col in range(len(prompts)):
         for row in range(rows):
-            torch.manual_seed(row * 31 + 3)
-            plot_words(generate(model, dataset, text, params), params,
-                       ax=axes[row][col], color="k")
+            words = st.decode(out[col * rows + row].cpu().numpy()[1:])
+            plot_words(words, params, ax=axes[row][col], color="k")
     fig.suptitle(f"step {step:,}", fontsize=11)
     fig.tight_layout(rect=[0, 0, 1, 0.94])
 
@@ -222,8 +237,12 @@ def save_progress(model, dataset, out_dir, step, prompts=None, temperature=1.0,
     top = max(ax.get_position().y1 for ax in axes[0])
     for col, text in enumerate(prompts):
         box = axes[0][col].get_position()
-        fig.text(box.x0 + box.width / 2, top + 0.012, text,
-                 ha="center", va="bottom", fontsize=10)
+        # Wrap to the column width, or sentence-length prompts (FS-COCO
+        # captions) run into their neighbors. va="bottom" grows extra lines
+        # upward, into space bbox_inches="tight" then reclaims.
+        wrapped = "\n".join(textwrap.wrap(text, width=24))
+        fig.text(box.x0 + box.width / 2, top + 0.012, wrapped,
+                 ha="center", va="bottom", fontsize=8)
     path = os.path.join(out_dir, f"step_{step:06d}.png")
     fig.savefig(path, dpi=100, bbox_inches="tight")
     plt.close(fig)

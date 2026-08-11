@@ -21,3 +21,7 @@ data/*.json
 # filtered set is 4.7 GB -- past the 100 MB file GitHub will accept.
 data/*.jsonl
 data/*.jsonl.gz
+
+# Source downloads (icon set clones, sketchy parquet, fscoco tarball): many GB,
+# all re-fetchable by the ink_* scripts.
+data/raw/

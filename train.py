@@ -15,8 +15,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from pengpt import (DataConfig, parse_configs, create_datasets, InfiniteDataLoader,
-                    PenTransformer, save_checkpoint, load_checkpoint, save_samples,
-                    save_progress)
+                    BucketedInfiniteLoader, PenTransformer, save_checkpoint,
+                    load_checkpoint, save_samples, save_progress)
 
 
 def resolve_device(device):
@@ -68,8 +68,15 @@ def main():
 
     torch.manual_seed(data_cfg.seed)   # after resume, so it is the run's own seed
 
+    text_encoder = None
+    if data_cfg.text_encoder == "clip+char":
+        text_encoder = "clip+char"
+    elif data_cfg.text_encoder != "char":
+        from pengpt.textenc import build_text_encoder
+        text_encoder = build_text_encoder(data_cfg.text_encoder, device)
     train_dataset, test_dataset, stroke_tok, char_tok = create_datasets(
-        data_cfg, merges=ckpt["merges"] if ckpt else None)
+        data_cfg, merges=ckpt["merges"] if ckpt else None,
+        text_encoder=text_encoder)
     if ckpt:
         assert char_tok.alphabet == ckpt["alphabet"], \
             "dataset alphabet does not match the checkpoint; resume needs its dataset"
@@ -77,8 +84,15 @@ def main():
     model_cfg.block_size = data_cfg.max_seq_length
     model_cfg.context_vocab_size = char_tok.vocab_size
     model_cfg.context_block_size = data_cfg.max_text_length
+    model_cfg.context_dim = (train_dataset.text_encoder.dim
+                             if train_dataset.text_encoder else 0)
 
     model = PenTransformer(model_cfg).to(device)
+    if model_cfg.pen_pos_bands > 0:
+        # The displacement table is a property of the tokenizer; a resume's
+        # state dict re-loads the same values.
+        model.pen_deltas.copy_(torch.tensor(stroke_tok.token_deltas(),
+                                            device=device))
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.learning_rate,
                                   weight_decay=train_cfg.weight_decay,
                                   betas=(0.9, 0.99), eps=1e-8)
@@ -105,13 +119,31 @@ def main():
                          name=train_cfg.wandb_run_name or None,
                          config={**asdict(data_cfg), **asdict(model_cfg), **asdict(train_cfg)})
 
-    loader = InfiniteDataLoader(train_dataset, batch_size=train_cfg.batch_size,
-                                pin_memory=(device == "cuda"),
-                                num_workers=train_cfg.num_workers)
+    if train_cfg.bucket_batches:
+        loader = BucketedInfiniteLoader(train_dataset,
+                                        batch_size=train_cfg.batch_size,
+                                        seed=data_cfg.seed,
+                                        pin_memory=(device == "cuda"),
+                                        num_workers=train_cfg.num_workers)
+    else:
+        loader = InfiniteDataLoader(train_dataset, batch_size=train_cfg.batch_size,
+                                    pin_memory=(device == "cuda"),
+                                    num_workers=train_cfg.num_workers)
+    pad = None
+    if train_cfg.bucket_batches:
+        pad = stroke_tok.PAD
 
     while step < train_cfg.steps:
         t0 = time.time()
         X, C, Y = [t.to(device) for t in loader.next()]
+        if pad is not None:
+            # Trim suffix padding to the batch's longest drawing, rounded so
+            # MPS sees few distinct shapes. Exact: causal attention means real
+            # tokens never look at the trimmed positions, and the loss already
+            # ignores them.
+            n = int((X != pad).sum(1).max())
+            n = min(X.size(1), max(128, (n + 63) // 64 * 64))
+            X, Y = X[:, :n], Y[:, :n]
         _, loss = model(X, C, Y)
 
         model.zero_grad(set_to_none=True)
@@ -121,6 +153,13 @@ def main():
         optimizer.step()
         scheduler.step()
         step += 1
+
+        # The MPS allocator keeps separate cached pools per tensor shape, so
+        # trimmed (varying-length) batches grow resident memory without bound
+        # -- observed at 21GB and swapping by step ~150. Flushing the cache
+        # periodically caps it; the flush costs far less than one step.
+        if pad is not None and device == "mps" and step % 100 == 0:
+            torch.mps.empty_cache()
 
         if run:
             run.log({"train_loss_step": loss.item(), "step": step})

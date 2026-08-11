@@ -49,6 +49,18 @@ class DataConfig:
     rotate: float = 0.0
     shear_min: float = -0.22
     shear_max: float = -0.18
+    # Probability of mirroring a drawing left-right. Skipped for any example
+    # whose caption says "left" or "right", so the text never lies about the
+    # picture. A mirrored scene is a valid scene; mirrored handwriting is not,
+    # so leave this off for text corpora.
+    hflip: float = 0.0
+    tremor: float = 0.0
+    # Probability of deleting each stroke independently (at least one always
+    # survives). A scene of sixty strokes minus three still matches its
+    # caption; a word minus a letter does not, so again: drawings only.
+    stroke_dropout: float = 0.0
+    text_encoder: str = "char"
+    holdout: str = ""
     seed: int = 1337
 
 
@@ -61,9 +73,21 @@ class ModelConfig:
     block_size: int = -1
     context_vocab_size: int = -1
     context_block_size: int = -1
+    # Fourier features of the pen's absolute canvas position, added to the
+    # token embedding. 0 disables (and matches checkpoints from before the
+    # feature existed). The tokens are relative motion, so without this the
+    # model must integrate the whole walk with attention to know whether two
+    # strokes connect; with it, position is an input rather than a computation.
+    pen_pos_bands: int = 0
+    # Training-time random canvas offset in grid cells. Absolute layout can't
+    # be memorized when the origin moves, but within-sample geometry -- which
+    # strokes touch, what is already drawn where -- survives translation.
+    pen_pos_jitter: int = 32
+    context_dim: int = 0
 
 
-DERIVED_FIELDS = {"vocab_size", "block_size", "context_vocab_size", "context_block_size"}
+DERIVED_FIELDS = {"vocab_size", "block_size", "context_vocab_size",
+                  "context_block_size", "context_dim"}
 
 CHOICES = {"augment": ("none", "general", "handwriting")}
 
@@ -79,6 +103,11 @@ class TrainConfig:
     eval_every: int = 1_000
     print_every: int = 100
     num_workers: int = 4
+    # Group similar-length drawings per batch and trim each batch to its
+    # longest member (rounded up, so MPS reuses compiled shapes). Exact --
+    # suffix padding never influences real tokens -- but only worthwhile for
+    # single-drawing corpora whose lengths vary a lot; requires max_words 1.
+    bucket_batches: bool = False
     device: str = "auto"
     out_dir: str = "out/default"
     resume: str = ""

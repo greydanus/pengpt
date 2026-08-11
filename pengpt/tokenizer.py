@@ -64,9 +64,26 @@ def bresenham_steps(x0, y0, x1, y1):
 
 
 def _walk(grid_xy):
+    grid_xy = np.asarray(grid_xy, dtype=np.int64)
+    if len(grid_xy) < 2:
+        return []
+    deltas = np.diff(grid_xy, axis=0)
+    moved = (deltas[:, 0] != 0) | (deltas[:, 1] != 0)
+    deltas = deltas[moved]
+    if not len(deltas):
+        return []
+    # Dense recordings land in the same or an adjacent cell, so nearly every
+    # move is a single direction token; Bresenham only matters for the rare
+    # multi-cell jump. Taking the all-unit case wholesale keeps the per-point
+    # Python loop off the training hot path.
+    if (np.abs(deltas) <= 1).all():
+        return _DIR_LOOKUP[deltas[:, 0] + 1, deltas[:, 1] + 1].tolist()
     out = []
-    for (x0, y0), (x1, y1) in zip(grid_xy[:-1], grid_xy[1:]):
-        if x0 != x1 or y0 != y1:
+    for i in np.flatnonzero(moved):
+        (x0, y0), (x1, y1) = grid_xy[i], grid_xy[i + 1]
+        if abs(x1 - x0) <= 1 and abs(y1 - y0) <= 1:
+            out.append(int(_DIR_LOOKUP[x1 - x0 + 1, y1 - y0 + 1]))
+        else:
             out.extend(int(t) for t in bresenham_steps(x0, y0, x1, y1))
     return out
 
@@ -110,6 +127,21 @@ class ScribeTokenizer:
         # baseline -- the two things a whole sample hangs on.
         self.PAD, self.END, self.WORD, self.BOS = n, n + 1, n + 2, n + 3
         self.vocab_size = n + 4
+
+    def token_deltas(self):
+        """(vocab_size, 2) net pen displacement of every token, in grid cells.
+
+        Base direction tokens move one cell, pen-state and special tokens move
+        nothing, and a merged token moves by the sum of its children -- so the
+        pen's absolute position is the running sum of these deltas over any
+        token sequence, merged or not. This is what lets a model be told where
+        the pen is without changing the token stream.
+        """
+        deltas = np.zeros((self.vocab_size, 2), dtype=np.int64)
+        deltas[:len(DIRECTIONS)] = DIRECTIONS
+        for a, b, c in self.merges:
+            deltas[c] = deltas[a] + deltas[b]
+        return deltas
 
     def encode_word(self, points):
         """Tokens for one word, starting from the baseline at x = 0.
@@ -156,20 +188,27 @@ class ScribeTokenizer:
         """
         if not self._pairs:
             return tokens
-        out = [int(t) for t in tokens]
-        present = set(zip(out, out[1:]))
+        out = np.asarray(tokens, dtype=np.int64).copy()
         for a, b, merged in self.merges:
-            if (a, b) not in present:
+            matches = np.flatnonzero((out[:-1] == a) & (out[1:] == b))
+            if not matches.size:
                 continue
-            nxt, i, n = [], 0, len(out)
-            while i < n:
-                if i + 1 < n and out[i] == a and out[i + 1] == b:
-                    nxt.append(merged); i += 2
-                else:
-                    nxt.append(out[i]); i += 1
-            out = nxt
-            present = set(zip(out, out[1:]))
-        return np.array(out, dtype=np.int64)
+            # A left-to-right pass merges non-overlapping pairs: a match
+            # directly after an applied one shares its second token and is
+            # skipped. Only adjacent matches (runs like [a,a,a] under a rule
+            # (a,a)) need the sequential resolution; otherwise every match
+            # stands.
+            if matches.size > 1 and (np.diff(matches) == 1).any():
+                kept, last = [], -2
+                for i in matches:
+                    if i > last + 1:
+                        kept.append(i); last = i
+                matches = np.array(kept)
+            out[matches] = merged
+            remove = np.ones(len(out), dtype=bool)
+            remove[matches + 1] = False
+            out = out[remove]
+        return out
 
     def decode(self, tokens):
         tokens = np.asarray(tokens)

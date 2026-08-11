@@ -84,11 +84,21 @@ class PenTransformer(nn.Module):
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)
         self.pos_emb = nn.Embedding(cfg.block_size, cfg.n_embd)
-        self.ctx_emb = nn.Embedding(cfg.context_vocab_size, cfg.n_embd)
+        if cfg.context_dim > 0:
+            self.ctx_proj = nn.Linear(cfg.context_dim, cfg.n_embd)
+        else:
+            self.ctx_emb = nn.Embedding(cfg.context_vocab_size, cfg.n_embd)
         self.ctx_pos_emb = nn.Embedding(cfg.context_block_size, cfg.n_embd)
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer))
         self.ln_f = nn.LayerNorm(cfg.n_embd)
         self.head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
+        if cfg.pen_pos_bands > 0:
+            # Filled from the tokenizer by the caller (train.py); restored from
+            # the state dict on load. Rides in the checkpoint like a weight.
+            self.register_buffer("pen_deltas",
+                                 torch.zeros(cfg.vocab_size, 2, dtype=torch.long))
+            self.pen_pos_proj = nn.Linear(4 * cfg.pen_pos_bands, cfg.n_embd,
+                                          bias=False)
         self.apply(self._init_weights)
         print(f"PenTransformer parameters: {sum(p.numel() for p in self.parameters()):,}")
 
@@ -99,16 +109,45 @@ class PenTransformer(nn.Module):
             if getattr(module, "bias", None) is not None:
                 nn.init.zeros_(module.bias)
 
+    def _pen_pos_features(self, idx):
+        """Fourier features of the pen position after each token.
+
+        The position at step t sums the displacements of tokens <= t, so it is
+        known before token t+1 is predicted -- causal by construction, at
+        training time and during generation alike (generate() re-runs the full
+        prefix, so no incremental state is needed). Wavelengths run from 4
+        cells to 4 * 2^(bands-1), resolving both "is this the cell that stroke
+        ended in" and "which side of the canvas am I on". At training time the
+        whole canvas is shifted by a random offset per sample: layout can't be
+        memorized in absolute terms, while every within-sample relation is
+        preserved.
+        """
+        positions = self.pen_deltas[idx].cumsum(dim=1)
+        if self.training and self.cfg.pen_pos_jitter > 0:
+            jitter = self.cfg.pen_pos_jitter
+            offset = torch.randint(-jitter, jitter + 1, (idx.size(0), 1, 2),
+                                   device=idx.device)
+            positions = positions + offset
+        k = torch.arange(self.cfg.pen_pos_bands, device=idx.device)
+        angles = positions[..., None].float() * (torch.pi / (2.0 * 2.0 ** k))
+        feats = torch.cat([angles.sin(), angles.cos()], dim=-1)
+        return feats.flatten(-2)
+
     def forward(self, idx, context, targets=None):
         T = idx.size(1)
         assert T <= self.cfg.block_size, f"sequence length {T} > block size {self.cfg.block_size}"
         pos = torch.arange(T, device=idx.device)
         x = self.tok_emb(idx) + self.pos_emb(pos)
+        if self.cfg.pen_pos_bands > 0:
+            x = x + self.pen_pos_proj(self._pen_pos_features(idx))
 
         ctx_pos = torch.arange(context.size(1), device=idx.device)
-        c = self.ctx_emb(context) + self.ctx_pos_emb(ctx_pos)
-        ctx_mask = None
-        if context.dim() == 2:
+        if context.dim() == 3:
+            c = self.ctx_proj(context) + self.ctx_pos_emb(ctx_pos)
+            ctx_mask = (context.abs().sum(-1) != 0)[:, None, None, :]
+            ctx_mask = ctx_mask | ~ctx_mask.any(-1, keepdim=True)
+        else:
+            c = self.ctx_emb(context) + self.ctx_pos_emb(ctx_pos)
             ctx_mask = (context != 0)[:, None, None, :]
             # A prompt of only padding (every char outside the alphabet) would
             # mask every key, and softmax over an empty row is NaN. Attending
@@ -121,8 +160,8 @@ class PenTransformer(nn.Module):
 
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
-                                   ignore_index=-1)
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
+                                   targets.reshape(-1), ignore_index=-1)
         return logits, loss
 
     @torch.inference_mode()
@@ -196,7 +235,14 @@ def load_for_sampling(path, device="cpu", n_examples=200):
     model, checkpoint = load_checkpoint(path, device)
     cfg = DataConfig(**checkpoint["data_config"])
     cfg.train_size = cfg.test_size = n_examples
-    _, dataset, stroke_tok, char_tok = create_datasets(cfg, merges=checkpoint["merges"])
+    text_encoder = None
+    if getattr(cfg, "text_encoder", "char") == "clip+char":
+        text_encoder = "clip+char"
+    elif getattr(cfg, "text_encoder", "char") != "char":
+        from .textenc import build_text_encoder
+        text_encoder = build_text_encoder(cfg.text_encoder, device)
+    _, dataset, stroke_tok, char_tok = create_datasets(
+        cfg, merges=checkpoint["merges"], text_encoder=text_encoder)
     assert char_tok.alphabet == checkpoint["alphabet"], \
         "dataset alphabet does not match the checkpoint; use the training dataset"
     return model, dataset, cfg, checkpoint

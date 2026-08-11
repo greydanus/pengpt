@@ -5,6 +5,7 @@ import torch
 from pengpt import (DataConfig, ModelConfig, PenTransformer, PenDataset,
                     ScribeTokenizer, CharTokenizer, learn_merges)
 from pengpt.data import IGNORE_INDEX, prepare_word, resample
+from pengpt.model import save_checkpoint, load_checkpoint
 from pengpt.tokenizer import bresenham_steps, DIRECTIONS, DOWN, UP
 
 
@@ -261,6 +262,197 @@ def test_normalize_absolute_bypasses_delta_detection():
     assert (np.diff(out[:, 0]) < 0).any()             # a cumsum'd square is monotone
 
 
+def test_physics_captions_must_determine_their_answer():
+    """A truncated physics caption must not leave the answer ambiguous.
+
+    These captions compare two clauses and the deciding one is usually second,
+    so the cursive default of 50 characters cut 33% of physics_v0 down to a
+    prompt shared by examples with opposite labels. Loss still falls on that
+    data, so only an explicit check catches it.
+    """
+    import physics_sketch
+
+    examples = physics_sketch.generate(300, seed=0)
+    longest = max(len(e["text"]) for e in examples)
+
+    # At the full caption length nothing is truncated, so nothing is ambiguous.
+    assert physics_sketch.check_captions(examples, longest) == longest
+
+    # Half a caption cuts before the deciding clause on every archetype.
+    with pytest.raises(SystemExit, match="no longer determines the answer"):
+        physics_sketch.check_captions(examples, longest // 2)
+
+
+def test_every_physics_archetype_composes_several_attributes():
+    """No archetype may collapse to a handful of captions.
+
+    Distinct captions, not example count, bound what a text-conditioned model
+    can learn: examples sharing a caption differ only in stroke style. Three
+    archetypes once compared a single binned attribute between two objects and
+    so could only ever produce six captions each, however many examples were
+    generated. This pins the floor so that cannot come back unnoticed.
+    """
+    import collections
+
+    import physics_sketch
+
+    rng = np.random.default_rng(0)
+    captions = collections.defaultdict(set)
+    answers = collections.defaultdict(collections.Counter)
+    for i in range(12_000):
+        kind = list(physics_sketch.SPECS)[i % len(physics_sketch.SPECS)]
+        spec = physics_sketch.SPECS[kind](rng)
+        if spec is not None:
+            captions[kind].add(spec["text"])
+            answers[kind][spec["answer"]] += 1
+
+    for kind in physics_sketch.SPECS:
+        # Geometry archetypes carry their variety in the drawing rather than
+        # the caption -- that is the point of them -- so only the caption-borne
+        # archetypes are held to a caption-count floor.
+        if kind not in physics_sketch.GEOMETRY_KINDS:
+            assert len(captions[kind]) >= 40, \
+                f"{kind} has too few distinct captions"
+        # No archetype may be guessable from its answer prior alone.
+        counts = answers[kind]
+        assert max(counts.values()) / sum(counts.values()) < 0.7, \
+            f"{kind} answers are imbalanced: {dict(counts)}"
+
+
+def test_geometry_archetypes_need_the_picture():
+    """Geometry captions must NOT determine the answer; the drawing must.
+
+    The rest of the corpus states every attribute, so the caption alone answers
+    it and a sketch can at best break even. These archetypes are the other
+    regime -- easy with the picture, near chance without -- which is where a
+    scratchpad can actually pay off. If a caption here ever becomes sufficient,
+    the archetype has stopped testing what it exists to test.
+    """
+    import collections
+
+    import physics_sketch
+
+    rng = np.random.default_rng(0)
+    for kind in physics_sketch.GEOMETRY_KINDS:
+        by_caption = collections.defaultdict(collections.Counter)
+        for _ in range(4000):
+            spec = physics_sketch.SPECS[kind](rng)
+            if spec is not None:
+                by_caption[spec["text"]][spec["answer"]] += 1
+        total = sum(sum(c.values()) for c in by_caption.values())
+        best = sum(max(c.values()) for c in by_caption.values())
+        assert best / total < 0.75, (
+            f"{kind} is {best / total:.0%} solvable from the caption alone; "
+            f"the drawing should be carrying that information")
+
+
+def test_chain_terminal_stages_are_balanced():
+    """Each chain question type must be balanced on its own.
+
+    An aggregate check hides a skewed stage behind the mix: a buoyancy stage
+    inheriting a 60/40 float prior stays invisible when most chains end on a
+    seesaw. Balance is per terminal stage or it is not balance.
+    """
+    import collections
+
+    import physics_sketch
+
+    rng = np.random.default_rng(0)
+    by_stage = collections.defaultdict(collections.Counter)
+    for _ in range(6000):
+        spec = physics_sketch.spec_chain(rng, 4)
+        if spec is not None:
+            by_stage[spec["steps"][-1]["stage"]][spec["answer"]] += 1
+
+    assert len(by_stage) >= 5, "chains should end on a variety of stages"
+    for stage, counts in by_stage.items():
+        total = sum(counts.values())
+        if total < 100:                     # too few to judge
+            continue
+        assert max(counts.values()) / total < 0.7, \
+            f"chain stage {stage} is imbalanced: {dict(counts)}"
+
+
+def test_chain_depth_is_real_not_decorative():
+    """A chain's final clause must not give away the answer.
+
+    If it does, every earlier stage is decorative and a "depth 4" example is a
+    depth-1 example wearing a label -- which would silently invalidate any
+    scaling study that uses depth as its independent variable. Stages once
+    named the side they received ("the left chute feeds..."), and the final
+    clause alone then predicted the answer 95% of the time.
+    """
+    import collections
+
+    import physics_sketch
+
+    rng = np.random.default_rng(0)
+    by_last = collections.defaultdict(collections.Counter)
+    steps_seen = []
+    for _ in range(3000):
+        spec = physics_sketch.spec_chain(rng, 4)
+        if spec is None:
+            continue
+        by_last[spec["text"].split(", then ")[-1]][spec["answer"]] += 1
+        steps_seen.append(len(spec["steps"]))
+
+    assert steps_seen and all(n == 4 for n in steps_seen)
+    total = sum(sum(c.values()) for c in by_last.values())
+    best = sum(max(c.values()) for c in by_last.values())
+    assert best / total < 0.7, (
+        f"final clause alone predicts the answer {best / total:.0%} of the time")
+
+
+def test_chain_carries_per_step_ground_truth():
+    """Each step records its input and output, for process-level verification.
+
+    Verifying only the final answer gives one bit per example; the point of
+    generating chains procedurally is that every intermediate state is known,
+    so credit can be assigned per step.
+    """
+    import physics_sketch
+
+    rng = np.random.default_rng(0)
+    example = None
+    while example is None:
+        example = physics_sketch.make_example("chain3", rng)
+
+    steps = example["meta"]["steps"]
+    assert example["meta"]["depth"] == 3 and len(steps) == 3
+    # Each step consumes what the one before it produced.
+    for earlier, later in zip(steps, steps[1:]):
+        assert later["in"] == earlier["out"]
+    assert steps[-1]["out"] == example["meta"]["answer"]
+
+
+def test_plain_style_shortens_sketches():
+    """Plain style must cut sketch length without changing the labels.
+
+    In a depth sweep the sketch should hold reasoning state and nothing else;
+    decorative ink that grows with depth would confound sketch length with
+    reasoning depth.
+    """
+    import physics_sketch
+    from pengpt.tokenizer import ScribeTokenizer
+
+    st = ScribeTokenizer(grid=0.020)
+
+    def token_p99(style):
+        physics_sketch.STYLE = style
+        rng = np.random.default_rng(0)
+        lengths = []
+        while len(lengths) < 60:
+            ex = physics_sketch.make_example("lever", rng)
+            if ex is not None:
+                lengths.append(len(st.encode_word(np.array(ex["points"]))))
+        return np.percentile(lengths, 99)
+
+    try:
+        assert token_p99("plain") < token_p99("rich")
+    finally:
+        physics_sketch.STYLE = "rich"
+
+
 def test_bradley_terry_recovers_an_ordering():
     from pengpt.quality import bradley_terry, spearman
     truth = np.arange(20, dtype=float)
@@ -412,3 +604,221 @@ def test_model_forward_and_generate(tiny_dataset):
     out = model.generate(x[:, :10], c, max_new_tokens=20, end_token=st.END, pad_token=st.PAD)
     assert out.shape[1] <= 30
     assert st.decode(out[0].numpy()) is not None  # arbitrary output decodes safely
+
+
+class _StubTextEncoder:
+    dim = 8
+
+    def encode(self, text, length):
+        out = np.zeros((length, 8), dtype=np.float32)
+        for i, b in enumerate(text.encode()[:length]):
+            out[i, b % 8] = 1.0
+            out[i, (b // 8) % 8] += 0.5
+        return out
+
+
+def test_float_context_path(tiny_dataset):
+    st, cfg = tiny_dataset.stroke_tok, tiny_dataset.cfg
+    tiny_dataset.text_encoder = _StubTextEncoder()
+    try:
+        x, c, y = tiny_dataset[0]
+        assert c.dtype == torch.float32
+        assert c.shape == (cfg.max_text_length, 8)
+        mcfg = ModelConfig(n_layer=2, n_head=2, n_embd=32, vocab_size=st.vocab_size,
+                           block_size=cfg.max_seq_length, context_vocab_size=1,
+                           context_block_size=cfg.max_text_length, context_dim=8)
+        model = PenTransformer(mcfg)
+        logits, loss = model(x.unsqueeze(0), c.unsqueeze(0), y.unsqueeze(0))
+        assert torch.isfinite(loss)
+        empty = torch.zeros(1, cfg.max_text_length, 8)
+        _, loss2 = model(x.unsqueeze(0), empty, y.unsqueeze(0))
+        assert torch.isfinite(loss2)
+        out = model.generate(x.unsqueeze(0)[:, :6], c.unsqueeze(0),
+                             max_new_tokens=8, end_token=st.END, pad_token=st.PAD)
+        assert out.shape[1] <= 14
+    finally:
+        tiny_dataset.text_encoder = None
+
+
+def test_clip_char_encode_structure(tiny_dataset):
+    from pengpt.textenc import CharClipEncoder
+    enc = CharClipEncoder.__new__(CharClipEncoder)
+    enc.char_tok = tiny_dataset.char_tok
+    enc.clip_dim = 4
+    enc.dim = 4 + tiny_dataset.char_tok.vocab_size
+    enc._global = lambda text: np.array([1, 0, 0, 0], dtype=np.float32)
+    out = enc.encode("cab", 8)
+    ct = tiny_dataset.char_tok
+    assert out.shape == (8, enc.dim)
+    assert (out[:3, 0] == 1).all() and (out[3:] == 0).all()
+    for i, ch in enumerate("cab"):
+        assert out[i, 4 + ct.stoi[ch]] == 1.0
+        assert out[i, 4:].sum() == 1.0
+
+
+def test_holdout_filter():
+    from pengpt.data import filter_holdout
+    examples = [{"text": "a big wolf"}, {"text": "wolfhound"},
+                {"text": "a cat"}, {"text": "gray wolf pup"}]
+    kept = filter_holdout(examples, "wolf")
+    assert [e["text"] for e in kept] == ["wolfhound", "a cat"]
+    assert filter_holdout(examples, "") is examples
+
+
+def test_token_deltas_track_pen_position(tiny_dataset):
+    """The per-token displacement table must integrate to the true pen path,
+    through BPE merges, or pen-position features would silently lie."""
+    st = tiny_dataset.stroke_tok
+    deltas = st.token_deltas()
+    rng = np.random.default_rng(0)
+    points = np.column_stack([np.cumsum(rng.normal(0, 0.05, (30, 2)), axis=0),
+                              np.ones(30)])
+    points[9, 2] = 0  # a lift mid-way
+    tokens = st.encode_word(points)
+    summed = deltas[tokens].sum(axis=0)
+    grid_end = np.rint(points[-1, :2] / st.grid).astype(int)
+    assert (summed == grid_end).all()
+
+
+def test_pen_pos_features_are_causal_and_checkpoint_safe(tiny_dataset, tmp_path):
+    st, ct, cfg = tiny_dataset.stroke_tok, tiny_dataset.char_tok, tiny_dataset.cfg
+    mcfg = ModelConfig(n_layer=2, n_head=2, n_embd=32, vocab_size=st.vocab_size,
+                       block_size=cfg.max_seq_length, context_vocab_size=ct.vocab_size,
+                       context_block_size=cfg.max_text_length, pen_pos_bands=6)
+    model = PenTransformer(mcfg)
+    model.pen_deltas.copy_(torch.tensor(st.token_deltas()))
+    model.eval()
+    x, c, y = (t.unsqueeze(0) for t in tiny_dataset[0])
+    logits, loss = model(x, c, y)
+    assert torch.isfinite(loss)
+
+    # Causality: changing a suffix token must not change earlier logits.
+    x2 = x.clone()
+    x2[0, -1] = (x2[0, -1] + 1) % st.vocab_size
+    logits2, _ = model(x2, c, y)
+    assert torch.allclose(logits[0, :-1], logits2[0, :-1], atol=1e-5)
+
+    # Round-trip through a checkpoint, table included.
+    path = tmp_path / "ckpt.pt"
+    save_checkpoint(str(path), model, ct.alphabet, {"dataset": "x"}, st.merges)
+    reloaded, _ = load_checkpoint(str(path))
+    assert (reloaded.pen_deltas == model.pen_deltas).all()
+
+    # A no-position config must still load checkpoints that never had one.
+    mcfg0 = ModelConfig(n_layer=2, n_head=2, n_embd=32, vocab_size=st.vocab_size,
+                        block_size=cfg.max_seq_length, context_vocab_size=ct.vocab_size,
+                        context_block_size=cfg.max_text_length)
+    model0 = PenTransformer(mcfg0)
+    logits0, _ = model0(x, c, y)
+    assert logits0.shape == logits.shape
+
+
+def _apply_merges_reference(merges, pairs, tokens):
+    """The pre-vectorization implementation, kept to pin exact equivalence."""
+    if not pairs:
+        return np.asarray(tokens)
+    out = [int(t) for t in tokens]
+    present = set(zip(out, out[1:]))
+    for a, b, merged in merges:
+        if (a, b) not in present:
+            continue
+        nxt, i, n = [], 0, len(out)
+        while i < n:
+            if i + 1 < n and out[i] == a and out[i + 1] == b:
+                nxt.append(merged); i += 2
+            else:
+                nxt.append(out[i]); i += 1
+        out = nxt
+        present = set(zip(out, out[1:]))
+    return np.array(out, dtype=np.int64)
+
+
+def _walk_reference(grid_xy):
+    out = []
+    for (x0, y0), (x1, y1) in zip(grid_xy[:-1], grid_xy[1:]):
+        if x0 != x1 or y0 != y1:
+            out.extend(int(t) for t in bresenham_steps(x0, y0, x1, y1))
+    return out
+
+
+def test_vectorized_tokenizer_matches_reference(tiny_dataset):
+    from pengpt.tokenizer import _walk
+    st = tiny_dataset.stroke_tok
+    rng = np.random.default_rng(7)
+    for trial in range(30):
+        # Walks with dense unit steps, repeats, and occasional long jumps.
+        steps = rng.integers(-1, 2, size=(rng.integers(2, 60), 2))
+        steps[rng.random(len(steps)) < 0.1] *= rng.integers(2, 9)
+        grid = np.cumsum(steps, axis=0)
+        assert _walk(grid) == _walk_reference(grid)
+
+        # Token streams engineered to hit overlapping-run merges too.
+        tokens = rng.integers(0, st.vocab_size // 2, size=rng.integers(2, 200))
+        tokens[rng.random(len(tokens)) < 0.3] = tokens[0]  # force runs
+        got = st.apply_merges(np.asarray(tokens))
+        want = _apply_merges_reference(st.merges, st._pairs, tokens)
+        assert (got == want).all(), trial
+
+
+def test_augment_drawing():
+    from types import SimpleNamespace
+    from pengpt.data import augment_drawing
+    rng = np.random.default_rng(0)
+    pts = np.array([[0, 0, 1], [1, 0, 1], [1, 0, 0],
+                    [2, 2, 1], [3, 2, 1], [3, 2, 0],
+                    [5, 1, 1], [6, 1, 1], [6, 1, 0]], dtype=float)
+
+    # Defaults are inert.
+    cfg = SimpleNamespace(stroke_dropout=0.0, hflip=0.0, tremor=0.0)
+    assert (augment_drawing(pts, "a scene", cfg, rng) == pts).all()
+
+    # Dropout removes whole strokes with their lift rows, never all of them.
+    cfg = SimpleNamespace(stroke_dropout=0.999, hflip=0.0, tremor=0.0)
+    out = augment_drawing(pts, "a scene", cfg, rng)
+    assert len(out) in (3, 6) and (out[:, 2] == 1).sum() >= 2
+    assert (out[-1, 2] == 0)
+
+    # Flip reflects x within the bbox, but never when the caption is sided.
+    cfg = SimpleNamespace(stroke_dropout=0.0, hflip=1.0, tremor=0.0)
+    out = augment_drawing(pts, "a scene", cfg, rng)
+    assert np.isclose(out[:, 0].min(), pts[:, 0].min())
+    assert np.isclose(out[:, 0].max(), pts[:, 0].max())
+    assert np.isclose(out[0, 0], 6.0)
+    kept = augment_drawing(pts, "a tree on the left", cfg, rng)
+    assert (kept == pts).all()
+
+    # Tremor perturbs a dense stroke without changing its structure: same
+    # point count, pen states untouched, displacement bounded near the
+    # amplitude (perpendicular noise plus endpoint slop, never a redraw).
+    line = np.column_stack([np.linspace(0, 1, 60), np.zeros(60), np.ones(60)])
+    line[-1, 2] = 0
+    cfg = SimpleNamespace(stroke_dropout=0.0, hflip=0.0, tremor=0.004)
+    out = augment_drawing(line.copy(), "a scene", cfg, np.random.default_rng(1))
+    assert out.shape == line.shape
+    assert (out[:, 2] == line[:, 2]).all()
+    assert not np.allclose(out[:, :2], line[:, :2])
+    assert np.abs(out[:, 1]).max() < 6 * cfg.tremor
+    # Two-point strokes have no interior to wave; they pass through untouched.
+    assert (augment_drawing(pts, "a scene", cfg,
+                            np.random.default_rng(2)) == pts).all()
+
+
+def test_bucketed_loader(tiny_dataset):
+    from pengpt.data import BucketedInfiniteLoader
+
+    # bank_word_for must replay exactly the draw __getitem__ makes.
+    if tiny_dataset.cfg.max_words == 1:
+        for idx in range(20):
+            bank = tiny_dataset.bank_word_for(idx)
+            assert tiny_dataset.text_for(idx) == tiny_dataset.bank_texts[bank]
+
+    ds = tiny_dataset
+    ds.cfg.max_words = 1
+    for idx in range(20):
+        bank = ds.bank_word_for(idx)
+        assert ds.bank_texts[bank] in ds.text_for(idx) or \
+            ds.text_for(idx) == ds.bank_texts[bank]
+
+    loader = BucketedInfiniteLoader(ds, batch_size=4, num_workers=0)
+    x, c, y = loader.next()
+    assert x.shape[0] == 4 and x.shape[1] == ds.cfg.max_seq_length

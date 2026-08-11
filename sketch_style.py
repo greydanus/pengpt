@@ -201,3 +201,106 @@ def ground_hatched(x0, x1, y, rng):
 
 
 GROUND_PROGRAMS = [ground_line, ground_line, ground_hatched]  # hatching is rarer
+
+
+# ------------------------------------------------- mechanisms and annotations
+#
+# Depictions for archetypes beyond weights on planks. Each is a polyline
+# program with the same contract as the ones above -- take a position and a
+# size, return a list of stroke arrays in y-up coordinates -- so humanize() and
+# the compilers treat them no differently.
+
+
+def spring_coil(x, y0, y1, rng, width=0.020, coils=5):
+    """A vertical zigzag between two heights: the standard sketch spring.
+
+    Coil count reads as stiffness in a drawing, but here it is fixed and the
+    stated stiffness carries the physics -- a drawing convention should not
+    quietly become a second channel for the answer.
+    """
+    n = max(2, coils) * 2
+    ys = np.linspace(y0, y1, n + 1)
+    xs = [x + (width if i % 2 else -width) for i in range(n)] + [x]
+    xs[0] = x
+    return [np.column_stack([xs, ys])]
+
+
+def spring_arcs(x, y0, y1, rng, width=0.020, coils=5):
+    """The same spring drawn as stacked half-circles rather than a zigzag."""
+    out, ys = [], np.linspace(y0, y1, max(2, coils) + 1)
+    for lo, hi in zip(ys[:-1], ys[1:]):
+        t = np.linspace(-np.pi / 2, np.pi / 2, 9)
+        side = 1 if len(out) % 2 == 0 else -1
+        out.append(np.column_stack([x + side * width * np.cos(t),
+                                    (lo + hi) / 2 + (hi - lo) / 2 * np.sin(t)]))
+    return out
+
+
+SPRING_PROGRAMS = [spring_coil, spring_arcs]
+
+
+def wheel_plain(cx, cy, r, rng):
+    return ball_circle(cx, cy, r, rng)
+
+
+def wheel_spoked(cx, cy, r, rng):
+    """A circle with two crossing spokes: reads as a wheel rather than a ball."""
+    out = ball_circle(cx, cy, r, rng)
+    for a in (rng.uniform(0, np.pi / 2), rng.uniform(0, np.pi / 2) + np.pi / 2):
+        out.append(np.array([(cx - r * np.cos(a), cy - r * np.sin(a)),
+                             (cx + r * np.cos(a), cy + r * np.sin(a))], float))
+    return out
+
+
+WHEEL_PROGRAMS = [wheel_plain, wheel_spoked]
+
+
+def pulley(cx, cy, r, rng):
+    """A wheel with a hanger above it, for rope-and-pulley scenes."""
+    out = ball_circle(cx, cy, r, rng)
+    out.append(np.array([(cx, cy + r), (cx, cy + r + 0.03)], float))
+    return out
+
+
+def beaker(cx, base_y, w, h, rng):
+    """An open-topped vessel: two walls and a floor, drawn in one stroke."""
+    return [np.array([(cx - w / 2, base_y + h), (cx - w / 2, base_y),
+                      (cx + w / 2, base_y), (cx + w / 2, base_y + h)], float)]
+
+
+def beaker_footed(cx, base_y, w, h, rng):
+    out = beaker(cx, base_y, w, h, rng)
+    out.append(np.array([(cx - w * 0.7, base_y), (cx + w * 0.7, base_y)], float))
+    return out
+
+
+VESSEL_PROGRAMS = [beaker, beaker_footed]
+
+
+def fill_level(cx, base_y, w, level_y, rng):
+    """A waterline across a vessel, with a small meniscus wobble."""
+    return [np.array([(cx - w / 2 * 0.94, level_y),
+                      (cx, level_y + rng.uniform(-0.004, 0.004)),
+                      (cx + w / 2 * 0.94, level_y)], float)]
+
+
+def arrow(x, y, dx, dy, rng, head=0.012):
+    """A straight arrow from (x, y) along (dx, dy), with a two-stroke head."""
+    x1, y1 = x + dx, y + dy
+    norm = np.hypot(dx, dy) + 1e-9
+    ux, uy = dx / norm, dy / norm
+    px, py = -uy, ux
+    return [np.array([(x, y), (x1, y1)], float),
+            np.array([(x1 - head * (ux - px * 0.6), y1 - head * (uy - py * 0.6)),
+                      (x1, y1),
+                      (x1 - head * (ux + px * 0.6), y1 - head * (uy + py * 0.6))],
+                     float)]
+
+
+def magnet_horseshoe(cx, cy, w, h, rng):
+    """A U shape: two prongs joined by an arc, opening upward."""
+    t = np.linspace(np.pi, 2 * np.pi, 12)
+    arc = np.column_stack([cx + (w / 2) * np.cos(t), cy + (h / 3) * np.sin(t)])
+    left = np.array([(cx - w / 2, cy), (cx - w / 2, cy + h * 0.6)], float)
+    right = np.array([(cx + w / 2, cy), (cx + w / 2, cy + h * 0.6)], float)
+    return [np.vstack([left[::-1], arc, right])]

@@ -26,7 +26,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from .tokenizer import ScribeTokenizer, CharTokenizer, learn_merges
+from .tokenizer import ScribeTokenizer, CharTokenizer, learn_merges, _stroke_spans
 
 IGNORE_INDEX = -1
 Y_BASELINE = 0.65
@@ -162,10 +162,84 @@ def prepare_word(points, cfg, rng=None):
     return resample(points, spacing) if spacing > 0 else points
 
 
+def _tremor(points, rng, amp, wavelength=0.055, end_scale=0.006):
+    """Hand tremor and endpoint slop, per pen-down stroke.
+
+    Designer-drawn sources (icon sets, procedural sketches) are ruler-perfect:
+    exact circles, straight lines, corners that close. A model trained on them
+    learns a drafting machine's hand. This bridges toward human ink the same
+    way sketch_style.humanize does for the physics corpus: smooth low-frequency
+    noise perpendicular to each path -- knots every ~wavelength of arc,
+    interpolated, so lines wave the way a freehand line waves rather than
+    jittering per point -- plus endpoints extended or trimmed by a few
+    millimetres of canvas, so corners overshoot or fall short.
+
+    amp is in ink units (INK_HEIGHT is 0.22, so 0.004 is ~2% of letter height,
+    about a third of the default token grid: visible waver, same drawing).
+    """
+    out = points.copy()
+    for start, stop in _stroke_spans(points[:, 2]):
+        seg = out[start:stop, :2]
+        if len(seg) < 3:
+            continue
+        d = np.r_[0.0, np.cumsum(np.hypot(*np.diff(seg, axis=0).T))]
+        if d[-1] < 1e-6:
+            continue
+        knots = max(3, int(d[-1] / wavelength) + 2)
+        knot_val = rng.normal(0, amp, knots)
+        offset = np.interp(d, np.linspace(0, d[-1], knots), knot_val)
+        tangent = np.gradient(seg, axis=0)
+        norm = np.hypot(tangent[:, 0], tangent[:, 1]) + 1e-9
+        normal = np.column_stack([-tangent[:, 1], tangent[:, 0]]) / norm[:, None]
+        seg += offset[:, None] * normal
+        # Endpoint slop: overshoot along the end tangent, or stop short.
+        for end, t in ((0, seg[0] - seg[1]), (-1, seg[-1] - seg[-2])):
+            delta = rng.uniform(-end_scale, end_scale)
+            if delta > 0:
+                seg[end] += t / (np.hypot(*t) + 1e-9) * delta
+        out[start:stop, :2] = seg
+    return out
+
+
+def augment_drawing(points, text, cfg, rng):
+    """Drawing-only augmentations that need the caption or stroke structure.
+
+    These run after prepare_word's geometric jitter. All are off by default
+    and belong to drawing corpora: mirrored or stroke-dropped handwriting
+    stops matching its transcript, but a scene stays a scene.
+    """
+    if cfg.tremor > 0:
+        # Amplitude varies per drawing: a corpus of one fixed waver is as
+        # synthetic as no waver. Sampling U(0.3, 1) x tremor spans careful
+        # hands to casual ones without reaching the level that mangles small
+        # elements (measured: 2x the default visibly distorts a plus sign).
+        points = _tremor(points, rng, rng.uniform(0.3, 1.0) * cfg.tremor)
+    if cfg.stroke_dropout > 0:
+        spans = _stroke_spans(points[:, 2])
+        if len(spans) > 1:
+            drop = rng.random(len(spans)) < cfg.stroke_dropout
+            if drop.all():
+                drop[rng.integers(len(spans))] = False
+            keep = np.ones(len(points), dtype=bool)
+            for (start, stop), d in zip(spans, drop):
+                if d:
+                    # The lift row after the run belongs to the stroke.
+                    lift = stop < len(points) and points[stop, 2] == 0
+                    keep[start:stop + (1 if lift else 0)] = False
+            points = points[keep]
+    if cfg.hflip > 0 and rng.random() < cfg.hflip:
+        lowered = text.lower()
+        if "left" not in lowered and "right" not in lowered:
+            points = points.copy()
+            # Reflect within the bounding box, so coordinates keep their range.
+            points[:, 0] = points[:, 0].max() + points[:, 0].min() - points[:, 0]
+    return points
+
+
 class PenDataset(Dataset):
 
     def __init__(self, bank_points, bank_texts, indices, stroke_tok, char_tok, cfg,
-                 length, augment=True, name="", seed=0):
+                 length, augment=True, name="", seed=0, text_encoder=None):
         self.bank_points = bank_points
         self.bank_texts = bank_texts
         self.indices = np.asarray(indices)
@@ -176,6 +250,12 @@ class PenDataset(Dataset):
         self.augment = augment
         self.name = name
         self.seed = seed
+        self.text_encoder = text_encoder
+
+    def encode_text(self, text):
+        if self.text_encoder is not None:
+            return self.text_encoder.encode(text, self.cfg.max_text_length)
+        return self.char_tok.encode(text, self.cfg.max_text_length)
 
     def __len__(self):
         return self.length
@@ -198,6 +278,8 @@ class PenDataset(Dataset):
         for i in rng.choice(self.indices, size=draw, replace=False)[:limit]:
             word = prepare_word(self.bank_points[i], self.cfg,
                                 rng if self.augment else None)
+            if self.augment:
+                word = augment_drawing(word, self.bank_texts[i], self.cfg, rng)
             tokens = self.stroke_tok.encode_word(word)
             extra = len(tokens) + (2 if parts else 0)
             if parts and total + extra > block - 2:   # room for BOS and END
@@ -208,6 +290,19 @@ class PenDataset(Dataset):
             total += extra
             chosen.append(i)
         return np.concatenate(parts), " ".join(self.bank_texts[i] for i in chosen)
+
+    def bank_word_for(self, idx):
+        """The bank index that __getitem__(idx) will draw, without tokenizing.
+
+        Replays pick_words' first two rng draws, which is only well-defined at
+        max_words == 1 (one word, no packing loop). Length-bucketed batching
+        uses this to group samples of similar size for a fraction of the cost
+        of actually encoding them; a test pins the replay to pick_words.
+        """
+        assert self.cfg.max_words == 1
+        rng = np.random.default_rng([self.seed, idx])
+        rng.integers(1, min(1, len(self.indices)) + 1)  # pick_words' limit draw
+        return int(rng.choice(self.indices, size=1, replace=False)[0])
 
     def __getitem__(self, idx):
         rng = np.random.default_rng([self.seed, idx])
@@ -229,21 +324,34 @@ class PenDataset(Dataset):
         # wherever the block does. Everything before the cut is still real.
         if len(tokens) > n:
             y[n] = IGNORE_INDEX
-        c = torch.from_numpy(self.char_tok.encode(text, self.cfg.max_text_length))
+        c = torch.from_numpy(self.encode_text(text))
         return x, c, y
 
     def text_for(self, idx):
         return self.pick_words(np.random.default_rng([self.seed, idx]))[1]
 
 
-def create_datasets(cfg, merges=None):
+def filter_holdout(examples, holdout):
+    held = {w.strip().lower() for w in holdout.split(",") if w.strip()}
+    if not held:
+        return examples
+    kept = [e for e in examples if not (held & set(e["text"].lower().split()))]
+    print(f"Holdout {sorted(held)}: {len(examples) - len(kept)} examples removed")
+    return kept
+
+
+def create_datasets(cfg, merges=None, text_encoder=None):
     examples = load_examples(cfg.dataset, getattr(cfg, 'max_examples', 0) or None)
+    examples = filter_holdout(examples, getattr(cfg, "holdout", ""))
     check_scale(examples, cfg.grid)
     bank_points = [e["points"] for e in examples]
     bank_texts = [e["text"] for e in examples]
 
     alphabet = " " + "".join(sorted(set("".join(bank_texts)) - {" "}))
     char_tok = CharTokenizer(alphabet)
+    if text_encoder == "clip+char":
+        from .textenc import build_text_encoder
+        text_encoder = build_text_encoder("clip+char", char_tok=char_tok)
 
     rng = np.random.default_rng(cfg.seed)
     perm = rng.permutation(len(examples))
@@ -260,7 +368,8 @@ def create_datasets(cfg, merges=None):
 
     def build(ix, n, name, seed):
         return PenDataset(bank_points, bank_texts, ix, stroke_tok, char_tok, cfg,
-                          length=n, augment=cfg.augment != "none", name=name, seed=seed)
+                          length=n, augment=cfg.augment != "none", name=name,
+                          seed=seed, text_encoder=text_encoder)
 
     train_dataset = build(train_ix, cfg.train_size, "train", cfg.seed)
     test_dataset = build(test_ix, cfg.test_size, "test", cfg.seed + 1)
@@ -284,3 +393,52 @@ class InfiniteDataLoader:
         except StopIteration:
             self.iterator = iter(self.loader)
             return next(self.iterator)
+
+
+class _BucketBatches:
+    """Endless batches of dataset indices, grouped by drawing size.
+
+    Random batches are padded to their longest member, and the longest of
+    sixteen random scenes is nearly always near the block size -- so almost
+    nothing is saved by trimming them. Sorting a shuffled window by point
+    count (a cheap proxy for token count) before chunking makes batches
+    length-homogeneous, which is what lets the training loop cut most of the
+    padding. Sampling stays uniform: every index in a window is used exactly
+    once, windows are drawn at random, and batch order is shuffled.
+    """
+
+    def __init__(self, dataset, batch_size, window_batches=64, seed=0):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.window = batch_size * window_batches
+        self.rng = np.random.default_rng(seed)
+        # Unaugmented token counts, once per bank word. Raw point count is a
+        # poor proxy -- BPE compresses drawings unevenly -- and fuzzy sorting
+        # leaves batches nearly as padded as random ones. Augmentation moves a
+        # length ~15%, which sorting tolerates.
+        self.sizes = np.array([len(dataset.stroke_tok.encode_word(p))
+                               for p in dataset.bank_points])
+
+    def __iter__(self):
+        while True:
+            indices = self.rng.integers(0, len(self.dataset), size=self.window)
+            proxy = self.sizes[[self.dataset.bank_word_for(i) for i in indices]]
+            indices = indices[np.argsort(proxy, kind="stable")]
+            batches = [indices[i:i + self.batch_size].tolist()
+                       for i in range(0, len(indices), self.batch_size)]
+            self.rng.shuffle(batches)
+            yield from batches
+
+
+class BucketedInfiniteLoader:
+    """InfiniteDataLoader that groups similar-length drawings per batch."""
+
+    def __init__(self, dataset, batch_size, seed=0, **kwargs):
+        self.loader = DataLoader(dataset,
+                                 batch_sampler=_BucketBatches(dataset, batch_size,
+                                                              seed=seed),
+                                 **kwargs)
+        self.iterator = iter(self.loader)
+
+    def next(self):
+        return next(self.iterator)
