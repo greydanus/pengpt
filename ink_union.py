@@ -17,7 +17,7 @@ def canonical(text):
 SOURCES = [
     ("quickdraw", "data/quickdraw_balanced_fixed.jsonl.gz", 120_000),
     ("sketchy", "data/sketchy_tags.jsonl", 0),
-    ("icons", "data/icons.jsonl", 0),
+    ("icons", "data/icons_captioned.jsonl", 0),
 ]
 
 
@@ -35,7 +35,10 @@ def main():
             for i, item in enumerate(_read(path)):
                 if i % stride:
                     continue
-                text = canonical(item["text"])
+                raw = item["text"]
+                if raw == "unrecognizable":
+                    raw = item.get("meta", {}).get("label", "")
+                text = canonical(raw)
                 if not text:
                     continue
                 meta = item.get("meta", {})

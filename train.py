@@ -142,12 +142,18 @@ def main():
         t0 = time.time()
         X, C, Y = [t.to(device) for t in loader.next()]
         if pad is not None:
-            # Trim suffix padding to the batch's longest drawing, rounded so
-            # MPS sees few distinct shapes. Exact: causal attention means real
-            # tokens never look at the trimmed positions, and the loss already
-            # ignores them.
+            # Trim suffix padding to the batch's longest drawing. Exactly two
+            # shapes (half block or full): the 2023-era rounding to 64 made
+            # ~10 distinct shapes, and MPSGraph keeps a workspace per shape --
+            # that is the unbounded-memory trap that shelved bucketing on MPS.
+            # Two shapes bounds it at two workspaces while capturing most of
+            # the win when the corpus mix is mostly-short (union: 66% fits the
+            # half block). Exact either way: causal attention means real
+            # tokens never look at trimmed positions, and the loss ignores
+            # them.
             n = int((X != pad).sum(1).max())
-            n = min(X.size(1), max(128, (n + 63) // 64 * 64))
+            half = X.size(1) // 2
+            n = half if n <= half else X.size(1)
             X, Y = X[:, :n], Y[:, :n]
         _, loss = model(X, C, Y)
 
