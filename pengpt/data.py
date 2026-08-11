@@ -97,7 +97,8 @@ def load_examples(path, limit=None):
             points[:, 1] -= Y_BASELINE
         points[:, 0] -= points[0, 0]
         text = item.get("text", meta.get("asciiSequence", ""))
-        examples.append({"text": text, "points": points})
+        examples.append({"text": text, "points": points,
+                         "source": item.get("meta", {}).get("source", "")})
     print(f"Loaded {len(examples)} examples from {path}")
     return examples
 
@@ -201,20 +202,29 @@ def _tremor(points, rng, amp, wavelength=0.055, end_scale=0.006):
     return out
 
 
-def augment_drawing(points, text, cfg, rng):
+HUMAN_INK = {"sketchy", "quickdraw", "fscoco"}
+NO_FLIP = {"icons"}
+NO_DROPOUT = {"icons"}
+
+
+def augment_drawing(points, text, cfg, rng, source=""):
     """Drawing-only augmentations that need the caption or stroke structure.
 
     These run after prepare_word's geometric jitter. All are off by default
     and belong to drawing corpora: mirrored or stroke-dropped handwriting
     stops matching its transcript, but a scene stays a scene.
+
+    Sources gate what applies: tremor humanizes designer geometry, so human
+    ink skips it; icons skip mirroring (letterform labels) and stroke dropout
+    (a dropped stroke can be the x in "ticket x").
     """
-    if cfg.tremor > 0:
+    if cfg.tremor > 0 and source not in HUMAN_INK:
         # Amplitude varies per drawing: a corpus of one fixed waver is as
         # synthetic as no waver. Sampling U(0.3, 1) x tremor spans careful
         # hands to casual ones without reaching the level that mangles small
         # elements (measured: 2x the default visibly distorts a plus sign).
         points = _tremor(points, rng, rng.uniform(0.3, 1.0) * cfg.tremor)
-    if cfg.stroke_dropout > 0:
+    if cfg.stroke_dropout > 0 and source not in NO_DROPOUT:
         spans = _stroke_spans(points[:, 2])
         if len(spans) > 1:
             drop = rng.random(len(spans)) < cfg.stroke_dropout
@@ -227,7 +237,7 @@ def augment_drawing(points, text, cfg, rng):
                     lift = stop < len(points) and points[stop, 2] == 0
                     keep[start:stop + (1 if lift else 0)] = False
             points = points[keep]
-    if cfg.hflip > 0 and rng.random() < cfg.hflip:
+    if cfg.hflip > 0 and source not in NO_FLIP and rng.random() < cfg.hflip:
         lowered = text.lower()
         if "left" not in lowered and "right" not in lowered:
             points = points.copy()
@@ -239,7 +249,8 @@ def augment_drawing(points, text, cfg, rng):
 class PenDataset(Dataset):
 
     def __init__(self, bank_points, bank_texts, indices, stroke_tok, char_tok, cfg,
-                 length, augment=True, name="", seed=0, text_encoder=None):
+                 length, augment=True, name="", seed=0, text_encoder=None,
+                 bank_embeds=None, bank_sources=None):
         self.bank_points = bank_points
         self.bank_texts = bank_texts
         self.indices = np.asarray(indices)
@@ -251,6 +262,23 @@ class PenDataset(Dataset):
         self.name = name
         self.seed = seed
         self.text_encoder = text_encoder
+        self.bank_embeds = bank_embeds
+        self.bank_sources = bank_sources
+
+    def sources(self):
+        if self.bank_sources is None:
+            return []
+        return sorted({self.bank_sources[i] for i in self.indices} - {""})
+
+    def for_source(self, source):
+        keep = [i for i in self.indices if self.bank_sources[i] == source]
+        return PenDataset(self.bank_points, self.bank_texts, keep,
+                          self.stroke_tok, self.char_tok, self.cfg,
+                          length=min(self.length, 1000), augment=self.augment,
+                          name=f"{self.name}_{source}", seed=self.seed,
+                          text_encoder=self.text_encoder,
+                          bank_embeds=self.bank_embeds,
+                          bank_sources=self.bank_sources)
 
     def encode_text(self, text):
         if self.text_encoder is not None:
@@ -279,7 +307,9 @@ class PenDataset(Dataset):
             word = prepare_word(self.bank_points[i], self.cfg,
                                 rng if self.augment else None)
             if self.augment:
-                word = augment_drawing(word, self.bank_texts[i], self.cfg, rng)
+                word = augment_drawing(
+                    word, self.bank_texts[i], self.cfg, rng,
+                    source=self.bank_sources[i] if self.bank_sources else "")
             tokens = self.stroke_tok.encode_word(word)
             extra = len(tokens) + (2 if parts else 0)
             if parts and total + extra > block - 2:   # room for BOS and END
@@ -324,8 +354,15 @@ class PenDataset(Dataset):
         # wherever the block does. Everything before the cut is still real.
         if len(tokens) > n:
             y[n] = IGNORE_INDEX
-        c = torch.from_numpy(self.encode_text(text))
-        return x, c, y
+        c = self.encode_text(text)
+        if self.bank_embeds is not None:
+            drop = self.augment and rng.random() < self.cfg.embed_dropout
+            if not drop:
+                c = c.copy()
+                live = c.any(axis=1)
+                d = self.text_encoder.clip_dim
+                c[live, :d] = self.bank_embeds[self.bank_word_for(idx)]
+        return x, torch.from_numpy(c), y
 
     def text_for(self, idx):
         return self.pick_words(np.random.default_rng([self.seed, idx]))[1]
@@ -342,7 +379,20 @@ def filter_holdout(examples, holdout):
 
 def create_datasets(cfg, merges=None, text_encoder=None):
     examples = load_examples(cfg.dataset, getattr(cfg, 'max_examples', 0) or None)
-    examples = filter_holdout(examples, getattr(cfg, "holdout", ""))
+    bank_embeds = None
+    if getattr(cfg, "clip_image_embeds", ""):
+        bank_embeds = np.load(cfg.clip_image_embeds)[:len(examples)]
+        assert len(bank_embeds) == len(examples), \
+            "clip_image_embeds rows do not match the dataset"
+    held = {w.strip().lower() for w in getattr(cfg, "holdout", "").split(",")
+            if w.strip()}
+    if held:
+        keep = [i for i, e in enumerate(examples)
+                if not (held & set(e["text"].lower().split()))]
+        print(f"Holdout {sorted(held)}: {len(examples) - len(keep)} examples removed")
+        examples = [examples[i] for i in keep]
+        if bank_embeds is not None:
+            bank_embeds = bank_embeds[keep]
     check_scale(examples, cfg.grid)
     bank_points = [e["points"] for e in examples]
     bank_texts = [e["text"] for e in examples]
@@ -366,10 +416,15 @@ def create_datasets(cfg, merges=None, text_encoder=None):
         print(f"Learned {len(merges)} BPE merges")
     stroke_tok = ScribeTokenizer(grid=cfg.grid, merges=merges)
 
+    bank_sources = [e["source"] for e in examples]
+    if not any(bank_sources):
+        bank_sources = None
+
     def build(ix, n, name, seed):
         return PenDataset(bank_points, bank_texts, ix, stroke_tok, char_tok, cfg,
                           length=n, augment=cfg.augment != "none", name=name,
-                          seed=seed, text_encoder=text_encoder)
+                          seed=seed, text_encoder=text_encoder,
+                          bank_embeds=bank_embeds, bank_sources=bank_sources)
 
     train_dataset = build(train_ix, cfg.train_size, "train", cfg.seed)
     test_dataset = build(test_ix, cfg.test_size, "test", cfg.seed + 1)

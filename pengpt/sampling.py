@@ -249,6 +249,42 @@ def save_progress(model, dataset, out_dir, step, prompts=None, temperature=1.0,
     return path
 
 
+def save_mixed_progress(model, datasets_by_source, out_dir, step, cols=6):
+    os.makedirs(out_dir, exist_ok=True)
+    sources = sorted(datasets_by_source)
+    fig, axes = plt.subplots(len(sources), cols,
+                             figsize=(2.1 * cols, 2.2 * len(sources)),
+                             squeeze=False)
+    for row, source in enumerate(sources):
+        ds = datasets_by_source[source]
+        prompts = _cached_prompts(ds)[:cols]
+        params = SampleParams(max_tokens=ds.cfg.max_seq_length - 1)
+        st = ds.stroke_tok
+        device = next(model.parameters()).device
+        contexts = torch.stack([torch.from_numpy(ds.encode_text(t))
+                                for t in prompts]).to(device)
+        torch.manual_seed(7)
+        idx = torch.full((len(prompts), 1), st.BOS, dtype=torch.long, device=device)
+        out = model.generate(idx, contexts, max_new_tokens=params.max_tokens,
+                             temperature=params.temperature, end_token=st.END,
+                             pad_token=st.PAD)
+        for col in range(cols):
+            ax = axes[row][col]
+            ax.axis("off")
+            if col < len(prompts):
+                words = st.decode(out[col].cpu().numpy()[1:])
+                plot_words(words, params, ax=ax, color="k")
+                ax.set_title(prompts[col][:28], fontsize=7)
+        axes[row][0].set_ylabel(source, fontsize=10, rotation=0,
+                                ha="right", va="center", labelpad=10)
+    fig.suptitle(f"step {step:,}", fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    path = os.path.join(out_dir, f"mixed_{step:06d}.png")
+    fig.savefig(path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 def save_samples(model, dataset, out_dir=".", num=3, do_sample=True):
     """Generate from test prompts and save one PNG per example."""
     os.makedirs(out_dir, exist_ok=True)

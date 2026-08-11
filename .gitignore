@@ -25,3 +25,6 @@ data/*.jsonl.gz
 # Source downloads (icon set clones, sketchy parquet, fscoco tarball): many GB,
 # all re-fetchable by the ink_* scripts.
 data/raw/
+
+# CLIP image-embedding banks (ink_embed.py): up to ~850MB each, regenerable.
+data/*.clipimg.npy

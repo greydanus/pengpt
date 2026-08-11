@@ -58,10 +58,11 @@ def render_png(points, size=448):
 
 
 def caption(client, model, png_bytes):
+    kwargs = {"output_config": {"effort": "low"}} if "opus" in model or "fable" in model else {}
     response = client.messages.create(
         model=model,
         max_tokens=100,
-        output_config={"effort": "low"},
+        **kwargs,
         messages=[{
             "role": "user",
             "content": [
@@ -111,6 +112,7 @@ def main():
                 raise SystemExit(f"API error at item {done + i}: {e.message}")
             # Failures still get a line, so the resume index stays aligned with
             # the input; filter "unrecognizable" downstream before training.
+            item.setdefault("meta", {})["label"] = item.get("text", "")
             item["text"] = text or "unrecognizable"
             f.write(json.dumps(item) + "\n")
             f.flush()

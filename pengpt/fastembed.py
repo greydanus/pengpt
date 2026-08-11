@@ -113,8 +113,11 @@ class FastEmbedder:
                         initargs=(self.px, self.linewidth, self.supersample))
 
     def _load_model(self):
-        from transformers import CLIPVisionModelWithProjection
-        model = CLIPVisionModelWithProjection.from_pretrained(self.name)
+        # transformers 5 refuses to load the composite CLIP checkpoint into the
+        # vision-only class (CLIPConfig has no hidden_size); the full model
+        # costs the unused text tower but loads everywhere.
+        from transformers import CLIPModel
+        model = CLIPModel.from_pretrained(self.name)
         model = model.to(self.device).eval()
         return model.half() if self.fp16 else model
 
@@ -137,9 +140,9 @@ class FastEmbedder:
         with self.torch.inference_mode():
             for arrays in rendered:
                 x = self._to_tensor(arrays)
-                feats = self.model(pixel_values=x,
-                                   interpolate_pos_encoding=(self.px != 224))
-                out.append(feats.image_embeds.float().cpu().numpy())
+                feats = self.model.get_image_features(
+                    pixel_values=x, interpolate_pos_encoding=(self.px != 224))
+                out.append(feats.float().cpu().numpy())
         return np.concatenate(out) if out else np.zeros((0, 512))
 
     def close(self):

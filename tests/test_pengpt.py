@@ -656,6 +656,48 @@ def test_clip_char_encode_structure(tiny_dataset):
         assert out[i, 4:].sum() == 1.0
 
 
+def test_image_embed_conditioning(tiny_dataset):
+    from pengpt.textenc import CharClipEncoder
+    if tiny_dataset.cfg.max_words != 1:
+        tiny_dataset.cfg.max_words = 1
+    enc = CharClipEncoder.__new__(CharClipEncoder)
+    enc.char_tok = tiny_dataset.char_tok
+    enc.clip_dim = 4
+    enc.dim = 4 + tiny_dataset.char_tok.vocab_size
+    enc._global = lambda text: np.full(4, 0.5, dtype=np.float32)
+    tiny_dataset.text_encoder = enc
+    tiny_dataset.bank_embeds = np.arange(6 * 4, dtype=np.float32).reshape(6, 4)
+    tiny_dataset.cfg.embed_dropout = 0.0
+    tiny_dataset.augment = False
+    try:
+        for idx in range(4):
+            x, c, y = tiny_dataset[idx]
+            bank = tiny_dataset.bank_word_for(idx)
+            live = c.numpy().any(axis=1)
+            assert live.any()
+            assert (c.numpy()[live, :4] == tiny_dataset.bank_embeds[bank]).all()
+            assert (c.numpy()[~live] == 0).all()
+        assert (tiny_dataset.encode_text("cab")[:3, :4] == 0.5).all()
+    finally:
+        tiny_dataset.text_encoder = None
+        tiny_dataset.bank_embeds = None
+
+
+def test_union_canonical_and_sources(tiny_dataset):
+    from ink_union import canonical
+    assert canonical("Hot-Air Balloon") == "hot air balloon"
+    assert canonical("car (sedan)") == "car"
+    assert canonical("teddy_bear!") == "teddy bear!"
+
+    tiny_dataset.bank_sources = ["a", "a", "b", "b", "b", ""]
+    assert tiny_dataset.sources() == ["a", "b"]
+    sub = tiny_dataset.for_source("b")
+    assert list(sub.indices) == [2, 3, 4]
+    assert sub.name.endswith("_b")
+    x, c, y = sub[0]
+    assert (x >= 0).all()
+
+
 def test_holdout_filter():
     from pengpt.data import filter_holdout
     examples = [{"text": "a big wolf"}, {"text": "wolfhound"},
@@ -801,6 +843,18 @@ def test_augment_drawing():
     # Two-point strokes have no interior to wave; they pass through untouched.
     assert (augment_drawing(pts, "a scene", cfg,
                             np.random.default_rng(2)) == pts).all()
+
+    # Source gating: human ink skips tremor; icons skip flip and dropout.
+    out = augment_drawing(line.copy(), "a scene", cfg,
+                          np.random.default_rng(1), source="sketchy")
+    assert (out == line).all()
+    cfg = SimpleNamespace(stroke_dropout=0.999, hflip=1.0, tremor=0.0)
+    out = augment_drawing(pts, "a scene", cfg,
+                          np.random.default_rng(3), source="icons")
+    assert (out == pts).all()
+    out = augment_drawing(pts, "a scene", cfg,
+                          np.random.default_rng(3), source="quickdraw")
+    assert out.shape != pts.shape or not (out == pts).all()
 
 
 def test_bucketed_loader(tiny_dataset):

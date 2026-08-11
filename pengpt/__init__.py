@@ -7,4 +7,4 @@ from .data import (PenDataset, InfiniteDataLoader, BucketedInfiniteLoader,
 from .model import PenTransformer, save_checkpoint, load_checkpoint
 from .sampling import (SampleParams, generate, generate_paragraph, draw,
                        layout_words, plot_words, plot_paragraph, save_samples,
-                       save_progress)
+                       save_progress, save_mixed_progress)

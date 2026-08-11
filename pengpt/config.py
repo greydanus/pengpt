@@ -60,6 +60,8 @@ class DataConfig:
     # caption; a word minus a letter does not, so again: drawings only.
     stroke_dropout: float = 0.0
     text_encoder: str = "char"
+    clip_image_embeds: str = ""
+    embed_dropout: float = 0.1
     holdout: str = ""
     seed: int = 1337
 

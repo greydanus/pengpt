@@ -16,7 +16,8 @@ from torch.utils.data import DataLoader
 
 from pengpt import (DataConfig, parse_configs, create_datasets, InfiniteDataLoader,
                     BucketedInfiniteLoader, PenTransformer, save_checkpoint,
-                    load_checkpoint, save_samples, save_progress)
+                    load_checkpoint, save_samples, save_progress,
+                    save_mixed_progress)
 
 
 def resolve_device(device):
@@ -133,6 +134,10 @@ def main():
     if train_cfg.bucket_batches:
         pad = stroke_tok.PAD
 
+    src_tests = {s: test_dataset.for_source(s) for s in test_dataset.sources()}
+    if src_tests:
+        print(f"per-source eval: {sorted(src_tests)}")
+
     while step < train_cfg.steps:
         t0 = time.time()
         X, C, Y = [t.to(device) for t in loader.next()]
@@ -173,6 +178,11 @@ def main():
             print(f"step {step} | train loss {train_loss:.4f} | test loss {test_loss:.4f}")
             if run:
                 run.log({"train_loss": train_loss, "test_loss": test_loss, "step": step})
+            for s, ds_s in src_tests.items():
+                loss_s = evaluate(model, ds_s, device, batch_size=50, max_batches=4)
+                print(f"  {s:10s} test {loss_s:.4f}")
+                if run:
+                    run.log({f"test_loss_{s}": loss_s, "step": step})
 
             if best_loss is None or test_loss < best_loss:
                 best_loss = test_loss
@@ -191,8 +201,18 @@ def main():
                             char_tok.alphabet, asdict(data_cfg), stroke_tok.merges,
                             optimizer, scheduler, step, best_loss)
 
-            progress = save_progress(model, test_dataset,
-                                     os.path.join(train_cfg.out_dir, "progress"), step)
+            if src_tests:
+                for s, ds_s in src_tests.items():
+                    save_progress(model, ds_s,
+                                  os.path.join(train_cfg.out_dir, f"progress_{s}"),
+                                  step)
+                progress = save_mixed_progress(
+                    model, src_tests, os.path.join(train_cfg.out_dir, "progress"),
+                    step)
+            else:
+                progress = save_progress(model, test_dataset,
+                                         os.path.join(train_cfg.out_dir, "progress"),
+                                         step)
             paths = [progress]
             if step % (train_cfg.eval_every * 4) == 0:
                 paths += save_samples(model, test_dataset,
