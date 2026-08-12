@@ -57,6 +57,10 @@ def render_png(points, size=448):
     return buf.getvalue()
 
 
+PRICES = {"claude-haiku-4-5": (1.0, 5.0), "claude-opus-5": (5.0, 25.0)}
+SPENT = [0.0]
+
+
 def caption(client, model, png_bytes):
     kwargs = {"output_config": {"effort": "low"}} if "opus" in model or "fable" in model else {}
     response = client.messages.create(
@@ -73,6 +77,9 @@ def caption(client, model, png_bytes):
             ],
         }],
     )
+    p_in, p_out = PRICES.get(model, (5.0, 25.0))
+    SPENT[0] += (response.usage.input_tokens * p_in
+                 + response.usage.output_tokens * p_out) / 1e6
     if response.stop_reason == "refusal":
         return None
     text = next((b.text for b in response.content if b.type == "text"), "")
@@ -85,6 +92,8 @@ def main():
     parser.add_argument("--out", required=True, help="captioned JSONL (appended, resumable)")
     parser.add_argument("--model", default="claude-opus-5")
     parser.add_argument("--limit", type=int, default=None, help="caption at most N items")
+    parser.add_argument("--budget", type=float, default=0.0,
+                        help="stop when measured API spend reaches this many dollars")
     args = parser.parse_args()
 
     import anthropic
@@ -117,6 +126,10 @@ def main():
             f.write(json.dumps(item) + "\n")
             f.flush()
             print(f"[{done + i}] {item.get('meta', {}).get('source', '?')}: {item['text']}")
+            if args.budget and SPENT[0] >= args.budget:
+                print(f"budget reached: ${SPENT[0]:.2f} after {done + i + 1} items")
+                break
+    print(f"total spend ${SPENT[0]:.2f}")
 
 
 if __name__ == "__main__":

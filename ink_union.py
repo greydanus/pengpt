@@ -15,10 +15,23 @@ def canonical(text):
 
 
 SOURCES = [
-    ("quickdraw", "data/quickdraw_balanced_fixed.jsonl.gz", 120_000),
-    ("sketchy", "data/sketchy_tags.jsonl", 0),
-    ("icons", "data/icons_captioned.jsonl", 0),
+    ("doodle", "data/quickdraw_balanced_fixed.jsonl.gz", 120_000),
+    ("doodle", "data/quickdraw_captioned.jsonl", 0),
+    ("sketch", "data/sketchy_tags.jsonl", 0),
+    ("icon", "data/icons_captioned.jsonl", 0),
+    ("scene", "data/fscoco.json", 0),
+    ("bird", "data/birds.jsonl", 0),
+    ("creature", "data/creatures.jsonl", 0),
 ]
+
+COLORS = {"black", "white", "grey", "gray", "brown", "red", "orange", "yellow",
+          "green", "blue", "purple", "pink", "beige", "tan", "golden", "gold",
+          "silver", "dark", "light"}
+
+
+def strip_colors(text):
+    kept = [w for w in text.split() if w not in COLORS]
+    return " ".join(kept) if kept else text
 
 
 def main():
@@ -39,14 +52,17 @@ def main():
                 if raw == "unrecognizable":
                     raw = item.get("meta", {}).get("label", "")
                 text = canonical(raw)
+                if source == "sketch":
+                    text = strip_colors(text)
                 if not text:
                     continue
                 meta = item.get("meta", {})
                 meta["source"] = source
-                out.write(json.dumps({"text": text, "points": item["points"],
+                out.write(json.dumps({"text": f"{source}: {text}",
+                                      "points": item["points"],
                                       "meta": meta}) + "\n")
                 kept += 1
-            counts[source] = kept
+            counts[source] = counts.get(source, 0) + kept
     print(f"wrote {sum(counts.values()):,} examples to {args.out}: {counts}")
 
 

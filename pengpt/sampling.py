@@ -274,7 +274,7 @@ def save_mixed_progress(model, datasets_by_source, out_dir, step, cols=6):
             if col < len(prompts):
                 words = st.decode(out[col].cpu().numpy()[1:])
                 plot_words(words, params, ax=ax, color="k")
-                ax.set_title(prompts[col][:28], fontsize=7)
+                ax.set_title(textwrap.fill(prompts[col], 30), fontsize=6)
         axes[row][0].set_ylabel(source, fontsize=10, rotation=0,
                                 ha="right", va="center", labelpad=10)
     fig.suptitle(f"step {step:,}", fontsize=11)
