@@ -125,6 +125,7 @@ class ScribeTokenizer:
         # is conditioned on a prefix that never occurs in training, and that
         # token fixes the pen's entry point and the word's height above the
         # baseline -- the two things a whole sample hangs on.
+        self.DOWN, self.UP = DOWN, UP
         self.PAD, self.END, self.WORD, self.BOS = n, n + 1, n + 2, n + 3
         self.vocab_size = n + 4
 
@@ -142,6 +143,33 @@ class ScribeTokenizer:
         for a, b, c in self.merges:
             deltas[c] = deltas[a] + deltas[b]
         return deltas
+
+    def token_ink_cells(self, max_cells=48):
+        """Relative grid cells each token paints, from the token's start.
+
+        Direction and merged tokens trace their expanded walk. DOWN marks the
+        current cell. Pen-up and specials paint nothing.
+        """
+        rel = np.zeros((self.vocab_size, max_cells, 2), dtype=np.int64)
+        valid = np.zeros((self.vocab_size, max_cells), dtype=bool)
+        for tid in range(self.vocab_size):
+            if tid == DOWN:
+                cells = [(0, 0)]
+            elif tid in (UP, self.PAD, self.END, self.WORD, self.BOS) or tid < 0:
+                cells = []
+            else:
+                x = y = 0
+                cells = []
+                for b in self.expand([tid]):
+                    if 0 <= int(b) < 8:
+                        x += int(DIRECTIONS[b, 0])
+                        y += int(DIRECTIONS[b, 1])
+                        cells.append((x, y))
+            cells = cells[:max_cells]
+            if cells:
+                rel[tid, :len(cells)] = np.array(cells, dtype=np.int64)
+                valid[tid, :len(cells)] = True
+        return rel, valid
 
     def encode_word(self, points):
         """Tokens for one word, starting from the baseline at x = 0.

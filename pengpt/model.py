@@ -7,7 +7,7 @@ attention where available.
 """
 
 import math
-from dataclasses import asdict
+from dataclasses import asdict, fields
 
 import torch
 import torch.nn as nn
@@ -92,13 +92,41 @@ class PenTransformer(nn.Module):
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer))
         self.ln_f = nn.LayerNorm(cfg.n_embd)
         self.head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
-        if cfg.pen_pos_bands > 0:
-            # Filled from the tokenizer by the caller (train.py); restored from
-            # the state dict on load. Rides in the checkpoint like a weight.
+        needs_pen = cfg.pen_pos_bands > 0 or cfg.pen_last_down or cfg.local_canvas > 0
+        if needs_pen:
+            # Filled from the tokenizer by attach_tokenizer_tables.
             self.register_buffer("pen_deltas",
                                  torch.zeros(cfg.vocab_size, 2, dtype=torch.long))
-            self.pen_pos_proj = nn.Linear(4 * cfg.pen_pos_bands, cfg.n_embd,
-                                          bias=False)
+        if cfg.pen_pos_bands > 0 or cfg.pen_last_down:
+            n_xy = 2 if cfg.pen_last_down and cfg.pen_pos_bands > 0 else 1
+            if cfg.pen_pos_bands == 0:
+                bands = 4
+            else:
+                bands = cfg.pen_pos_bands
+            self._pen_feat_bands = bands
+            self.pen_pos_proj = nn.Linear(4 * bands * n_xy, cfg.n_embd, bias=False)
+        if cfg.pen_last_down or cfg.local_canvas > 0:
+            self.register_buffer("down_id", torch.tensor(8, dtype=torch.long))
+            self.register_buffer("up_id", torch.tensor(9, dtype=torch.long))
+        if cfg.local_canvas > 0:
+            self.register_buffer("ink_rel",
+                                 torch.zeros(cfg.vocab_size, 48, 2, dtype=torch.long))
+            self.register_buffer("ink_valid",
+                                 torch.zeros(cfg.vocab_size, 48, dtype=torch.bool))
+            if cfg.canvas_linear:
+                self.canvas_proj = nn.Linear(cfg.local_canvas ** 2, cfg.n_embd,
+                                             bias=False)
+            else:
+                hid = max(8, cfg.n_embd // 4)
+                self.canvas_net = nn.Sequential(
+                    nn.Conv2d(1, hid, 3, stride=2, padding=1),
+                    nn.GELU(approximate="tanh"),
+                    nn.Conv2d(hid, hid, 3, stride=2, padding=1),
+                    nn.GELU(approximate="tanh"),
+                    nn.AdaptiveAvgPool2d(4),
+                    nn.Flatten(),
+                    nn.Linear(hid * 16, cfg.n_embd, bias=False),
+                )
         self.apply(self._init_weights)
         print(f"PenTransformer parameters: {sum(p.numel() for p in self.parameters()):,}")
 
@@ -109,37 +137,115 @@ class PenTransformer(nn.Module):
             if getattr(module, "bias", None) is not None:
                 nn.init.zeros_(module.bias)
 
-    def _pen_pos_features(self, idx):
-        """Fourier features of the pen position after each token.
-
-        The position at step t sums the displacements of tokens <= t, so it is
-        known before token t+1 is predicted -- causal by construction, at
-        training time and during generation alike (generate() re-runs the full
-        prefix, so no incremental state is needed). Wavelengths run from 4
-        cells to 4 * 2^(bands-1), resolving both "is this the cell that stroke
-        ended in" and "which side of the canvas am I on". At training time the
-        whole canvas is shifted by a random offset per sample: layout can't be
-        memorized in absolute terms, while every within-sample relation is
-        preserved.
-        """
+    def _positions(self, idx):
         positions = self.pen_deltas[idx].cumsum(dim=1)
         if self.training and self.cfg.pen_pos_jitter > 0:
             jitter = self.cfg.pen_pos_jitter
             offset = torch.randint(-jitter, jitter + 1, (idx.size(0), 1, 2),
                                    device=idx.device)
             positions = positions + offset
-        k = torch.arange(self.cfg.pen_pos_bands, device=idx.device)
-        angles = positions[..., None].float() * (torch.pi / (2.0 * 2.0 ** k))
-        feats = torch.cat([angles.sin(), angles.cos()], dim=-1)
-        return feats.flatten(-2)
+        return positions
+
+    def _fourier(self, xy, bands):
+        k = torch.arange(bands, device=xy.device)
+        angles = xy[..., None].float() * (torch.pi / (2.0 * 2.0 ** k))
+        return torch.cat([angles.sin(), angles.cos()], dim=-1).flatten(-2)
+
+    def _last_down_offset(self, idx, positions):
+        T = idx.size(1)
+        steps = torch.arange(T, device=idx.device)
+        down_i = torch.where(idx == self.down_id, steps, torch.full_like(idx, -1))
+        last_i = down_i.cummax(dim=1).values
+        gather = last_i.clamp(min=0)
+        last = torch.stack([
+            positions[:, :, 0].gather(1, gather),
+            positions[:, :, 1].gather(1, gather),
+        ], dim=-1)
+        last = torch.where(last_i.unsqueeze(-1) >= 0, last, torch.zeros_like(last))
+        return positions - last
+
+    def _drawing_mask(self, idx):
+        """True where token t lays ink (DOWN, or a move while the pen is down)."""
+        down = idx == self.down_id
+        up = idx == self.up_id
+        steps = torch.arange(idx.size(1), device=idx.device)
+        last_down = torch.where(down, steps, torch.full_like(idx, -1)).cummax(1).values
+        last_up = torch.where(up, steps, torch.full_like(idx, -1)).cummax(1).values
+        pen_after = last_down > last_up
+        pen_before = F.pad(pen_after[:, :-1], (1, 0), value=False)
+        return pen_before | down
+
+    def _local_maps(self, idx, positions):
+        """(B, T, N, N) soft occupancy of ink so far, around the pen.
+
+        Ink endpoints are bilinear-splatted onto an N x N map whose pixel
+        pitch is local_cell ScribeTokens cells (fractional allowed). Same
+        (B, T, hist) pairing as the binary map; four weighted writes instead
+        of one hard assignment.
+        """
+        B, T = idx.shape
+        n = self.cfg.local_canvas
+        cell = float(self.cfg.local_cell) if self.cfg.local_cell else 1.0
+        half = n // 2
+        hist = min(96, T)
+        drawn = self._drawing_mask(idx)
+        ink = positions.float()
+        z = ink.new_zeros(B, hist - 1, 2)
+        zd = drawn.new_zeros(B, hist - 1)
+        ink_h = torch.cat([z, ink], 1).unfold(1, hist, 1).permute(0, 1, 3, 2)
+        drawn_h = torch.cat([zd, drawn], 1).unfold(1, hist, 1)
+        d = (ink_h - ink[:, :, None, :]) / cell
+        u = d[..., 0] + half
+        v = d[..., 1] + half
+        maps = ink.new_zeros(B, T, n * n)
+        x0 = u.floor()
+        y0 = v.floor()
+        wx = u - x0
+        wy = v - y0
+        nsq = n * n
+        # Four separate scatters beat one fat cat: MPS scatter scales poorly
+        # in the hist*4 dimension.
+        for dx, dy, w in (
+            (0, 0, (1 - wx) * (1 - wy)),
+            (1, 0, wx * (1 - wy)),
+            (0, 1, (1 - wx) * wy),
+            (1, 1, wx * wy),
+        ):
+            xs = x0 + dx
+            ys = y0 + dy
+            valid = drawn_h & (xs >= 0) & (xs < n) & (ys >= 0) & (ys < n)
+            slot = (ys * n + xs).long().clamp(0, nsq - 1)
+            maps.scatter_add_(2, slot, w * valid.to(dtype=w.dtype))
+        return maps.view(B, T, n, n).clamp_(0, 1)
+
+    def _pen_features(self, idx):
+        positions = self._positions(idx)
+        parts = []
+        bands = getattr(self, "_pen_feat_bands", self.cfg.pen_pos_bands)
+        if self.cfg.pen_pos_bands > 0:
+            parts.append(self._fourier(positions, self.cfg.pen_pos_bands))
+        if self.cfg.pen_last_down:
+            parts.append(self._fourier(self._last_down_offset(idx, positions), bands))
+        return torch.cat(parts, dim=-1) if parts else None, positions
 
     def forward(self, idx, context, targets=None):
         T = idx.size(1)
         assert T <= self.cfg.block_size, f"sequence length {T} > block size {self.cfg.block_size}"
         pos = torch.arange(T, device=idx.device)
         x = self.tok_emb(idx) + self.pos_emb(pos)
-        if self.cfg.pen_pos_bands > 0:
-            x = x + self.pen_pos_proj(self._pen_pos_features(idx))
+        if self.cfg.pen_pos_bands > 0 or self.cfg.pen_last_down or self.cfg.local_canvas > 0:
+            feats, positions = self._pen_features(idx)
+            if feats is not None:
+                x = x + self.pen_pos_proj(feats)
+            if self.cfg.local_canvas > 0:
+                with torch.no_grad():
+                    maps = self._local_maps(idx, positions)
+                B = idx.size(0)
+                if getattr(self.cfg, "canvas_linear", False):
+                    x = x + self.canvas_proj(maps.reshape(B, T, -1))
+                else:
+                    x = x + self.canvas_net(maps.reshape(B * T, 1, maps.size(-2), maps.size(-1))
+                                            ).view(B, T, -1)
 
         ctx_pos = torch.arange(context.size(1), device=idx.device)
         if context.dim() == 3:
@@ -212,12 +318,35 @@ def save_checkpoint(path, model, alphabet, data_config, merges=None, optimizer=N
     torch.save(checkpoint, path)
 
 
+def attach_tokenizer_tables(model, stroke_tok):
+    """Copy tokenizer geometry into the model's buffers."""
+    if hasattr(model, "pen_deltas"):
+        model.pen_deltas.copy_(torch.as_tensor(stroke_tok.token_deltas(),
+                                               device=model.pen_deltas.device))
+    if hasattr(model, "down_id"):
+        model.down_id.fill_(int(stroke_tok.DOWN))
+        model.up_id.fill_(int(stroke_tok.UP))
+    if hasattr(model, "ink_rel"):
+        rel, valid = stroke_tok.token_ink_cells(max_cells=model.ink_rel.size(1))
+        model.ink_rel.copy_(torch.as_tensor(rel, device=model.ink_rel.device))
+        model.ink_valid.copy_(torch.as_tensor(valid, device=model.ink_valid.device))
+
+
+def _model_config_from_ckpt(d):
+    cfg = {f.name: f.default for f in fields(ModelConfig)}
+    cfg.update(d)
+    # Checkpoints from before canvas_linear used the tiny CNN.
+    if "canvas_linear" not in d and d.get("local_canvas", 0) > 0:
+        cfg["canvas_linear"] = False
+    return ModelConfig(**cfg)
+
+
 def load_checkpoint(path, device="cpu"):
     """Returns (model, checkpoint_dict). The checkpoint carries the alphabet
     and data config needed to rebuild matching tokenizers."""
     checkpoint = torch.load(path, map_location=device, weights_only=True)
-    model = PenTransformer(ModelConfig(**checkpoint["model_config"]))
-    model.load_state_dict(checkpoint["model"])
+    model = PenTransformer(_model_config_from_ckpt(checkpoint["model_config"]))
+    model.load_state_dict(checkpoint["model"], strict=False)
     model.to(device)
     return model, checkpoint
 
@@ -245,4 +374,5 @@ def load_for_sampling(path, device="cpu", n_examples=200):
         cfg, merges=checkpoint["merges"], text_encoder=text_encoder)
     assert char_tok.alphabet == checkpoint["alphabet"], \
         "dataset alphabet does not match the checkpoint; use the training dataset"
+    attach_tokenizer_tables(model, stroke_tok)
     return model, dataset, cfg, checkpoint

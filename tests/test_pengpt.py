@@ -755,6 +755,102 @@ def test_pen_pos_features_are_causal_and_checkpoint_safe(tiny_dataset, tmp_path)
     assert logits0.shape == logits.shape
 
 
+def test_local_canvas_marks_ink_and_stays_causal(tiny_dataset):
+    st, ct, cfg = tiny_dataset.stroke_tok, tiny_dataset.char_tok, tiny_dataset.cfg
+    from pengpt.model import attach_tokenizer_tables
+    mcfg = ModelConfig(n_layer=2, n_head=2, n_embd=32, vocab_size=st.vocab_size,
+                       block_size=cfg.max_seq_length, context_vocab_size=ct.vocab_size,
+                       context_block_size=cfg.max_text_length,
+                       pen_pos_bands=4, pen_last_down=True,
+                       local_canvas=16, local_cell=8)
+    model = PenTransformer(mcfg)
+    attach_tokenizer_tables(model, st)
+    model.eval()
+    x, c, y = (t.unsqueeze(0) for t in tiny_dataset[0])
+    logits, loss = model(x, c, y)
+    assert torch.isfinite(loss)
+    x2 = x.clone()
+    x2[0, -1] = (x2[0, -1] + 1) % st.vocab_size
+    logits2, _ = model(x2, c, y)
+    assert torch.allclose(logits[0, :-1], logits2[0, :-1], atol=1e-5)
+
+    # A DOWN then a right-step should light a cell in the local window.
+    seq = torch.tensor([[st.BOS, getattr(st, "DOWN", 8), 0,
+                         getattr(st, "UP", 9), st.END]], dtype=torch.long)
+    if seq.size(1) < cfg.max_seq_length:
+        pad = torch.full((1, cfg.max_seq_length - seq.size(1)), st.PAD)
+        seq = torch.cat([seq, pad], dim=1)
+    pos = model.pen_deltas[seq].cumsum(dim=1)
+    maps = model._local_maps(seq, pos)
+    assert maps[0, 2].sum() > 0
+
+
+def _drawing_mask_loop(idx, down_id, up_id):
+    B, T = idx.shape
+    down = idx == down_id
+    up = idx == up_id
+    drawn = torch.zeros(B, T, dtype=torch.bool, device=idx.device)
+    pen = torch.zeros(B, dtype=torch.bool, device=idx.device)
+    for t in range(T):
+        pen = torch.where(down[:, t], torch.ones_like(pen), pen)
+        drawn[:, t] = pen
+        pen = torch.where(up[:, t], torch.zeros_like(pen), pen)
+    return drawn
+
+
+def test_drawing_mask_matches_loop(tiny_dataset):
+    st = tiny_dataset.stroke_tok
+    from pengpt.model import attach_tokenizer_tables
+    mcfg = ModelConfig(n_layer=2, n_head=2, n_embd=32, vocab_size=st.vocab_size,
+                       block_size=64, context_vocab_size=8, context_block_size=8,
+                       local_canvas=16, local_cell=1.25)
+    model = PenTransformer(mcfg)
+    attach_tokenizer_tables(model, st)
+    rng = torch.Generator().manual_seed(0)
+    idx = torch.randint(0, st.vocab_size, (4, 48), generator=rng)
+    idx[:, 3] = st.DOWN
+    idx[:, 20] = st.UP
+    idx[:, 25] = st.DOWN
+    idx[:, 40] = st.UP
+    assert torch.equal(model._drawing_mask(idx),
+                       _drawing_mask_loop(idx, st.DOWN, st.UP))
+
+
+def test_canvas_linear_and_cnn_both_run(tiny_dataset):
+    st, ct, cfg = tiny_dataset.stroke_tok, tiny_dataset.char_tok, tiny_dataset.cfg
+    from pengpt.model import attach_tokenizer_tables
+    x, c, y = (t.unsqueeze(0) for t in tiny_dataset[0])
+    for linear in (True, False):
+        mcfg = ModelConfig(n_layer=2, n_head=2, n_embd=32, vocab_size=st.vocab_size,
+                           block_size=cfg.max_seq_length, context_vocab_size=ct.vocab_size,
+                           context_block_size=cfg.max_text_length,
+                           local_canvas=16, local_cell=1.25, canvas_linear=linear)
+        model = PenTransformer(mcfg)
+        attach_tokenizer_tables(model, st)
+        _, loss = model(x, c, y)
+        assert torch.isfinite(loss)
+        assert hasattr(model, "canvas_proj" if linear else "canvas_net")
+
+
+def test_local_maps_accumulates_and_stays_in_unit_interval(tiny_dataset):
+    st = tiny_dataset.stroke_tok
+    from pengpt.model import attach_tokenizer_tables
+    mcfg = ModelConfig(n_layer=2, n_head=2, n_embd=32, vocab_size=st.vocab_size,
+                       block_size=8, context_vocab_size=8, context_block_size=8,
+                       local_canvas=16, local_cell=1.0)
+    model = PenTransformer(mcfg)
+    attach_tokenizer_tables(model, st)
+    # Stay in place with the pen down: every endpoint hits the same cell.
+    idx = torch.tensor([[st.BOS, st.DOWN, st.UP, st.END]], dtype=torch.long)
+    pos = torch.zeros(1, 4, 2)
+    maps = model._local_maps(idx, pos)
+    assert maps.min() >= 0 and maps.max() <= 1
+    # DOWN and the following UP both splat the origin; occupancy must accumulate
+    # enough to light the center (advanced-index += drops collisions).
+    center = maps[0, 2, 8, 8]
+    assert center > 0.5
+
+
 def _apply_merges_reference(merges, pairs, tokens):
     """The pre-vectorization implementation, kept to pin exact equivalence."""
     if not pairs:

@@ -85,6 +85,21 @@ class ModelConfig:
     # be memorized when the origin moves, but within-sample geometry -- which
     # strokes touch, what is already drawn where -- survives translation.
     pen_pos_jitter: int = 32
+    # Fourier features of (pen - last DOWN), so the model sees the vector back
+    # to the start of the current stroke. Closure is "return to this cell",
+    # not "where am I on the page".
+    pen_last_down: bool = False
+    # Local ink occupancy around the pen. 0 disables. 16 means a 16x16 map.
+    # local_cell is ScribeTokens cells per map pixel (can be fractional).
+    # 1.25 is a ~20-cell window -- about 1.6x tighter than cell=2 -- with
+    # bilinear splat so sub-cell structure survives.
+    local_canvas: int = 0
+    local_cell: float = 1.25
+    # Read the occupancy map with a Linear (fast) instead of the tiny CNN.
+    # CNN backward is the bulk of the canvas tax on MPS; Linear lands near
+    # +10% step time, CNN near +25%. Old canvas checkpoints keep the CNN
+    # via _model_config_from_ckpt.
+    canvas_linear: bool = True
     context_dim: int = 0
 
 

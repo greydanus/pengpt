@@ -18,6 +18,7 @@ from pengpt import (DataConfig, parse_configs, create_datasets, InfiniteDataLoad
                     BucketedInfiniteLoader, PenTransformer, save_checkpoint,
                     load_checkpoint, save_samples, save_progress,
                     save_mixed_progress)
+from pengpt.model import attach_tokenizer_tables
 
 
 def resolve_device(device):
@@ -87,13 +88,16 @@ def main():
     model_cfg.context_block_size = data_cfg.max_text_length
     model_cfg.context_dim = (train_dataset.text_encoder.dim
                              if train_dataset.text_encoder else 0)
+    # The encoder choice is part of the checkpoint. Missing key = old CNN run.
+    if ckpt:
+        saved = ckpt["model_config"]
+        if "canvas_linear" in saved:
+            model_cfg.canvas_linear = saved["canvas_linear"]
+        elif saved.get("local_canvas", 0) > 0:
+            model_cfg.canvas_linear = False
 
     model = PenTransformer(model_cfg).to(device)
-    if model_cfg.pen_pos_bands > 0:
-        # The displacement table is a property of the tokenizer; a resume's
-        # state dict re-loads the same values.
-        model.pen_deltas.copy_(torch.tensor(stroke_tok.token_deltas(),
-                                            device=device))
+    attach_tokenizer_tables(model, stroke_tok)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.learning_rate,
                                   weight_decay=train_cfg.weight_decay,
                                   betas=(0.9, 0.99), eps=1e-8)
@@ -224,6 +228,15 @@ def main():
                 paths += save_samples(model, test_dataset,
                                       os.path.join(train_cfg.out_dir, "samples"),
                                       num=3, do_sample=True)
+            windows_path = os.path.join(train_cfg.out_dir, "samples", "windows.png")
+            if model_cfg.local_canvas > 0 and not os.path.exists(windows_path):
+                from viz_canvas import save_windows
+                wp = save_windows(model, stroke_tok,
+                                  train_dataset.bank_points, train_dataset.bank_texts,
+                                  windows_path, block=data_cfg.max_seq_length)
+                if wp:
+                    paths.append(wp)
+                    print(f"  wrote {wp}")
             print(f"  wrote {progress}")
             if run:
                 run.log({os.path.basename(p): wandb.Image(p) for p in paths})
