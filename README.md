@@ -13,6 +13,13 @@ dataset.
 
 ![hero](static/hero.png)
 
+The whole model lives in two files. `pengpt.py` is the algorithm — tokenizer,
+data pipeline, transformer, training loop, sampling — and `utils.py` is
+everything specific to one dataset: a preset of settled training settings per
+corpus, plus the tools that build each corpus in the first place. The same
+core algorithm trains on every dataset; only lengths, augmentation, and model
+size move between presets.
+
 ## Quality over a training run
 
 ![progress](static/progress.png)
@@ -26,16 +33,18 @@ almost immediately; spelling follows. All three prompts are correct by step
 ```bash
 pip install -e .          # torch, numpy, matplotlib
 pip install -e ".[dev]"   # + pytest
-pytest tests/             # ~1 second
+pytest tests/             # a few seconds
 ```
 
 Train — about 45 minutes on an M-series laptop, no GPU rental needed:
 
 ```bash
-python train.py --dataset data/bigbank_3500.json.zip --out_dir out/cursive
+python pengpt.py train --preset cursive
 ```
 
-Each run owns a folder under `out/`:
+The presets are `cursive`, `quickdraw`, `physics`, and `icons`; each names its
+dataset, lengths, augmentation, and model size, and any explicit flag
+overrides the preset. Each run owns a folder under `out/`:
 
 ```
 out/cursive/
@@ -48,11 +57,10 @@ out/cursive/
 Progress images use the same prompts and seeds every time, so consecutive
 images differ only by the model. Four samples per prompt is what makes them
 readable: one sample cannot tell a model ignoring its prompt from a model
-having a bad draw. Stack them with `python progress.py`, or put real
-handwriting beside generations for the same text with `python compare.py`.
+having a bad draw.
 
 Add `--wandb --wandb_entity you` for Weights & Biases logging (optional).
-Resume with `--resume out/cursive/last.pt` -- `last.pt`, not `best.pt`, which
+Resume with `--resume out/cursive/last.pt` — `last.pt`, not `best.pt`, which
 lags whenever test loss has stopped improving. Resuming rebuilds the tokenizer
 from the checkpoint rather than from the command line, and says so when a data
 flag disagrees: merges and alphabet decide what every token id means, so a
@@ -60,47 +68,42 @@ re-derived vocabulary would load the weights against ids they were never
 trained on. For a faster run, `--n_layer 3` roughly halves the time and scored
 within noise of the default in ablations.
 
-Checkpoints from before commit `1693c3f` no longer load. That commit is titled
-for a change to `conditioning.py` but also rewrote the token stream: BPE merges
-now apply in learned order, and a BOS token was added. Both change what the ids
-mean and shift `vocab_size`, so a model from before it has to be retrained.
+Checkpoints from before the repo was consolidated around `pengpt.py` may have
+been trained with features that no longer exist (alternate text encoders,
+pen-position inputs); the loader warns and ignores those config keys, and a
+checkpoint that actually used them should be retrained.
 
 ### Drawings rather than handwriting
 
-The defaults are tuned for cursive. A drawing corpus needs three of them
-changed, because its samples are single objects with short labels:
-
 ```bash
-python train.py --dataset data/quickdraw_balanced_fixed.jsonl.gz \
-  --max_words 1 --augment general \
-  --max_text_length 24 --max_seq_length 192 \
-  --n_layer 6 --n_embd 128 --learning_rate 1e-3 --batch_size 32 \
-  --out_dir out/quickdraw
+python pengpt.py train --preset quickdraw
 ```
 
-`quickdraw_balanced_fixed` is `quickdraw_balanced` after `repair_quickdraw.py`:
-the original was written through a delta-detection bug that cumsum'd 24% of
-drawings into diagonal staircases (see `normalize` in `pengpt/convert.py`).
-At the repaired token statistics (p50 = 39, p99 = 136), a 192-token block
-covers 99.6% of drawings; 384 spent most of every sequence on padding.
+The preset is the settings a drawing corpus needs: `--max_words 1` because
+each sample is a single object, `--augment general` because shear is an italic
+slant that presumes a baseline and is a distortion on a sketch, and
+`--max_text_length 24 --max_seq_length 192` near the corpus's longest label
+and p99 token count — leaving these at the cursive defaults spends most of
+every sequence on padding.
 
-`--augment general` drops shear, which is an italic slant that presumes a
-baseline and is a distortion on a sketch. Set `--max_text_length` near the
-longest label and `--max_seq_length` near the p99 token count; leaving them at
-the cursive defaults spends most of every sequence on padding.
+`quickdraw_balanced_fixed` is `quickdraw_balanced` after repairing a
+delta-detection bug that cumsum'd 24% of drawings into diagonal staircases
+(see `normalize` in `utils.py`). At the repaired token statistics
+(p50 = 39, p99 = 136), a 192-token block covers 99.6% of drawings.
 
-Loss alone will not tell you whether the prompt is being read -- a model can
+Loss alone will not tell you whether the prompt is being read — a model can
 post a falling loss while drawing the corpus average for every prompt. Measure
-it directly:
+it directly: score one real drawing under every candidate label and see where
+its true label ranks (1 of N is perfect, (N+1)/2 is chance):
 
 ```bash
-python conditioning.py --checkpoint out/quickdraw/best.pt --per_label 8
+python pengpt.py rank --checkpoint out/quickdraw/best.pt --per_label 8
 ```
 
 Generate handwriting from a trained model:
 
 ```bash
-python sample.py --checkpoint out/cursive/best.pt --text "The quick brown fox jumps over the lazy dog"
+python pengpt.py sample --checkpoint out/cursive/best.pt --text "The quick brown fox jumps over the lazy dog"
 ```
 
 If a word comes out misspelled, note its index (`--show_indices`) and regenerate
@@ -108,7 +111,7 @@ just that word with `--redo 3,7`.
 
 ## How it works
 
-**Tokenization** (`pengpt/tokenizer.py`) is
+**Tokenization** is
 [ScribeTokens](https://arxiv.org/abs/2603.02805). Pen coordinates are quantized
 to an integer grid, and motion becomes a walk on that grid: eight compass
 directions plus `DOWN` and `UP`. Movement between grid points is decomposed with
@@ -121,18 +124,18 @@ token — which is what keeps sequences short.
 *Grey is the original, red is decoded from tokens. `grid=0.020` is the default:
 reconstruction error stays inside the width of a pen stroke at 99 tokens per word.*
 
-**Model** (`pengpt/model.py`): a small GPT-style decoder (~410k params at the
-cursive default, ~1.7M at the drawing settings above) with cross-attention over
-the character embedding of the text prompt, in the makemore/nanoGPT lineage.
+**Model**: a small GPT-style decoder (~410k params at the cursive default,
+~1.7M at the quickdraw preset) with cross-attention over the character
+embedding of the text prompt, in the makemore/nanoGPT lineage.
 
 The prompt reaches the model only through that cross-attention, never as a class
 index, so the same architecture takes a word to write or the name of an object
 to draw, and an unseen label still says something through its characters.
 
-**Data** (`pengpt/data.py`): each example is one word, an `(N, 3)` array of
-`(x, y, pen)`. Training examples pack random words together until the block is
-full, so a few thousand words become effectively unlimited examples and nothing
-is ever truncated mid-word.
+**Data**: each example is one word, an `(N, 3)` array of `(x, y, pen)`.
+Training examples pack random words together until the block is full, so a few
+thousand words become effectively unlimited examples and nothing is ever
+truncated mid-word.
 
 ## Why ScribeTokens
 
@@ -177,7 +180,7 @@ training set.
 ## Writing a paragraph
 
 ```bash
-python iliad.py --checkpoint out/cursive/best.pt
+python pengpt.py sample --checkpoint out/cursive/best.pt --text "Sing, O goddess, the anger of Achilles son of Peleus, that brought countless ills upon the Achaeans."
 ```
 
 ![iliad](static/iliad.png)
@@ -188,7 +191,8 @@ only that word with `--redo 3,7`.
 
 ## Training on your own pen data
 
-The dataset format is a JSON list (optionally zipped), one item per word:
+The dataset format is a JSON list (optionally zipped) or JSON Lines, one item
+per word:
 
 ```json
 {"text": "hello", "points": [[0.0, 0.1, 1], [0.01, 0.12, 1], ...]}
@@ -201,7 +205,8 @@ tall.
 - **Collect your own**: open `collect.html` in a browser, write with a
   mouse/trackpad, export JSON. This is how the bundled `bigbank_3500` dataset
   (3,500 words, one author) was made.
-- **Convert existing datasets**: see `pengpt/convert.py`.
+- **Convert existing datasets**: `normalize` in `utils.py` brings absolute or
+  delta-encoded points to the expected conventions.
 - **Irregular point density?** Set `--spacing 0.02` to resample to uniform arc
   length. The bundled data does not need this: `collect.html` records a point
   every time the pen has moved a fixed distance, so its spacing is already
@@ -216,7 +221,7 @@ Nothing in the tokenizer knows about letters or words — it encodes pen motion 
 a grid. Sketches, signatures, diagrams and gestures work with two settings:
 
 ```bash
-python train.py --dataset data/sketches.json --max_words 1 --augment general
+python pengpt.py train --dataset data/sketches.json --max_words 1 --augment general
 ```
 
 `--max_words 1` treats each example as one trajectory, which makes the `WORD`
@@ -226,9 +231,9 @@ slant about. `--augment none` disables augmentation entirely, and `--rotate 10`
 adds rotation, which suits data with no canonical upright.
 
 Ink scale is the one thing to get right. The grid is a fixed distance, so tokens
-per example scale with how large the drawing is; `convert.py` normalizes to the
-bundled data's scale, and `train.py` warns with a suggested `--grid` if a dataset
-arrives at a different one.
+per example scale with how large the drawing is; `normalize` in `utils.py`
+rescales to the bundled data's scale, and training warns with a suggested
+`--grid` if a dataset arrives at a different one.
 
 Measured on the bundled cursive, the shear earns its place: removing it costs
 0.79 → 0.95 bits per pen-point even with 37% more optimizer steps. That is a
@@ -241,21 +246,18 @@ draw yields a caption, a pen sketch of that setup, and a question whose answer
 follows from the physics. Ground truth is exact by construction.
 
 ```bash
-python physics_sketch.py --n 20000 --max_text_length 160 --out data/physics_v1.jsonl
+python physics_sketch.py --n 28000 --style plain --detail elided \
+  --max_text_length 170 --out data/physics_v2.jsonl
 python physics_sketch.py --preview     # per-archetype validation sheets
-python train.py --dataset data/physics_v1.jsonl \
-  --max_words 1 --augment general \
-  --max_text_length 160 --max_seq_length 160 \
-  --n_layer 6 --n_embd 128 --learning_rate 1e-3 --batch_size 32 \
-  --out_dir out/physics
+python pengpt.py train --preset physics
 ```
 
-`--max_text_length 160` is not optional. These captions compare two clauses and
-the deciding one is usually the second, so the cursive default of 50 cuts the
-prompt before the information that fixes the answer: 33% of `physics_v0` was
-trained on a prompt shared by examples with opposite labels. Loss falls anyway.
-Generation now refuses to write a file whose captions its `--max_text_length`
-would make ambiguous, and prints the value to train with.
+The preset's `--max_text_length 170` is not optional. These captions compare
+two clauses and the deciding one is usually the second, so the cursive default
+of 50 cuts the prompt before the information that fixes the answer: 33% of
+`physics_v0` was trained on a prompt shared by examples with opposite labels.
+Loss falls anyway. Generation refuses to write a file whose captions its
+`--max_text_length` would make ambiguous, and prints the value to train with.
 
 `--max_seq_length 160` covers the p99: 278 merges take the drawings from a p99
 of 265 raw tokens to 124.
@@ -284,12 +286,7 @@ low caption diversity is correct — their variety is in the drawing. The captio
 floor test exempts them, and a separate test asserts the opposite property:
 that their captions stay *insufficient*.
 
-```bash
-python physics_sketch.py --n 28000 --style plain --detail elided \
-  --max_text_length 170 --out data/physics_v2.jsonl
-```
-
-36% of that corpus needs the picture. `meta["elided"]` names the withheld
+36% of the elided corpus needs the picture. `meta["elided"]` names the withheld
 attribute, so the picture-needed subset can be scored on its own.
 
 ### Composing attributes, not comparing one
@@ -395,48 +392,61 @@ doodles across 345 categories under CC-BY-4.0. Its format is already what pengpt
 expects — strokes with pen lifts at the boundaries — so the converter is thin:
 
 ```bash
-python -m pengpt.convert --quickdraw cat.ndjson --out data/cats.json
-python train.py --dataset data/cats.json --max_words 1 --augment general
+python utils.py convert --quickdraw cat.ndjson --out data/cats.json
+python pengpt.py train --dataset data/cats.json --max_words 1 --augment general
 ```
 
 Much of it is sloppy, and mean quality matters more than raw count, so
-`rank_quickdraw.py` keeps the best fraction of each category:
+`utils.py rank` keeps the best fraction of each category:
 
 ```bash
-python rank_quickdraw.py --raw_dir qd_raw --out data/top25.jsonl --resume
+python utils.py download --out_dir qd_raw
+python utils.py rank --raw_dir qd_raw --out data/top25.jsonl --resume
 ```
 
 It renders each drawing, embeds it with CLIP, and scores it with a probe
-calibrated on 210 hand-judged drawings (`pengpt/quality.py`). Held out, the
-quarter it keeps is 83% good-or-better against a 48% base rate, with none of the
-judged junk surviving — a good coarse filter, not a fine ranking. Selection is
-per category so class balance survives, output streams to JSON Lines, and
-`--resume` picks up after a crash.
+calibrated on 210 hand-judged drawings (`data/quickdraw_probe.npz`). Held out,
+the quarter it keeps is 83% good-or-better against a 48% base rate, with none
+of the judged junk surviving — a good coarse filter, not a fine ranking.
+Selection is per category so class balance survives, output streams to JSON
+Lines, and `--resume` picks up after a crash. Requires `transformers` and
+`Pillow` (`pip install -e ".[quality]"`).
 
 Throughput is 204 drawings/s here, so the full corpus is about 68 hours; a
 rented GPU does it in one to three, since 92% of the time is CLIP inference.
 
+## Icons
+
+Six open icon sets ship SVGs whose paths are literal pen centerlines — Lucide,
+Tabler outline, Feather, Iconoir regular, Heroicons outline, and Akar.
+`utils.py icons` aggregates them into one corpus of 8,770 sketchable icons
+across 7,541 compositional labels ("arrow down left from circle"), rejecting
+filled shapes, un-pennable geometry (30+ strokes, dot-by-dot dashes), and
+near-identical renditions that shared ancestry produces (Lucide forked
+Feather). Strokes are greedily reordered to minimize pen-up travel, the way a
+person sketches. Requires `svgelements`.
+
+```bash
+python utils.py icons --raw_dir data/raw --out data/icons.jsonl
+python pengpt.py train --preset icons
+```
+
+The preset uses a finer grid (0.012 — the default 0.020 is too coarse for
+small icon detail) and `--tremor 0.004 --rotate 2`: designer geometry is
+ruler-perfect, and a model trained on it learns a drafting machine's hand, so
+tremor bridges it toward human ink.
+
 ## Repo map
 
 ```
-pengpt/config.py     dataclass configs + CLI
-pengpt/tokenizer.py  ScribeTokens + BPE + char tokenizer
-pengpt/data.py       loading, augmentation, PenDataset
-pengpt/model.py      PenTransformer + checkpoint I/O
-pengpt/sampling.py   generation, paragraph layout, plotting
-pengpt/convert.py    external dataset converters
-pengpt/quality.py    rank drawings, to filter a crowd-sourced corpus
-train.py             training loop
-sample.py            write arbitrary text
-iliad.py             write the Iliad opening
-compare.py           real handwriting beside generations
-progress.py          contact sheet of samples over a run
-rank_quickdraw.py    filter Quick, Draw! to its best drawings
+pengpt.py            the algorithm: config, ScribeTokens + BPE, data pipeline,
+                     PenTransformer, sampling, and the train/sample/rank commands
+utils.py             per-dataset presets, converters, and corpus-building tools
+                     (Quick, Draw! download/convert/rank, icon aggregation)
 physics_sketch.py    procedural physics problems: caption, sketch, answer
 sketch_style.py      hand-style variation for procedural sketches
-ink_icons.py         aggregate stroke-native icon sets into one pen corpus
-ink_sketchy.py       convert the Sketchy database (75k object sketches)
 collect.html         self-contained data collection page
+tests/               pytest suite; pins tokenizer, data, model, and corpus properties
 ```
 
 By Sam Greydanus. Cursive model and dataset from the cursivetransformer project

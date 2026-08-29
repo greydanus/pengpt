@@ -12,9 +12,11 @@ dependencies = [
 [project.optional-dependencies]
 wandb = ["wandb"]
 dev = ["pytest"]
+quality = ["transformers", "Pillow"]   # utils.py rank: CLIP-based filtering
+icons = ["svgelements"]                # utils.py icons: SVG icon aggregation
 
 [tool.setuptools]
-packages = ["pengpt"]
+py-modules = ["pengpt", "utils", "physics_sketch", "sketch_style"]
 
 [build-system]
 requires = ["setuptools>=61"]

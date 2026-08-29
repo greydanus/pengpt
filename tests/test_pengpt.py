@@ -3,10 +3,10 @@ import pytest
 import torch
 
 from pengpt import (DataConfig, ModelConfig, PenTransformer, PenDataset,
-                    ScribeTokenizer, CharTokenizer, learn_merges)
-from pengpt.data import IGNORE_INDEX, prepare_word, resample
-from pengpt.model import save_checkpoint, load_checkpoint
-from pengpt.tokenizer import bresenham_steps, DIRECTIONS, DOWN, UP
+                    ScribeTokenizer, CharTokenizer, learn_merges,
+                    IGNORE_INDEX, prepare_word, resample, augment_drawing,
+                    save_checkpoint, load_checkpoint,
+                    bresenham_steps, DIRECTIONS, DOWN, UP, _walk)
 
 
 def make_word(n=40, seed=0):
@@ -220,7 +220,6 @@ def test_works_without_word_structure():
     packing loop must be inert rather than in the way. Nothing here should need
     a code path of its own -- only max_words=1.
     """
-    rng = np.random.default_rng(0)
     t = np.linspace(0, 4 * np.pi, 200)
     shapes = []
     for s in range(6):
@@ -254,7 +253,7 @@ def test_normalize_absolute_bypasses_delta_detection():
     it into a diagonal staircase. This corrupted 24% of a filtered Quick, Draw!
     corpus. absolute=True is how a caller that knows its format opts out.
     """
-    from pengpt.convert import normalize
+    from utils import normalize
     square = np.array([[0, 0, 1], [255, 0, 1], [255, 255, 1],
                        [0, 255, 1], [0, 0, 1]], dtype=float)
     out = normalize(square.copy(), absolute=True)
@@ -433,7 +432,6 @@ def test_plain_style_shortens_sketches():
     reasoning depth.
     """
     import physics_sketch
-    from pengpt.tokenizer import ScribeTokenizer
 
     st = ScribeTokenizer(grid=0.020)
 
@@ -454,7 +452,7 @@ def test_plain_style_shortens_sketches():
 
 
 def test_bradley_terry_recovers_an_ordering():
-    from pengpt.quality import bradley_terry, spearman
+    from utils import bradley_terry, spearman
     truth = np.arange(20, dtype=float)
     rng = np.random.default_rng(0)
     comparisons = []
@@ -466,7 +464,7 @@ def test_bradley_terry_recovers_an_ordering():
 
 
 def test_select_per_class_keeps_class_balance():
-    from pengpt.quality import select_per_class
+    from utils import select_per_class
     labels = np.array(["cat"] * 40 + ["car"] * 40)
     scores = np.r_[np.arange(40), np.arange(40) * -1.0]   # opposite orderings
     keep = select_per_class(scores, labels, fraction=0.25)
@@ -606,249 +604,28 @@ def test_model_forward_and_generate(tiny_dataset):
     assert st.decode(out[0].numpy()) is not None  # arbitrary output decodes safely
 
 
-class _StubTextEncoder:
-    dim = 8
-
-    def encode(self, text, length):
-        out = np.zeros((length, 8), dtype=np.float32)
-        for i, b in enumerate(text.encode()[:length]):
-            out[i, b % 8] = 1.0
-            out[i, (b // 8) % 8] += 0.5
-        return out
-
-
-def test_float_context_path(tiny_dataset):
-    st, cfg = tiny_dataset.stroke_tok, tiny_dataset.cfg
-    tiny_dataset.text_encoder = _StubTextEncoder()
-    try:
-        x, c, y = tiny_dataset[0]
-        assert c.dtype == torch.float32
-        assert c.shape == (cfg.max_text_length, 8)
-        mcfg = ModelConfig(n_layer=2, n_head=2, n_embd=32, vocab_size=st.vocab_size,
-                           block_size=cfg.max_seq_length, context_vocab_size=1,
-                           context_block_size=cfg.max_text_length, context_dim=8)
-        model = PenTransformer(mcfg)
-        logits, loss = model(x.unsqueeze(0), c.unsqueeze(0), y.unsqueeze(0))
-        assert torch.isfinite(loss)
-        empty = torch.zeros(1, cfg.max_text_length, 8)
-        _, loss2 = model(x.unsqueeze(0), empty, y.unsqueeze(0))
-        assert torch.isfinite(loss2)
-        out = model.generate(x.unsqueeze(0)[:, :6], c.unsqueeze(0),
-                             max_new_tokens=8, end_token=st.END, pad_token=st.PAD)
-        assert out.shape[1] <= 14
-    finally:
-        tiny_dataset.text_encoder = None
-
-
-def test_clip_char_encode_structure(tiny_dataset):
-    from pengpt.textenc import CharClipEncoder
-    enc = CharClipEncoder.__new__(CharClipEncoder)
-    enc.char_tok = tiny_dataset.char_tok
-    enc.clip_dim = 4
-    enc.dim = 4 + tiny_dataset.char_tok.vocab_size
-    enc._global = lambda text: np.array([1, 0, 0, 0], dtype=np.float32)
-    out = enc.encode("cab", 8)
-    ct = tiny_dataset.char_tok
-    assert out.shape == (8, enc.dim)
-    assert (out[:3, 0] == 1).all() and (out[3:] == 0).all()
-    for i, ch in enumerate("cab"):
-        assert out[i, 4 + ct.stoi[ch]] == 1.0
-        assert out[i, 4:].sum() == 1.0
-
-
-def test_image_embed_conditioning(tiny_dataset):
-    from pengpt.textenc import CharClipEncoder
-    if tiny_dataset.cfg.max_words != 1:
-        tiny_dataset.cfg.max_words = 1
-    enc = CharClipEncoder.__new__(CharClipEncoder)
-    enc.char_tok = tiny_dataset.char_tok
-    enc.clip_dim = 4
-    enc.dim = 4 + tiny_dataset.char_tok.vocab_size
-    enc._global = lambda text: np.full(4, 0.5, dtype=np.float32)
-    tiny_dataset.text_encoder = enc
-    tiny_dataset.bank_embeds = np.arange(6 * 4, dtype=np.float32).reshape(6, 4)
-    tiny_dataset.cfg.embed_dropout = 0.0
-    tiny_dataset.augment = False
-    try:
-        for idx in range(4):
-            x, c, y = tiny_dataset[idx]
-            bank = tiny_dataset.bank_word_for(idx)
-            live = c.numpy().any(axis=1)
-            assert live.any()
-            assert (c.numpy()[live, :4] == tiny_dataset.bank_embeds[bank]).all()
-            assert (c.numpy()[~live] == 0).all()
-        assert (tiny_dataset.encode_text("cab")[:3, :4] == 0.5).all()
-    finally:
-        tiny_dataset.text_encoder = None
-        tiny_dataset.bank_embeds = None
-
-
-def test_union_canonical_and_sources(tiny_dataset):
-    from ink_union import canonical
-    assert canonical("Hot-Air Balloon") == "hot air balloon"
-    assert canonical("car (sedan)") == "car"
-    assert canonical("teddy_bear!") == "teddy bear!"
-
-    tiny_dataset.bank_sources = ["a", "a", "b", "b", "b", ""]
-    assert tiny_dataset.sources() == ["a", "b"]
-    sub = tiny_dataset.for_source("b")
-    assert list(sub.indices) == [2, 3, 4]
-    assert sub.name.endswith("_b")
-    x, c, y = sub[0]
-    assert (x >= 0).all()
-
-
-def test_holdout_filter():
-    from pengpt.data import filter_holdout
-    examples = [{"text": "a big wolf"}, {"text": "wolfhound"},
-                {"text": "a cat"}, {"text": "gray wolf pup"}]
-    kept = filter_holdout(examples, "wolf")
-    assert [e["text"] for e in kept] == ["wolfhound", "a cat"]
-    assert filter_holdout(examples, "") is examples
-
-
-def test_token_deltas_track_pen_position(tiny_dataset):
-    """The per-token displacement table must integrate to the true pen path,
-    through BPE merges, or pen-position features would silently lie."""
-    st = tiny_dataset.stroke_tok
-    deltas = st.token_deltas()
-    rng = np.random.default_rng(0)
-    points = np.column_stack([np.cumsum(rng.normal(0, 0.05, (30, 2)), axis=0),
-                              np.ones(30)])
-    points[9, 2] = 0  # a lift mid-way
-    tokens = st.encode_word(points)
-    summed = deltas[tokens].sum(axis=0)
-    grid_end = np.rint(points[-1, :2] / st.grid).astype(int)
-    assert (summed == grid_end).all()
-
-
-def test_pen_pos_features_are_causal_and_checkpoint_safe(tiny_dataset, tmp_path):
+def test_checkpoint_roundtrip(tiny_dataset, tmp_path):
+    """A saved model reloads with identical weights, config, and merges --
+    including through the field filtering that tolerates old checkpoints."""
     st, ct, cfg = tiny_dataset.stroke_tok, tiny_dataset.char_tok, tiny_dataset.cfg
     mcfg = ModelConfig(n_layer=2, n_head=2, n_embd=32, vocab_size=st.vocab_size,
                        block_size=cfg.max_seq_length, context_vocab_size=ct.vocab_size,
-                       context_block_size=cfg.max_text_length, pen_pos_bands=6)
+                       context_block_size=cfg.max_text_length)
     model = PenTransformer(mcfg)
-    model.pen_deltas.copy_(torch.tensor(st.token_deltas()))
-    model.eval()
-    x, c, y = (t.unsqueeze(0) for t in tiny_dataset[0])
-    logits, loss = model(x, c, y)
-    assert torch.isfinite(loss)
-
-    # Causality: changing a suffix token must not change earlier logits.
-    x2 = x.clone()
-    x2[0, -1] = (x2[0, -1] + 1) % st.vocab_size
-    logits2, _ = model(x2, c, y)
-    assert torch.allclose(logits[0, :-1], logits2[0, :-1], atol=1e-5)
-
-    # Round-trip through a checkpoint, table included.
     path = tmp_path / "ckpt.pt"
     save_checkpoint(str(path), model, ct.alphabet, {"dataset": "x"}, st.merges)
-    reloaded, _ = load_checkpoint(str(path))
-    assert (reloaded.pen_deltas == model.pen_deltas).all()
+    reloaded, ckpt = load_checkpoint(str(path))
+    assert ckpt["alphabet"] == ct.alphabet
+    assert reloaded.cfg == model.cfg
+    for k, v in model.state_dict().items():
+        assert torch.equal(reloaded.state_dict()[k], v)
 
-    # A no-position config must still load checkpoints that never had one.
-    mcfg0 = ModelConfig(n_layer=2, n_head=2, n_embd=32, vocab_size=st.vocab_size,
-                        block_size=cfg.max_seq_length, context_vocab_size=ct.vocab_size,
-                        context_block_size=cfg.max_text_length)
-    model0 = PenTransformer(mcfg0)
-    logits0, _ = model0(x, c, y)
-    assert logits0.shape == logits.shape
-
-
-def test_local_canvas_marks_ink_and_stays_causal(tiny_dataset):
-    st, ct, cfg = tiny_dataset.stroke_tok, tiny_dataset.char_tok, tiny_dataset.cfg
-    from pengpt.model import attach_tokenizer_tables
-    mcfg = ModelConfig(n_layer=2, n_head=2, n_embd=32, vocab_size=st.vocab_size,
-                       block_size=cfg.max_seq_length, context_vocab_size=ct.vocab_size,
-                       context_block_size=cfg.max_text_length,
-                       pen_pos_bands=4, pen_last_down=True,
-                       local_canvas=16, local_cell=8)
-    model = PenTransformer(mcfg)
-    attach_tokenizer_tables(model, st)
-    model.eval()
     x, c, y = (t.unsqueeze(0) for t in tiny_dataset[0])
-    logits, loss = model(x, c, y)
-    assert torch.isfinite(loss)
-    x2 = x.clone()
-    x2[0, -1] = (x2[0, -1] + 1) % st.vocab_size
-    logits2, _ = model(x2, c, y)
-    assert torch.allclose(logits[0, :-1], logits2[0, :-1], atol=1e-5)
-
-    # A DOWN then a right-step should light a cell in the local window.
-    seq = torch.tensor([[st.BOS, getattr(st, "DOWN", 8), 0,
-                         getattr(st, "UP", 9), st.END]], dtype=torch.long)
-    if seq.size(1) < cfg.max_seq_length:
-        pad = torch.full((1, cfg.max_seq_length - seq.size(1)), st.PAD)
-        seq = torch.cat([seq, pad], dim=1)
-    pos = model.pen_deltas[seq].cumsum(dim=1)
-    maps = model._local_maps(seq, pos)
-    assert maps[0, 2].sum() > 0
-
-
-def _drawing_mask_loop(idx, down_id, up_id):
-    B, T = idx.shape
-    down = idx == down_id
-    up = idx == up_id
-    drawn = torch.zeros(B, T, dtype=torch.bool, device=idx.device)
-    pen = torch.zeros(B, dtype=torch.bool, device=idx.device)
-    for t in range(T):
-        pen = torch.where(down[:, t], torch.ones_like(pen), pen)
-        drawn[:, t] = pen
-        pen = torch.where(up[:, t], torch.zeros_like(pen), pen)
-    return drawn
-
-
-def test_drawing_mask_matches_loop(tiny_dataset):
-    st = tiny_dataset.stroke_tok
-    from pengpt.model import attach_tokenizer_tables
-    mcfg = ModelConfig(n_layer=2, n_head=2, n_embd=32, vocab_size=st.vocab_size,
-                       block_size=64, context_vocab_size=8, context_block_size=8,
-                       local_canvas=16, local_cell=1.25)
-    model = PenTransformer(mcfg)
-    attach_tokenizer_tables(model, st)
-    rng = torch.Generator().manual_seed(0)
-    idx = torch.randint(0, st.vocab_size, (4, 48), generator=rng)
-    idx[:, 3] = st.DOWN
-    idx[:, 20] = st.UP
-    idx[:, 25] = st.DOWN
-    idx[:, 40] = st.UP
-    assert torch.equal(model._drawing_mask(idx),
-                       _drawing_mask_loop(idx, st.DOWN, st.UP))
-
-
-def test_canvas_linear_and_cnn_both_run(tiny_dataset):
-    st, ct, cfg = tiny_dataset.stroke_tok, tiny_dataset.char_tok, tiny_dataset.cfg
-    from pengpt.model import attach_tokenizer_tables
-    x, c, y = (t.unsqueeze(0) for t in tiny_dataset[0])
-    for linear in (True, False):
-        mcfg = ModelConfig(n_layer=2, n_head=2, n_embd=32, vocab_size=st.vocab_size,
-                           block_size=cfg.max_seq_length, context_vocab_size=ct.vocab_size,
-                           context_block_size=cfg.max_text_length,
-                           local_canvas=16, local_cell=1.25, canvas_linear=linear)
-        model = PenTransformer(mcfg)
-        attach_tokenizer_tables(model, st)
-        _, loss = model(x, c, y)
-        assert torch.isfinite(loss)
-        assert hasattr(model, "canvas_proj" if linear else "canvas_net")
-
-
-def test_local_maps_accumulates_and_stays_in_unit_interval(tiny_dataset):
-    st = tiny_dataset.stroke_tok
-    from pengpt.model import attach_tokenizer_tables
-    mcfg = ModelConfig(n_layer=2, n_head=2, n_embd=32, vocab_size=st.vocab_size,
-                       block_size=8, context_vocab_size=8, context_block_size=8,
-                       local_canvas=16, local_cell=1.0)
-    model = PenTransformer(mcfg)
-    attach_tokenizer_tables(model, st)
-    # Stay in place with the pen down: every endpoint hits the same cell.
-    idx = torch.tensor([[st.BOS, st.DOWN, st.UP, st.END]], dtype=torch.long)
-    pos = torch.zeros(1, 4, 2)
-    maps = model._local_maps(idx, pos)
-    assert maps.min() >= 0 and maps.max() <= 1
-    # DOWN and the following UP both splat the origin; occupancy must accumulate
-    # enough to light the center (advanced-index += drops collisions).
-    center = maps[0, 2, 8, 8]
-    assert center > 0.5
+    model.eval(), reloaded.eval()
+    with torch.inference_mode():
+        a, _ = model(x, c, y)
+        b, _ = reloaded(x, c, y)
+    assert torch.allclose(a, b)
 
 
 def _apply_merges_reference(merges, pairs, tokens):
@@ -880,7 +657,6 @@ def _walk_reference(grid_xy):
 
 
 def test_vectorized_tokenizer_matches_reference(tiny_dataset):
-    from pengpt.tokenizer import _walk
     st = tiny_dataset.stroke_tok
     rng = np.random.default_rng(7)
     for trial in range(30):
@@ -900,7 +676,6 @@ def test_vectorized_tokenizer_matches_reference(tiny_dataset):
 
 def test_augment_drawing():
     from types import SimpleNamespace
-    from pengpt.data import augment_drawing
     rng = np.random.default_rng(0)
     pts = np.array([[0, 0, 1], [1, 0, 1], [1, 0, 0],
                     [2, 2, 1], [3, 2, 1], [3, 2, 0],
@@ -939,36 +714,3 @@ def test_augment_drawing():
     # Two-point strokes have no interior to wave; they pass through untouched.
     assert (augment_drawing(pts, "a scene", cfg,
                             np.random.default_rng(2)) == pts).all()
-
-    # Source gating: human ink skips tremor; icons skip flip and dropout.
-    out = augment_drawing(line.copy(), "a scene", cfg,
-                          np.random.default_rng(1), source="sketchy")
-    assert (out == line).all()
-    cfg = SimpleNamespace(stroke_dropout=0.999, hflip=1.0, tremor=0.0)
-    out = augment_drawing(pts, "a scene", cfg,
-                          np.random.default_rng(3), source="icons")
-    assert (out == pts).all()
-    out = augment_drawing(pts, "a scene", cfg,
-                          np.random.default_rng(3), source="quickdraw")
-    assert out.shape != pts.shape or not (out == pts).all()
-
-
-def test_bucketed_loader(tiny_dataset):
-    from pengpt.data import BucketedInfiniteLoader
-
-    # bank_word_for must replay exactly the draw __getitem__ makes.
-    if tiny_dataset.cfg.max_words == 1:
-        for idx in range(20):
-            bank = tiny_dataset.bank_word_for(idx)
-            assert tiny_dataset.text_for(idx) == tiny_dataset.bank_texts[bank]
-
-    ds = tiny_dataset
-    ds.cfg.max_words = 1
-    for idx in range(20):
-        bank = ds.bank_word_for(idx)
-        assert ds.bank_texts[bank] in ds.text_for(idx) or \
-            ds.text_for(idx) == ds.bank_texts[bank]
-
-    loader = BucketedInfiniteLoader(ds, batch_size=4, num_workers=0)
-    x, c, y = loader.next()
-    assert x.shape[0] == 4 and x.shape[1] == ds.cfg.max_seq_length
