@@ -1,19 +1,3 @@
-"""pengpt: a minimal transformer for pen strokes, in one file.
-
-Give it a corpus of pen trajectories -- handwriting, sketches, anything drawn
-with a stylus or mouse -- and it learns to generate more of them, conditioned
-on text. The same core algorithm trains on every supported dataset; per-dataset
-settings live in utils.PRESETS.
-
-    python pengpt.py train --preset cursive
-    python pengpt.py train --preset quickdraw
-    python pengpt.py sample --checkpoint out/cursive/best.pt --text "hello world"
-    python pengpt.py rank --checkpoint out/quickdraw/best.pt --labels cat,car,fish
-
-The file reads top to bottom as the pipeline runs: configuration, tokenizer,
-data, model, sampling, then the three commands.
-"""
-
 import argparse
 import collections
 import gzip
@@ -31,37 +15,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader
 import matplotlib
-# Every figure here is written to a file, never shown. Left to choose for
-# itself, matplotlib picks an interactive backend where one is available, which
-# on macOS opens a GUI window per eval from inside a headless training run: it
-# logs ApplePersistenceIgnoreState, takes about thirty seconds to write what Agg
-# writes in one, and can block the run outright when no session is attached.
-matplotlib.use("Agg")
+matplotlib.use("Agg")  # figures only ever go to files; interactive backends stall headless runs
 import matplotlib.pyplot as plt
-
-
-# ---------------------------------------------------------------------------
-# Configuration
-#
-# Defaults come from wall-clock ablations on bigbank_3500, scored in bits per
-# pen-point on held-out words. Two are worth knowing about because they are
-# specific to the machine rather than to the task:
-#
-# - batch_size is small. Throughput on MPS is flat in batch size (47 ktok/s at
-#   8, 58 at 128), so a larger batch buys no tokens per second and simply takes
-#   fewer optimizer steps in the same time. On hardware that does scale, raise it.
-# - grid trades reconstruction error against sequence length. 0.020 keeps error
-#   inside the width of a pen stroke while costing 99 tokens per word.
-#
-# Comparing two runs: reported loss is nats per token, which is only comparable
-# between runs whose tokenizers agree. Anything that changes tokens per example
-# -- grid, n_merges, how merges apply -- rescales it, so multiply by tokens per
-# example first.
-#
-# The defaults suit handwriting. Drawing corpora want --max_words 1
-# --augment general and per-corpus lengths; utils.PRESETS records the settled
-# values per dataset.
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -70,31 +25,21 @@ class DataConfig:
     max_examples: int = 0
     train_size: int = 500_000
     test_size: int = 3_000
-    max_words: int = 8
+    max_words: int = 8              # words packed per training sequence
     max_seq_length: int = 512
     max_text_length: int = 50
-    grid: float = 0.020
+    grid: float = 0.020             # tokenizer cell size: reconstruction error vs sequence length
     n_merges: int = 512
     augment: str = "handwriting"
-    spacing: float = 0.0
+    spacing: float = 0.0            # resample to uniform arc length; 0 = data already uniform
     spacing_jitter: float = 0.20
     scale_jitter: float = 0.15
     rotate: float = 0.0
     shear_min: float = -0.22
     shear_max: float = -0.18
-    # Probability of mirroring a drawing left-right. Skipped for any example
-    # whose caption says "left" or "right", so the text never lies about the
-    # picture. A mirrored scene is a valid scene; mirrored handwriting is not,
-    # so leave this off for text corpora.
-    hflip: float = 0.0
-    # Hand-tremor amplitude in ink units, for designer-drawn sources (icon
-    # sets, procedural sketches) whose ruler-perfect lines would otherwise
-    # teach a drafting machine's hand. 0 disables.
-    tremor: float = 0.0
-    # Probability of deleting each stroke independently (at least one always
-    # survives). A scene of sixty strokes minus three still matches its
-    # caption; a word minus a letter does not, so again: drawings only.
-    stroke_dropout: float = 0.0
+    hflip: float = 0.0              # mirror drawings; skipped when the caption says left/right
+    tremor: float = 0.0             # humanize ruler-perfect ink (icon sets); wrong for human ink
+    stroke_dropout: float = 0.0     # drop whole strokes; scenes survive it, words do not
     seed: int = 1337
 
 
@@ -103,30 +48,12 @@ class ModelConfig:
     n_layer: int = 5
     n_head: int = 4
     n_embd: int = 64
-    # Fourier features of the pen's absolute canvas position, added to the
-    # token embedding. The tokens are relative motion, so without this the
-    # model must integrate the whole walk with attention to know whether two
-    # strokes connect; with it, position is an input rather than a
-    # computation. On by default; the measured gain is real but small (~0.02
-    # nats per token on scene sketches, less on short drawings), so
-    # --pen_pos_bands 0 opts out. Wavelengths are 4 * 2^k grid cells; the
-    # longest period (4 * 2^(bands-1)) must exceed the largest within-sample
-    # position range plus twice the jitter, or positions alias.
-    pen_pos_bands: int = 8
-    # Training-time random canvas offset in grid cells. Absolute layout can't
-    # be memorized when the origin moves, but within-sample geometry -- which
-    # strokes touch, what is already drawn where -- survives translation.
-    pen_pos_jitter: int = 32
+    pen_pos_bands: int = 8          # fourier features of absolute pen position; 0 disables
+    pen_pos_jitter: int = 32        # train-time canvas offset, so layout cannot be memorized
     vocab_size: int = -1
     block_size: int = -1
     context_vocab_size: int = -1
     context_block_size: int = -1
-
-
-DERIVED_FIELDS = {"vocab_size", "block_size", "context_vocab_size",
-                  "context_block_size"}
-
-CHOICES = {"augment": ("none", "general", "handwriting")}
 
 
 @dataclass
@@ -139,10 +66,7 @@ class TrainConfig:
     grad_clip: float = 1.0
     eval_every: int = 1_000
     print_every: int = 100
-    # 0 loads data on the main process. The models are small enough that
-    # loading is never the bottleneck, and DataLoader worker spawn deadlocks
-    # before step 1 on some macOS + recent-Python combinations.
-    num_workers: int = 0
+    num_workers: int = 0            # loading never bottlenecks; workers deadlock on macOS py3.14
     device: str = "auto"
     out_dir: str = "out/default"
     resume: str = ""
@@ -152,8 +76,13 @@ class TrainConfig:
     wandb_run_name: str = ""
 
 
+DERIVED_FIELDS = {"vocab_size", "block_size", "context_vocab_size",
+                  "context_block_size"}
+
+CHOICES = {"augment": ("none", "general", "handwriting")}
+
+
 def add_config_args(parser):
-    """Generate one CLI from the three config dataclasses."""
     for cls in (DataConfig, ModelConfig, TrainConfig):
         for f in fields(cls):
             if f.name in DERIVED_FIELDS:
@@ -168,55 +97,17 @@ def add_config_args(parser):
 
 def configs_from_args(args):
     args = vars(args)
-
-    def build(cls):
-        return cls(**{f.name: args[f.name] for f in fields(cls) if f.name in args})
-
+    build = lambda cls: cls(**{f.name: args[f.name] for f in fields(cls) if f.name in args})
     return build(DataConfig), build(ModelConfig), build(TrainConfig)
 
 
 def _filter_config(cls, d):
-    """Keep only the fields cls still has, reporting anything dropped.
-
-    Checkpoints written before the repo was consolidated carry config keys for
-    removed features (text encoders, pen-position features, source labels).
-    Their weights still load -- load_state_dict is non-strict -- but a key that
-    was actually in use deserves a warning rather than silence.
-    """
     known = {f.name for f in fields(cls)}
     dropped = {k: v for k, v in d.items() if k not in known and v}
     if dropped:
         print(f"WARNING: checkpoint used removed features, ignoring {dropped}")
     return {k: v for k, v in d.items() if k in known}
 
-
-# ---------------------------------------------------------------------------
-# Tokenizer
-#
-# ScribeTokens ("ScribeTokens: Fixed-Vocabulary Tokenization of Digital Ink",
-# arXiv:2603.02805): coordinates are quantized to an integer grid and motion
-# becomes a walk on that grid -- eight compass directions (Freeman chain codes)
-# plus two pen-state tokens.
-#
-#     0:right 1:up-right 2:up 3:up-left 4:left 5:down-left 6:down 7:down-right
-#     8:DOWN (pen touches paper)   9:UP (pen lifts)
-#
-# Movement between grid points is decomposed with Bresenham's line algorithm,
-# so any path is representable. Byte pair encoding then merges recurring runs,
-# which is what makes sequences short.
-#
-# Two properties matter. Insensitivity to sampling rate: recording the same
-# shape more finely barely changes the tokens, and changes them not at all once
-# samples land in adjacent grid cells. Point density in raw pen data is an
-# artifact of the recorder, so this is what lets a mouse, a digitizer and a
-# public dataset share one representation. No out-of-vocabulary: a grid walk
-# always decomposes into base tokens, unlike bin tables that must be retuned
-# per dataset and silently clip outliers.
-#
-# A word is an (N, 3) array of (x, y, pen); pen == 1 while touching the paper,
-# and rows with pen == 0 mark a lift, so strokes are the maximal runs of
-# pen == 1.
-# ---------------------------------------------------------------------------
 
 DIRECTIONS = np.array([(1, 0), (1, 1), (0, 1), (-1, 1),
                        (-1, 0), (-1, -1), (0, -1), (1, -1)])
@@ -229,15 +120,10 @@ for _i, (_dx, _dy) in enumerate(DIRECTIONS):
 
 
 def bresenham_steps(x0, y0, x1, y1):
-    """Unit direction indices walking (x0, y0) -> (x1, y1).
-
-    Tie-breaking must stay fixed: two encodings of one straight line have to
-    agree, or BPE learns separate merges for a single shape.
-    """
     dx, dy = abs(x1 - x0), abs(y1 - y0)
     sx = 1 if x1 > x0 else -1
     sy = 1 if y1 > y0 else -1
-    err = dx - dy
+    err = dx - dy  # fixed tie-breaking: one line must always encode one way, or BPE splits it
     out, x, y = [], int(x0), int(y0)
     while x != x1 or y != y1:
         e2 = 2 * err
@@ -260,11 +146,7 @@ def _walk(grid_xy):
     deltas = deltas[moved]
     if not len(deltas):
         return []
-    # Dense recordings land in the same or an adjacent cell, so nearly every
-    # move is a single direction token; Bresenham only matters for the rare
-    # multi-cell jump. Taking the all-unit case wholesale keeps the per-point
-    # Python loop off the training hot path.
-    if (np.abs(deltas) <= 1).all():
+    if (np.abs(deltas) <= 1).all():  # dense recordings: every move is one direction token
         return _DIR_LOOKUP[deltas[:, 0] + 1, deltas[:, 1] + 1].tolist()
     out = []
     for i in np.flatnonzero(moved):
@@ -309,41 +191,21 @@ class ScribeTokenizer:
         self._pairs = {(a, b): c for a, b, c in self.merges}
         self._inverse = {c: (a, b) for a, b, c in self.merges}
         n = N_BASE + len(self.merges)
-        # BOS is what generation starts from. Without it the first sampled token
-        # is conditioned on a prefix that never occurs in training, and that
-        # token fixes the pen's entry point and the word's height above the
-        # baseline -- the two things a whole sample hangs on.
         self.DOWN, self.UP = DOWN, UP
         self.PAD, self.END, self.WORD, self.BOS = n, n + 1, n + 2, n + 3
         self.vocab_size = n + 4
 
     def token_deltas(self):
-        """(vocab_size, 2) net pen displacement of every token, in grid cells.
-
-        Base direction tokens move one cell, pen-state and special tokens move
-        nothing, and a merged token moves by the sum of its children -- so the
-        pen's absolute position is the running sum of these deltas over any
-        token sequence, merged or not. This is what lets a model be told where
-        the pen is without changing the token stream.
-        """
         deltas = np.zeros((self.vocab_size, 2), dtype=np.int64)
         deltas[:len(DIRECTIONS)] = DIRECTIONS
         for a, b, c in self.merges:
-            deltas[c] = deltas[a] + deltas[b]
+            deltas[c] = deltas[a] + deltas[b]  # a merged token moves by the sum of its children
         return deltas
 
     def encode_word(self, points):
-        """Tokens for one word, starting from the baseline at x = 0.
-
-        The walk begins at the origin rather than at the word's first point, so
-        the initial pen-up move carries the word's height above or below the
-        baseline. Words that start at the cap line (digits, most capitals) and
-        words that start on the baseline are then distinguishable from the
-        tokens alone, with no per-alphabet table.
-        """
         points = np.asarray(points, dtype=float)
         grid_xy = np.rint(points[:, :2] / self.grid).astype(np.int64)
-        out, previous_end = [], np.array([0, 0], dtype=np.int64)
+        out, previous_end = [], np.array([0, 0], dtype=np.int64)  # start at the baseline origin, so tokens carry word height
         for start, stop in _stroke_spans(points[:, 2]):
             out.extend(_walk([previous_end, grid_xy[start]]))
             out.append(DOWN)
@@ -356,38 +218,19 @@ class ScribeTokenizer:
         parts = []
         for i, word in enumerate(words):
             if i:
-                parts.append(np.array([self.WORD, self.WORD], dtype=np.int64))
+                parts.append(np.array([self.WORD] * 2, dtype=np.int64))
             parts.append(self.encode_word(word))
         return np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
 
     def apply_merges(self, tokens):
-        """Apply merges in the order they were learned, as BPE requires.
-
-        One pass per rule, mirroring learn_merges, so encoding reproduces what
-        training produced. Taking whichever rule happens to match first in a
-        left-to-right scan is a different algorithm: on a rule set holding
-        (0,1)->10 and (2,0)->11, the sequence [2, 0, 1] greedily becomes
-        [11, 1], where BPE gives [2, 10]. Priority order is what makes the
-        earlier, more frequent rule win. The two disagreed on every word of the
-        bundled corpus, and the greedy reading cost a third of the compression
-        the merges were learned to provide (99 tokens per word against 67).
-
-        Rules whose pair is absent are skipped rather than scanned for, which is
-        most of them once a sequence is partly merged.
-        """
         if not self._pairs:
             return tokens
         out = np.asarray(tokens, dtype=np.int64).copy()
-        for a, b, merged in self.merges:
+        for a, b, merged in self.merges:  # one pass per rule, in learned order: earlier rules win shared tokens
             matches = np.flatnonzero((out[:-1] == a) & (out[1:] == b))
             if not matches.size:
                 continue
-            # A left-to-right pass merges non-overlapping pairs: a match
-            # directly after an applied one shares its second token and is
-            # skipped. Only adjacent matches (runs like [a,a,a] under a rule
-            # (a,a)) need the sequential resolution; otherwise every match
-            # stands.
-            if matches.size > 1 and (np.diff(matches) == 1).any():
+            if matches.size > 1 and (np.diff(matches) == 1).any():  # runs like [a,a,a] under rule (a,a)
                 kept, last = [], -2
                 for i in matches:
                     if i > last + 1:
@@ -413,12 +256,6 @@ class ScribeTokenizer:
         return words
 
     def decode_word(self, tokens, smooth=True):
-        """Walk the grid, emitting a point wherever the pen is down.
-
-        Eight-direction movement on a grid leaves staircase artifacts on gentle
-        curves; the moving average removes them, shifting points by well under
-        one cell so it cannot invent structure the tokens did not encode.
-        """
         points, x, y, down = [], 0, 0, False
         for t in self.expand(tokens):
             if t == DOWN:
@@ -450,31 +287,18 @@ class ScribeTokenizer:
 
 
 def learn_merges(token_sequences, n_merges=512, min_count=20):
-    """Learn BPE merges over direction tokens.
-
-    DOWN and UP are never merged, so stroke boundaries stay explicit and every
-    merged token still decomposes into base tokens.
-
-    Fewer than n_merges may come back: merging stops once no pair occurs
-    min_count times, since a rule that fires on a handful of words costs a
-    vocabulary entry without shortening anything. On the bundled data this
-    settles around 350 merges however many are asked for, and on Quick, Draw!
-    around 170 -- sketch strokes are shorter and less repetitive than cursive,
-    so there is simply less to merge. Raising --n_merges past that does
-    nothing.
-    """
     sequences = [list(s) for s in token_sequences]
     merges, next_id = [], N_BASE
     for _ in range(n_merges):
         counts = collections.Counter()
         for s in sequences:
             for pair in zip(s, s[1:]):
-                if DOWN not in pair and UP not in pair:
+                if DOWN not in pair and UP not in pair:  # never merge across a stroke boundary
                     counts[pair] += 1
         if not counts:
             break
         (a, b), count = counts.most_common(1)[0]
-        if count < min_count:
+        if count < min_count:  # a rule that rarely fires costs vocabulary without shortening anything
             break
         merges.append((a, b, next_id))
         for i, s in enumerate(sequences):
@@ -513,66 +337,25 @@ class CharTokenizer:
         return "".join(self.itos.get(int(i), "") for i in ids)
 
 
-# ---------------------------------------------------------------------------
-# Data
-#
-# On-disk format is a JSON list (optionally zipped) of examples:
-#
-#     {"text": "hello", "points": [[x, y, pen], ...]}
-#
-# Data from collect.html instead carries a metadata dict (asciiSequence,
-# aspectRatio); both forms are normalized on load. Each example is one word,
-# and training examples pack random words together until the block is full, so
-# a few thousand words yield effectively unlimited distinct examples and no
-# example is ever truncated mid-word.
-#
-# On resampling: point density in raw pen data is often an artifact of capture
-# hardware, and resampling to uniform arc length removes it. The bundled
-# bigbank data does not need this -- collect.html records a point every time
-# the pen has moved a fixed distance -- hence cfg.spacing defaults to 0. Set it
-# for time-sampled sources such as IAM, where density really varies with speed.
-# ---------------------------------------------------------------------------
-
 IGNORE_INDEX = -1
 Y_BASELINE = 0.65
-
 INK_HEIGHT = 0.22
 
 
-def ink_height(examples, n=200):
-    """Median vertical extent of the ink, ignoring outliers."""
+def check_scale(examples, grid, n=200):
     heights = [np.quantile(d[:, 1], 0.95) - np.quantile(d[:, 1], 0.05)
                for d in (e["points"][e["points"][:, 2] == 1] for e in examples[:n])
                if len(d) > 2]
-    return float(np.median(heights)) if heights else 0.0
-
-
-def check_scale(examples, grid, n=200):
-    """Warn when ink size and grid size disagree.
-
-    The grid is a fixed distance, so tokens per example scale with how large the
-    drawing is: the same shapes at twice the size cost twice the sequence. What
-    matters is the ratio of ink size to grid, not either alone. INK_HEIGHT is
-    simply the scale the bundled data happens to use; a dataset at a different
-    scale is fine as long as --grid moves with it.
-    """
-    height = ink_height(examples, n)
-    if height <= 0:
+    if not heights:
         return
-    ratio = height / INK_HEIGHT
+    ratio = float(np.median(heights)) / INK_HEIGHT  # token cost scales with ink size over grid size
     if not 0.5 < ratio < 2:
-        print(f"WARNING: ink is {ratio:.1f}x the usual size (height {height:.2f}). "
+        print(f"WARNING: ink is {ratio:.1f}x the usual size. "
               f"Sequences will be about {ratio:.1f}x as long; "
               f"pass --grid {grid * ratio:.4f} to compensate, or rescale the data.")
 
 
 def read_items(path, limit=None):
-    """Yield raw items from .json, .zip, .jsonl, or either of the last gzipped.
-
-    JSON Lines matters at corpus scale: a 12M-drawing array cannot be parsed
-    into memory at once, but one line at a time can, and `limit` then caps how
-    much of a large corpus is used.
-    """
     path = str(path)
     if path.endswith(".zip"):
         with zipfile.ZipFile(path) as zf:
@@ -597,7 +380,7 @@ def load_examples(path, limit=None):
     for item in read_items(path, limit):
         points = np.array(item["points"], dtype=float)
         meta = item.get("metadata", {})
-        if "aspectRatio" in meta:
+        if "aspectRatio" in meta:  # collect.html format
             points[:, 0] *= meta["aspectRatio"]
             points[:, 1] -= Y_BASELINE
         points[:, 0] -= points[0, 0]
@@ -608,13 +391,6 @@ def load_examples(path, limit=None):
 
 
 def resample(points, spacing):
-    """Place points at equal distances along each pen-down stroke.
-
-    It is the path that is sampled uniformly, not the chords: the straight-line
-    distance between consecutive outputs is at most spacing, and less wherever
-    the path curves between them. Pen-up rows are lift markers, not movements,
-    so they pass through untouched.
-    """
     out, stroke = [], []
 
     def flush(stroke):
@@ -643,20 +419,11 @@ def resample(points, spacing):
 
 
 def prepare_word(points, cfg, rng=None):
-    """Canonicalize one trajectory, augmenting it when an rng is given.
-
-    Augmentations come in two tiers. The general ones -- rescaling, rotation,
-    and jittered resampling -- make sense for any pen data, since a drawing is
-    still the same drawing slightly larger or slightly turned. Shear is
-    handwriting-only: it is always negative, so it imposes an italic slant
-    rather than jittering, and it presumes a baseline to slant about. On a
-    sketch it is a distortion, so cfg.augment selects the tier.
-    """
     spacing = cfg.spacing
     if rng is not None and cfg.augment != "none":
         points = points.copy()
         if cfg.augment == "handwriting":
-            points[:, 0] += rng.uniform(cfg.shear_min, cfg.shear_max) * points[:, 1]
+            points[:, 0] += rng.uniform(cfg.shear_min, cfg.shear_max) * points[:, 1]  # italic slant; presumes a baseline
         if cfg.rotate:
             a = np.deg2rad(rng.uniform(-cfg.rotate, cfg.rotate))
             c, s = np.cos(a), np.sin(a)
@@ -668,19 +435,6 @@ def prepare_word(points, cfg, rng=None):
 
 
 def _tremor(points, rng, amp, wavelength=0.055, end_scale=0.006):
-    """Hand tremor and endpoint slop, per pen-down stroke.
-
-    Designer-drawn sources (icon sets, procedural sketches) are ruler-perfect:
-    exact circles, straight lines, corners that close. A model trained on them
-    learns a drafting machine's hand. This bridges toward human ink: smooth
-    low-frequency noise perpendicular to each path -- knots every ~wavelength
-    of arc, interpolated, so lines wave the way a freehand line waves rather
-    than jittering per point -- plus endpoints extended or trimmed by a few
-    millimetres of canvas, so corners overshoot or fall short.
-
-    amp is in ink units (INK_HEIGHT is 0.22, so 0.004 is ~2% of letter height,
-    about a third of the default token grid: visible waver, same drawing).
-    """
     out = points.copy()
     for start, stop in _stroke_spans(points[:, 2]):
         seg = out[start:stop, :2]
@@ -690,13 +444,11 @@ def _tremor(points, rng, amp, wavelength=0.055, end_scale=0.006):
         if d[-1] < 1e-6:
             continue
         knots = max(3, int(d[-1] / wavelength) + 2)
-        knot_val = rng.normal(0, amp, knots)
-        offset = np.interp(d, np.linspace(0, d[-1], knots), knot_val)
+        offset = np.interp(d, np.linspace(0, d[-1], knots), rng.normal(0, amp, knots))
         tangent = np.gradient(seg, axis=0)
         norm = np.hypot(tangent[:, 0], tangent[:, 1]) + 1e-9
         normal = np.column_stack([-tangent[:, 1], tangent[:, 0]]) / norm[:, None]
-        seg += offset[:, None] * normal
-        # Endpoint slop: overshoot along the end tangent, or stop short.
+        seg += offset[:, None] * normal  # smooth waver along the path, not per-point jitter
         for end, t in ((0, seg[0] - seg[1]), (-1, seg[-1] - seg[-2])):
             delta = rng.uniform(-end_scale, end_scale)
             if delta > 0:
@@ -706,21 +458,8 @@ def _tremor(points, rng, amp, wavelength=0.055, end_scale=0.006):
 
 
 def augment_drawing(points, text, cfg, rng):
-    """Drawing-only augmentations that need the caption or stroke structure.
-
-    These run after prepare_word's geometric jitter. All are off by default
-    and belong to drawing corpora: mirrored or stroke-dropped handwriting
-    stops matching its transcript, but a scene stays a scene. Which of them
-    suit a dataset is the preset's decision -- tremor humanizes designer
-    geometry but has no business on human ink, and a dropped stroke can be
-    the x in an icon labelled "ticket x".
-    """
     if cfg.tremor > 0:
-        # Amplitude varies per drawing: a corpus of one fixed waver is as
-        # synthetic as no waver. Sampling U(0.3, 1) x tremor spans careful
-        # hands to casual ones without reaching the level that mangles small
-        # elements (measured: 2x the default visibly distorts a plus sign).
-        points = _tremor(points, rng, rng.uniform(0.3, 1.0) * cfg.tremor)
+        points = _tremor(points, rng, rng.uniform(0.3, 1.0) * cfg.tremor)  # careful hands to casual ones
     if cfg.stroke_dropout > 0:
         spans = _stroke_spans(points[:, 2])
         if len(spans) > 1:
@@ -730,15 +469,13 @@ def augment_drawing(points, text, cfg, rng):
             keep = np.ones(len(points), dtype=bool)
             for (start, stop), d in zip(spans, drop):
                 if d:
-                    # The lift row after the run belongs to the stroke.
                     lift = stop < len(points) and points[stop, 2] == 0
                     keep[start:stop + (1 if lift else 0)] = False
             points = points[keep]
     if cfg.hflip > 0 and rng.random() < cfg.hflip:
         lowered = text.lower()
-        if "left" not in lowered and "right" not in lowered:
+        if "left" not in lowered and "right" not in lowered:  # the text must never lie about the picture
             points = points.copy()
-            # Reflect within the bounding box, so coordinates keep their range.
             points[:, 0] = points[:, 0].max() + points[:, 0].min() - points[:, 0]
     return points
 
@@ -765,19 +502,9 @@ class PenDataset(Dataset):
         return self.length
 
     def pick_words(self, rng):
-        """Pack words until the block is full, sometimes stopping short.
-
-        Filling greedily every time teaches the model that END arrives when the
-        block is nearly full, rather than when the prompt runs out: it then runs
-        on past a short prompt, repeating strokes to fill the space. Choosing a
-        word count up front decorrelates END from position in the block.
-        """
         block = self.cfg.max_seq_length
-        # A bank smaller than max_words is normal on the test split, which is
-        # only 5% of the corpus; drawing without replacement must not ask for
-        # more words than exist.
         draw = min(self.cfg.max_words, len(self.indices))
-        limit = rng.integers(1, draw + 1)
+        limit = rng.integers(1, draw + 1)  # sometimes stop short, so END decorrelates from block position
         chosen, parts, total = [], [], 0
         for i in rng.choice(self.indices, size=draw, replace=False)[:limit]:
             word = prepare_word(self.bank_points[i], self.cfg,
@@ -786,7 +513,7 @@ class PenDataset(Dataset):
                 word = augment_drawing(word, self.bank_texts[i], self.cfg, rng)
             tokens = self.stroke_tok.encode_word(word)
             extra = len(tokens) + (2 if parts else 0)
-            if parts and total + extra > block - 2:   # room for BOS and END
+            if parts and total + extra > block - 2:  # never truncate mid-word; leave room for BOS and END
                 break
             if parts:
                 parts.append(np.array([self.stroke_tok.WORD] * 2, dtype=np.int64))
@@ -799,24 +526,16 @@ class PenDataset(Dataset):
         rng = np.random.default_rng([self.seed, idx])
         tokens, text = self.pick_words(rng)
         st, block = self.stroke_tok, self.cfg.max_seq_length
-
-        # x is [BOS, tokens..., END]; y is x shifted left, so position 0 learns
-        # to predict the first real token from BOS alone. Generation seeds with
-        # that same BOS, so its first step is one the model has seen.
         x = torch.full((block,), st.PAD, dtype=torch.long)
         y = torch.full((block,), IGNORE_INDEX, dtype=torch.long)
         n = min(len(tokens), block - 2)
-        x[0] = st.BOS
+        x[0] = st.BOS  # generation seeds with the same BOS, so its first step was seen in training
         x[1:n + 1] = torch.from_numpy(tokens[:n])
         x[n + 1] = st.END
         y[:n + 1] = x[1:n + 2]
-        # A word longer than the block is cut, and the cut is not where the
-        # drawing ends: supervising END there teaches that drawings stop
-        # wherever the block does. Everything before the cut is still real.
         if len(tokens) > n:
-            y[n] = IGNORE_INDEX
-        c = self.encode_text(text)
-        return x, torch.from_numpy(c), y
+            y[n] = IGNORE_INDEX  # a word cut by the block did not actually end there
+        return x, torch.from_numpy(self.encode_text(text)), y
 
     def text_for(self, idx):
         return self.pick_words(np.random.default_rng([self.seed, idx]))[1]
@@ -827,7 +546,6 @@ def create_datasets(cfg, merges=None):
     check_scale(examples, cfg.grid)
     bank_points = [e["points"] for e in examples]
     bank_texts = [e["text"] for e in examples]
-
     alphabet = " " + "".join(sorted(set("".join(bank_texts)) - {" "}))
     char_tok = CharTokenizer(alphabet)
 
@@ -846,8 +564,7 @@ def create_datasets(cfg, merges=None):
 
     def build(ix, n, name, seed):
         return PenDataset(bank_points, bank_texts, ix, stroke_tok, char_tok, cfg,
-                          length=n, augment=cfg.augment != "none", name=name,
-                          seed=seed)
+                          length=n, augment=cfg.augment != "none", name=name, seed=seed)
 
     train_dataset = build(train_ix, cfg.train_size, "train", cfg.seed)
     test_dataset = build(test_ix, cfg.test_size, "test", cfg.seed + 1)
@@ -857,35 +574,12 @@ def create_datasets(cfg, merges=None):
     return train_dataset, test_dataset, stroke_tok, char_tok
 
 
-class InfiniteDataLoader:
-
-    def __init__(self, dataset, **kwargs):
-        sampler = torch.utils.data.RandomSampler(dataset, replacement=True,
-                                                 num_samples=int(1e10))
-        self.loader = DataLoader(dataset, sampler=sampler, **kwargs)
-        self.iterator = iter(self.loader)
-
-    def next(self):
-        try:
-            return next(self.iterator)
-        except StopIteration:
-            self.iterator = iter(self.loader)
-            return next(self.iterator)
-
-
-# ---------------------------------------------------------------------------
-# Model
-#
-# A GPT-style decoder with cross-attention over a character context, in the
-# makemore/nanoGPT lineage: pre-LayerNorm blocks of (causal self-attention,
-# cross-attention, MLP). Attention uses scaled_dot_product_attention, which
-# dispatches to flash attention where available.
-#
-# The prompt reaches the model only through cross-attention, never as a class
-# index, so the same architecture takes a word to write or the name of an
-# object to draw, and an unseen label still says something through its
-# characters.
-# ---------------------------------------------------------------------------
+def infinite_batches(dataset, **kwargs):
+    sampler = torch.utils.data.RandomSampler(dataset, replacement=True,
+                                             num_samples=int(1e10))
+    loader = DataLoader(dataset, sampler=sampler, **kwargs)
+    while True:
+        yield from loader
 
 
 def _split_heads(t, n_head):
@@ -962,13 +656,9 @@ class PenTransformer(nn.Module):
         self.ln_f = nn.LayerNorm(cfg.n_embd)
         self.head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
         if cfg.pen_pos_bands > 0:
-            # Net displacement per token in grid cells; filled from the
-            # tokenizer by attach_pen_deltas and restored from the state dict
-            # on load.
             self.register_buffer("pen_deltas",
                                  torch.zeros(cfg.vocab_size, 2, dtype=torch.long))
-            self.pen_pos_proj = nn.Linear(4 * cfg.pen_pos_bands, cfg.n_embd,
-                                          bias=False)
+            self.pen_pos_proj = nn.Linear(4 * cfg.pen_pos_bands, cfg.n_embd, bias=False)
         self.apply(self._init_weights)
         print(f"PenTransformer parameters: {sum(p.numel() for p in self.parameters()):,}")
 
@@ -980,18 +670,11 @@ class PenTransformer(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def _pen_features(self, idx):
-        """Fourier features of the pen's absolute position after each token.
-
-        Positions are the inclusive cumsum of per-token displacements, so a
-        token's feature reflects the pen after that token -- causal, since the
-        next-token prediction at position t may see everything through t.
-        """
-        positions = self.pen_deltas[idx].cumsum(dim=1)
+        positions = self.pen_deltas[idx].cumsum(dim=1)  # inclusive cumsum: pen after each token, still causal
         if self.training and self.cfg.pen_pos_jitter > 0:
             jitter = self.cfg.pen_pos_jitter
             positions = positions + torch.randint(-jitter, jitter + 1,
-                                                  (idx.size(0), 1, 2),
-                                                  device=idx.device)
+                                                  (idx.size(0), 1, 2), device=idx.device)
         k = torch.arange(self.cfg.pen_pos_bands, device=idx.device)
         angles = positions[..., None].float() * (torch.pi / (2.0 * 2.0 ** k))
         return torch.cat([angles.sin(), angles.cos()], dim=-1).flatten(-2)
@@ -1007,10 +690,7 @@ class PenTransformer(nn.Module):
         ctx_pos = torch.arange(context.size(1), device=idx.device)
         c = self.ctx_emb(context) + self.ctx_pos_emb(ctx_pos)
         ctx_mask = (context != 0)[:, None, None, :]
-        # A prompt of only padding (every char outside the alphabet) would
-        # mask every key, and softmax over an empty row is NaN. Attending
-        # uniformly to padding instead degrades to unconditional generation.
-        ctx_mask = ctx_mask | ~ctx_mask.any(-1, keepdim=True)
+        ctx_mask = ctx_mask | ~ctx_mask.any(-1, keepdim=True)  # all-pad prompt: attend uniformly rather than NaN
 
         for block in self.blocks:
             x = block(x, c, ctx_mask)
@@ -1019,15 +699,12 @@ class PenTransformer(nn.Module):
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
-                                   targets.reshape(-1), ignore_index=-1)
+                                   targets.reshape(-1), ignore_index=IGNORE_INDEX)
         return logits, loss
 
     @torch.inference_mode()
     def generate(self, idx, context, max_new_tokens, temperature=1.0, top_k=None,
                  do_sample=True, end_token=None, pad_token=None):
-        """Autoregressively extend idx (B, T). If end_token is given, sequences
-        that emit it are padded out with pad_token and generation stops early
-        once every sequence has finished."""
         was_training = self.training
         self.eval()
         done = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)
@@ -1053,7 +730,6 @@ class PenTransformer(nn.Module):
 
 
 def attach_pen_deltas(model, stroke_tok):
-    """Copy the tokenizer's per-token displacement table into the model."""
     if hasattr(model, "pen_deltas"):
         model.pen_deltas.copy_(torch.as_tensor(stroke_tok.token_deltas(),
                                                device=model.pen_deltas.device))
@@ -1078,14 +754,9 @@ def save_checkpoint(path, model, alphabet, data_config, merges=None, optimizer=N
 
 
 def load_checkpoint(path, device="cpu"):
-    """Returns (model, checkpoint_dict). The checkpoint carries the alphabet
-    and data config needed to rebuild matching tokenizers."""
     checkpoint = torch.load(path, map_location=device, weights_only=True)
     saved = _filter_config(ModelConfig, checkpoint["model_config"])
-    # A checkpoint from before the feature existed has no pen_pos_bands key;
-    # letting it default on would pair trained weights with an untrained
-    # position projection. Absent key means the feature was off.
-    saved.setdefault("pen_pos_bands", 0)
+    saved.setdefault("pen_pos_bands", 0)  # absent key = checkpoint predates the feature
     model = PenTransformer(ModelConfig(**saved))
     model.load_state_dict(checkpoint["model"], strict=False)
     model.to(device)
@@ -1093,12 +764,6 @@ def load_checkpoint(path, device="cpu"):
 
 
 def load_for_sampling(path, device="cpu", n_examples=200):
-    """Rebuild everything a checkpoint needs to generate: model, dataset, config.
-
-    The dataset comes back because generation reads the tokenizers and the text
-    of held-out examples from it; the BPE merges and alphabet ride along in the
-    checkpoint, so the tokenizer always matches the trained model.
-    """
     model, checkpoint = load_checkpoint(path, device)
     cfg = DataConfig(**_filter_config(DataConfig, checkpoint["data_config"]))
     cfg.train_size = cfg.test_size = n_examples
@@ -1107,14 +772,6 @@ def load_for_sampling(path, device="cpu", n_examples=200):
         "dataset alphabet does not match the checkpoint; use the training dataset"
     attach_pen_deltas(model, stroke_tok)
     return model, dataset, cfg, checkpoint
-
-
-# ---------------------------------------------------------------------------
-# Sampling and plotting
-#
-# Everything here builds on two primitives: `generate` turns a text prompt into
-# per-word point arrays, and `draw` puts point arrays on a matplotlib axis.
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -1133,17 +790,11 @@ class SampleParams:
 
 
 def generate(model, dataset, text, params=None):
-    """Text prompt -> list of per-word (N, 3) point arrays.
-
-    Nothing from the training set seeds the sequence: the model starts empty and
-    the prompt alone drives it, so a sample cannot copy strokes it was shown.
-    """
     params = params or SampleParams()
     st = dataset.stroke_tok
     device = next(model.parameters()).device
-    context = torch.from_numpy(
-        dataset.encode_text(text)).unsqueeze(0).to(device)
-    idx = torch.full((1, 1), st.BOS, dtype=torch.long, device=device)
+    context = torch.from_numpy(dataset.encode_text(text)).unsqueeze(0).to(device)
+    idx = torch.full((1, 1), st.BOS, dtype=torch.long, device=device)  # nothing from the training set seeds the sample
     out = model.generate(idx, context, max_new_tokens=params.max_tokens,
                          temperature=params.temperature, top_k=params.top_k,
                          do_sample=params.do_sample, end_token=st.END, pad_token=st.PAD)
@@ -1151,7 +802,6 @@ def generate(model, dataset, text, params=None):
 
 
 def draw(ax, points, color="b", linewidth=1.3):
-    """Draw absolute pen points (N, 3), lifting the pen where pen == 0."""
     points = np.asarray(points, dtype=float)
     if len(points):
         pen_down = points[:, 2] == 1
@@ -1166,11 +816,6 @@ def draw(ax, points, color="b", linewidth=1.3):
 
 
 def layout_words(words, params=None):
-    """Place per-word point arrays on a page, left to right with wrapping.
-
-    Each word carries its own height above the baseline, so this only advances
-    horizontally and wraps lines; no per-alphabet table is involved.
-    """
     params = params or SampleParams()
     placed, x, y = [], 0.0, 0.0
     for points in words:
@@ -1183,7 +828,7 @@ def layout_words(words, params=None):
         if x > 0 and x + width > params.line_width:
             x, y = 0.0, y + params.line_height
         points[:, 0] += x
-        points[:, 1] += y
+        points[:, 1] += y  # words carry their own height, so layout only advances and wraps
         placed.append(points)
         x += width + params.space_width
     return placed
@@ -1191,7 +836,6 @@ def layout_words(words, params=None):
 
 def plot_words(words, params=None, title="", figsize=(12, 2), dpi=150, ax=None,
                color="b"):
-    """Lay out per-word arrays and draw them on one axis."""
     params = params or SampleParams()
     fig = None
     if ax is None:
@@ -1203,29 +847,16 @@ def plot_words(words, params=None, title="", figsize=(12, 2), dpi=150, ax=None,
     return fig, ax, placed
 
 
-def plot_paragraph(words, text="", params=None, figsize=(12, 8), dpi=200,
-                   show_indices=False, include_title=False):
+def plot_paragraph(words, params=None, figsize=(12, 8), dpi=200, show_indices=False):
     params = params or SampleParams()
     fig, ax, placed = plot_words(words, params, figsize=figsize, dpi=dpi)
     if show_indices:
         for i, points in enumerate(placed):
             ax.text(points[:, 0].min() - 0.08, -points[0, 1] + 0.15, str(i), fontsize=8)
-    if include_title and text:
-        ax.set_title("\n".join(textwrap.wrap(text, width=83)), loc="left", fontsize=13)
     return fig, ax
 
 
 def generate_paragraph(model, dataset, text, params=None, words=None, redo=None):
-    """Generate a paragraph, n_at_a_time words per model call.
-
-    Words come in small groups because neighbours act as context. Groups of up
-    to four recover every word; larger groups overflow the block -- six words
-    cost more than 512 tokens about 70% of the time -- and the words that do not
-    fit are silently dropped.
-
-    Pass a previous result as `words` plus indices as `redo` to regenerate only
-    the words that came out wrong.
-    """
     params = params or SampleParams()
     fits = max(1, (params.max_tokens - 1) // 120)
     if params.n_at_a_time > fits:
@@ -1243,7 +874,7 @@ def generate_paragraph(model, dataset, text, params=None, words=None, redo=None)
 
     if words is None:
         words = []
-        for i in range(0, len(prompt_words), params.n_at_a_time):
+        for i in range(0, len(prompt_words), params.n_at_a_time):  # neighbours act as context
             words += for_chunk(prompt_words[i:i + params.n_at_a_time])
     else:
         for i in redo or []:
@@ -1253,19 +884,9 @@ def generate_paragraph(model, dataset, text, params=None, words=None, redo=None)
 
 
 def progress_prompts(dataset, n=8):
-    """Prompts drawn from the dataset's own text, so they are always in vocabulary.
-
-    Hardcoded prompts silently break on a new corpus: the handwriting defaults
-    contain digits and a capital S, and Quick, Draw!'s 35-character alphabet has
-    neither, so those characters encoded as padding and two of three progress
-    panels showed nothing meaningful for a whole run.
-
-    A dataset with no usable text raises rather than falling back to those
-    defaults, which would reintroduce exactly that failure somewhere quieter.
-    """
     seen, out = set(), []
     for i in range(min(len(dataset), 2000)):
-        text = dataset.text_for(i)
+        text = dataset.text_for(i)  # prompts from the corpus itself are always in vocabulary
         if text and text not in seen:
             seen.add(text)
             out.append(text)
@@ -1278,7 +899,6 @@ def progress_prompts(dataset, n=8):
 
 
 def _cached_prompts(dataset):
-    """Same prompts every eval, so the strip tracks the model not the prompt."""
     if not hasattr(dataset, "_progress_prompts"):
         dataset._progress_prompts = progress_prompts(dataset)
     return dataset._progress_prompts
@@ -1286,60 +906,35 @@ def _cached_prompts(dataset):
 
 def save_progress(model, dataset, out_dir, step, prompts=None, temperature=1.0,
                   rows=4):
-    """A grid of samples: one column per prompt, `rows` samples down each.
-
-    Several samples per prompt is what makes the picture readable. One sample
-    cannot distinguish a model that ignores its prompt from one that drew a
-    poor sample, and a column of four shows immediately whether the prompt
-    controls the shape or the model is drawing the corpus average whatever it
-    is asked for.
-
-    Prompts and seeds are fixed across evals, so consecutive images differ only
-    by the model.
-    """
-    prompts = prompts or _cached_prompts(dataset)
+    prompts = prompts or _cached_prompts(dataset)  # fixed prompts and seed: consecutive images differ only by the model
     os.makedirs(out_dir, exist_ok=True)
     params = SampleParams(temperature=temperature,
                           max_tokens=dataset.cfg.max_seq_length - 1)
-
-    fig, axes = plt.subplots(rows, len(prompts),
-                             figsize=(1.9 * len(prompts), 1.9 * rows),
-                             squeeze=False)
-    # One batched generate for the whole grid instead of rows x cols separate
-    # calls: at long block sizes the sequential version dominated eval time
-    # (each call re-runs its full prefix every token). A fixed seed keeps the
-    # grid deterministic per eval, so consecutive images still differ only by
-    # the model.
     st = dataset.stroke_tok
     device = next(model.parameters()).device
-    contexts = torch.stack([
-        torch.from_numpy(dataset.encode_text(text))
-        for text in prompts for _ in range(rows)]).to(device)
+    contexts = torch.stack([torch.from_numpy(dataset.encode_text(text))
+                            for text in prompts for _ in range(rows)]).to(device)
     torch.manual_seed(3)
     idx = torch.full((len(contexts), 1), st.BOS, dtype=torch.long, device=device)
     out = model.generate(idx, contexts, max_new_tokens=params.max_tokens,
                          temperature=params.temperature, top_k=params.top_k,
                          do_sample=params.do_sample, end_token=st.END,
                          pad_token=st.PAD)
+
+    fig, axes = plt.subplots(rows, len(prompts),
+                             figsize=(1.9 * len(prompts), 1.9 * rows),
+                             squeeze=False)
     for col in range(len(prompts)):
         for row in range(rows):
             words = st.decode(out[col * rows + row].cpu().numpy()[1:])
             plot_words(words, params, ax=axes[row][col], color="k")
     fig.suptitle(f"step {step:,}", fontsize=11)
     fig.tight_layout(rect=[0, 0, 1, 0.94])
-
-    # Label the columns on the figure rather than per axis. An axis title sits
-    # relative to that axis's contents, so a column of short drawings puts its
-    # label lower than the rest; placing them at one figure height keeps them
-    # aligned however tall the samples happen to be.
     top = max(ax.get_position().y1 for ax in axes[0])
     for col, text in enumerate(prompts):
         box = axes[0][col].get_position()
-        # Wrap to the column width, or sentence-length prompts run into their
-        # neighbors. va="bottom" grows extra lines upward, into space
-        # bbox_inches="tight" then reclaims.
-        wrapped = "\n".join(textwrap.wrap(text, width=24))
-        fig.text(box.x0 + box.width / 2, top + 0.012, wrapped,
+        fig.text(box.x0 + box.width / 2, top + 0.012,
+                 "\n".join(textwrap.wrap(text, width=24)),
                  ha="center", va="bottom", fontsize=8)
     path = os.path.join(out_dir, f"step_{step:06d}.png")
     fig.savefig(path, dpi=100, bbox_inches="tight")
@@ -1348,7 +943,6 @@ def save_progress(model, dataset, out_dir, step, prompts=None, temperature=1.0,
 
 
 def save_samples(model, dataset, out_dir=".", num=3, do_sample=True):
-    """Generate from test prompts and save one PNG per example."""
     os.makedirs(out_dir, exist_ok=True)
     params = SampleParams(do_sample=do_sample,
                           max_tokens=dataset.cfg.max_seq_length - 1)
@@ -1363,11 +957,6 @@ def save_samples(model, dataset, out_dir=".", num=3, do_sample=True):
         plt.close(fig)
         paths.append(path)
     return paths
-
-
-# ---------------------------------------------------------------------------
-# Commands: train, sample, rank
-# ---------------------------------------------------------------------------
 
 
 def resolve_device(device):
@@ -1399,11 +988,6 @@ def train(data_cfg, model_cfg, train_cfg):
     os.makedirs(train_cfg.out_dir, exist_ok=True)
     checkpoint_path = os.path.join(train_cfg.out_dir, "best.pt")
 
-    # Resuming has to rebuild the *checkpoint's* tokenizer, not one re-derived
-    # from the command line. Merges and alphabet decide what every token id
-    # means, so re-learning them from a config that differs in --n_merges,
-    # --grid, --dataset or --seed loads weights against a vocabulary they were
-    # never trained on -- silently, whenever the sizes happen to still match.
     ckpt = None
     if train_cfg.resume:
         _, ckpt = load_checkpoint(train_cfg.resume, device)
@@ -1414,10 +998,9 @@ def train(data_cfg, model_cfg, train_cfg):
                        if getattr(data_cfg, k) != v}
             print(f"Using the checkpoint's data config; ignoring {changed} "
                   f"(checkpoint value, command-line value)")
-        data_cfg = resumed_cfg
+        data_cfg = resumed_cfg  # merges and alphabet define token ids; the checkpoint's config wins
 
-    torch.manual_seed(data_cfg.seed)   # after resume, so it is the run's own seed
-
+    torch.manual_seed(data_cfg.seed)
     train_dataset, test_dataset, stroke_tok, char_tok = create_datasets(
         data_cfg, merges=ckpt["merges"] if ckpt else None)
     if ckpt:
@@ -1439,6 +1022,7 @@ def train(data_cfg, model_cfg, train_cfg):
             return (step + 1) / train_cfg.warmup
         t = (step - train_cfg.warmup) / max(1, train_cfg.steps - train_cfg.warmup)
         return 0.5 * (1 + math.cos(math.pi * min(t, 1.0)))
+
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_at)
 
     step, best_loss = 0, None
@@ -1457,15 +1041,14 @@ def train(data_cfg, model_cfg, train_cfg):
                          name=train_cfg.wandb_run_name or None,
                          config={**asdict(data_cfg), **asdict(model_cfg), **asdict(train_cfg)})
 
-    loader = InfiniteDataLoader(train_dataset, batch_size=train_cfg.batch_size,
-                                pin_memory=(device == "cuda"),
-                                num_workers=train_cfg.num_workers)
+    batches = infinite_batches(train_dataset, batch_size=train_cfg.batch_size,
+                               pin_memory=(device == "cuda"),
+                               num_workers=train_cfg.num_workers)
 
     while step < train_cfg.steps:
         t0 = time.time()
-        X, C, Y = [t.to(device) for t in loader.next()]
+        X, C, Y = [t.to(device) for t in next(batches)]
         _, loss = model(X, C, Y)
-
         model.zero_grad(set_to_none=True)
         loss.backward()
         if train_cfg.grad_clip > 0:
@@ -1479,54 +1062,46 @@ def train(data_cfg, model_cfg, train_cfg):
         if step % train_cfg.print_every == 0:
             print(f"step {step} | loss {loss.item():.4f} | {(time.time()-t0)*1000:.0f} ms/step"
                   f" | lr {scheduler.get_last_lr()[0]:.6f}")
+        if step % train_cfg.eval_every != 0:
+            continue
 
-        if step % train_cfg.eval_every == 0:
-            train_loss = evaluate(model, train_dataset, device)
-            test_loss = evaluate(model, test_dataset, device)
-            print(f"step {step} | train loss {train_loss:.4f} | test loss {test_loss:.4f}")
+        train_loss = evaluate(model, train_dataset, device)
+        test_loss = evaluate(model, test_dataset, device)
+        print(f"step {step} | train loss {train_loss:.4f} | test loss {test_loss:.4f}")
+        if run:
+            run.log({"train_loss": train_loss, "test_loss": test_loss, "step": step})
+
+        if best_loss is None or test_loss < best_loss:
+            best_loss = test_loss
+            print(f"New best test loss; saving checkpoint to {checkpoint_path}")
+            save_checkpoint(checkpoint_path, model, char_tok.alphabet, asdict(data_cfg),
+                            stroke_tok.merges, optimizer, scheduler, step, best_loss)
             if run:
-                run.log({"train_loss": train_loss, "test_loss": test_loss, "step": step})
+                artifact = wandb.Artifact("best_checkpoint", type="model")
+                artifact.add_file(checkpoint_path)
+                run.log_artifact(artifact)
 
-            if best_loss is None or test_loss < best_loss:
-                best_loss = test_loss
-                print(f"New best test loss; saving checkpoint to {checkpoint_path}")
-                save_checkpoint(checkpoint_path, model, char_tok.alphabet, asdict(data_cfg),
-                                stroke_tok.merges, optimizer, scheduler, step, best_loss)
-                if run:
-                    import wandb
-                    artifact = wandb.Artifact("best_checkpoint", type="model")
-                    artifact.add_file(checkpoint_path)
-                    run.log_artifact(artifact)
+        save_checkpoint(os.path.join(train_cfg.out_dir, "last.pt"), model,  # resume wants where the run stopped, not best
+                        char_tok.alphabet, asdict(data_cfg), stroke_tok.merges,
+                        optimizer, scheduler, step, best_loss)
 
-            # Resuming needs where the run stopped, which is not where it was
-            # last best: on a long run those diverge by thousands of steps, and
-            # --resume best.pt silently replays them.
-            save_checkpoint(os.path.join(train_cfg.out_dir, "last.pt"), model,
-                            char_tok.alphabet, asdict(data_cfg), stroke_tok.merges,
-                            optimizer, scheduler, step, best_loss)
-
-            progress = save_progress(model, test_dataset,
-                                     os.path.join(train_cfg.out_dir, "progress"),
-                                     step)
-            paths = [progress]
-            if step % (train_cfg.eval_every * 4) == 0:
-                paths += save_samples(model, test_dataset,
-                                      os.path.join(train_cfg.out_dir, "samples"),
-                                      num=3, do_sample=True)
-            print(f"  wrote {progress}")
-            if run:
-                import wandb
-                run.log({os.path.basename(p): wandb.Image(p) for p in paths})
+        paths = [save_progress(model, test_dataset,
+                               os.path.join(train_cfg.out_dir, "progress"), step)]
+        if step % (train_cfg.eval_every * 4) == 0:
+            paths += save_samples(model, test_dataset,
+                                  os.path.join(train_cfg.out_dir, "samples"),
+                                  num=3, do_sample=True)
+        print(f"  wrote {paths[0]}")
+        if run:
+            run.log({os.path.basename(p): wandb.Image(p) for p in paths})
 
     if run:
         run.finish()
 
 
 def sample_command(args):
-    """Generate a paragraph of handwriting (or a drawing) from a checkpoint."""
     device = resolve_device(args.device)
     model, dataset, cfg, _ = load_for_sampling(args.checkpoint, device, n_examples=100)
-
     params = SampleParams(temperature=args.temperature, top_k=args.top_k,
                           do_sample=not args.greedy, n_at_a_time=args.n_at_a_time,
                           max_tokens=cfg.max_seq_length - 1, seed=args.seed)
@@ -1535,8 +1110,7 @@ def sample_command(args):
         redo = [int(i) for i in args.redo.split(",") if i.strip()]
         words = generate_paragraph(model, dataset, args.text, params,
                                    words=words, redo=redo)
-
-    fig, _ = plot_paragraph(words, args.text, params, show_indices=args.show_indices)
+    fig, _ = plot_paragraph(words, params, show_indices=args.show_indices)
     fig.savefig(args.out, bbox_inches="tight")
     print(f"Saved {args.out}")
 
@@ -1546,30 +1120,6 @@ RANK_LABELS = ("cat,apple,car,fish,tree,house,star,umbrella,clock,ladder,"
 
 
 def rank_command(args):
-    """How strongly does the text prompt determine what the model draws?
-
-    Score one real drawing under every candidate label and see where its true
-    label ranks. If conditioning works the true label fits best, and the rank
-    is interpretable on its own: 1 of N is perfect, (N+1)/2 is chance.
-
-    Worth measuring separately from loss. A drawing model can post a healthy,
-    falling loss while ignoring its prompt entirely -- it learns the average
-    shape of the corpus and draws that regardless -- and samples alone are
-    ambiguous early in training, when everything looks like a scribble whether
-    or not the prompt is being read.
-
-    The reported spread, between the best and worst label's loss, says whether
-    the model merely prefers the right label or is actually driven by it. A
-    high rank with a tiny spread means the prompt is being read but barely
-    steers generation, which looks like every prompt producing the same
-    drawing.
-
-    Score several drawings per label (--per_label). One drawing per label is
-    not a small sample of the right thing, it is the wrong measurement:
-    per-label ranks are strongly bimodal, and a model can rank triangle 1st
-    and mouth 20th at the same checkpoint. Read the per-label breakdown, not
-    only the mean.
-    """
     labels = [l.strip() for l in args.labels.split(",") if l.strip()]
     device = resolve_device(args.device)
     model, dataset, cfg, ckpt = load_for_sampling(args.checkpoint, device,
@@ -1586,30 +1136,26 @@ def rank_command(args):
     if not found:
         raise SystemExit("none of those labels appear in the dataset")
 
-    ranks, spreads = [], []
-    by_label = {}
+    ranks, spreads, by_label = [], [], {}
     for true, indices in sorted(found.items()):
         for i in indices:
             x, _, y = dataset[i]
             x, y = x.unsqueeze(0).to(device), y.unsqueeze(0).to(device)
             scored = []
-            for label in labels:
+            for label in labels:  # score one real drawing under every candidate label
                 context = torch.from_numpy(
                     dataset.encode_text(label)).unsqueeze(0).to(device)
                 with torch.inference_mode():
                     _, loss = model(x, context, y)
                 scored.append((label, loss.item()))
             scored.sort(key=lambda r: r[1])
-            rank = [l for l, _ in scored].index(true) + 1
-            spread = (scored[-1][1] - scored[0][1]) / scored[0][1] * 100
-            ranks.append(rank)
-            spreads.append(spread)
-            by_label.setdefault(true, []).append(rank)
+            ranks.append([l for l, _ in scored].index(true) + 1)
+            spreads.append((scored[-1][1] - scored[0][1]) / scored[0][1] * 100)
+            by_label.setdefault(true, []).append(ranks[-1])
 
     for true, rs in sorted(by_label.items(), key=lambda kv: np.mean(kv[1])):
         print(f"  {true:12s} mean rank {np.mean(rs):4.1f}/{len(labels)}"
               f"   over {len(rs)} drawings")
-
     chance = (len(labels) + 1) / 2
     print(f"\nstep {ckpt['step']}: mean rank {np.mean(ranks):.1f}/{len(labels)}"
           f" (chance {chance:.1f}), mean spread {np.mean(spreads):.1f}%")
@@ -1646,8 +1192,7 @@ def main(argv=None):
     rank_p.add_argument("--checkpoint", type=str, default="out/quickdraw/best.pt")
     rank_p.add_argument("--labels", type=str, default=RANK_LABELS)
     rank_p.add_argument("--per_label", type=int, default=8,
-                        help="drawings per label; one is not enough, "
-                             "per-label ranks are strongly bimodal")
+                        help="drawings per label; per-label ranks are bimodal, one is not enough")
     rank_p.add_argument("--device", type=str, default="auto")
 
     known, _ = parser.parse_known_args(argv)
@@ -1659,12 +1204,9 @@ def main(argv=None):
         train_p.set_defaults(**PRESETS[known.preset])
     args = parser.parse_args(argv)
 
-    if args.command == "train":
-        train(*configs_from_args(args))
-    elif args.command == "sample":
-        sample_command(args)
-    elif args.command == "rank":
-        rank_command(args)
+    commands = {"train": lambda a: train(*configs_from_args(a)),
+                "sample": sample_command, "rank": rank_command}
+    commands[args.command](args)
 
 
 if __name__ == "__main__":
