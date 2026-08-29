@@ -1,3 +1,14 @@
+# pengpt: a minimal transformer for pen strokes, in one file.
+#
+# Ink becomes tokens -- a walk on a grid (8 directions + pen DOWN/UP), shortened
+# by BPE -- and a small GPT-style decoder predicts the next move, steered by
+# cross-attention over the character-level text prompt. The file reads top to
+# bottom as the pipeline runs: config, tokenizer, data, model, sampling, commands.
+# Per-dataset presets and corpus-building tools live in utils.py.
+#
+#   python pengpt.py train --preset cursive    # ~45 min on an M-series laptop
+#   python pengpt.py sample --checkpoint out/cursive/best.pt --text "hello world"
+
 import argparse
 import collections
 import gzip
