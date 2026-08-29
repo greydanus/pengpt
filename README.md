@@ -42,7 +42,7 @@ Train — about 45 minutes on an M-series laptop, no GPU rental needed:
 python pengpt.py train --preset cursive
 ```
 
-The presets are `cursive`, `quickdraw`, `physics`, and `icons`; each names its
+The presets are `cursive`, `quickdraw`, and `icons`; each names its
 dataset, lengths, augmentation, and model size, and any explicit flag
 overrides the preset. Each run owns a folder under `out/`:
 
@@ -131,6 +131,16 @@ embedding of the text prompt, in the makemore/nanoGPT lineage.
 The prompt reaches the model only through that cross-attention, never as a class
 index, so the same architecture takes a word to write or the name of an object
 to draw, and an unseen label still says something through its characters.
+
+One optional input rides along with the token embeddings: Fourier features of
+the pen's absolute canvas position, computed from a per-token displacement
+table the tokenizer provides (a merged token moves by the sum of its
+children). The tokens themselves are relative motion, so without this the
+model must integrate the whole walk with attention to know whether two strokes
+connect. It is on by default and cheap (one small bias-free linear layer), but
+the measured gain is modest — about 0.02 nats per token on scene sketches,
+less on short drawings — so `--pen_pos_bands 0` turns it off. A random canvas
+offset at training time keeps absolute layout from being memorized.
 
 **Data**: each example is one word, an `(N, 3)` array of `(x, y, pen)`.
 Training examples pack random words together until the block is full, so a few
@@ -239,152 +249,6 @@ Measured on the bundled cursive, the shear earns its place: removing it costs
 0.79 → 0.95 bits per pen-point even with 37% more optimizer steps. That is a
 statement about this dataset, not about pen data in general.
 
-## Physics sketches
-
-`physics_sketch.py` generates physics word problems procedurally: one parameter
-draw yields a caption, a pen sketch of that setup, and a question whose answer
-follows from the physics. Ground truth is exact by construction.
-
-```bash
-python physics_sketch.py --n 28000 --style plain --detail elided \
-  --max_text_length 170 --out data/physics_v2.jsonl
-python physics_sketch.py --preview     # per-archetype validation sheets
-python pengpt.py train --preset physics
-```
-
-The preset's `--max_text_length 170` is not optional. These captions compare
-two clauses and the deciding one is usually the second, so the cursive default
-of 50 cuts the prompt before the information that fixes the answer: 33% of
-`physics_v0` was trained on a prompt shared by examples with opposite labels.
-Loss falls anyway. Generation refuses to write a file whose captions its
-`--max_text_length` would make ambiguous, and prints the value to train with.
-
-`--max_seq_length 160` covers the p99: 278 merges take the drawings from a p99
-of 265 raw tokens to 124.
-
-### How much does the picture matter?
-
-The natural failure of a procedural generator is that the caption states every
-attribute, so text alone answers the question and the sketch is redundant. A
-scratchpad can then only break even. Measured per archetype as *caption-only
-accuracy* — how often the caption alone picks out the answer:
-
-| regime | archetypes | caption-only | reading |
-|---|---|---|---|
-| stated | lever, ramp, scale, … | 100% | picture redundant |
-| elided | lever, stack with `--detail elided` | 80% | picture helps |
-| geometry | reach, fit, shadow | 50–55% | picture required |
-
-`--detail elided` withholds one attribute from the caption and leaves it in the
-drawing alone — the lever's distances, the stack's shift. The geometry
-archetypes go further and are *always* elided: the caption names the objects
-("a ladder leans from the ground toward the top of a wall") and the arrangement
-lives entirely in the sketch, so text alone is at chance.
-
-That is why `reach`, `fit` and `shadow` have one or two captions each. For them
-low caption diversity is correct — their variety is in the drawing. The caption
-floor test exempts them, and a separate test asserts the opposite property:
-that their captions stay *insufficient*.
-
-36% of the elided corpus needs the picture. `meta["elided"]` names the withheld
-attribute, so the picture-needed subset can be scored on its own.
-
-### Composing attributes, not comparing one
-
-Each archetype scores a small set of binned attributes and rejects draws that
-land too near a tie, so the caption always decides the answer with a margin.
-What makes an archetype *diverse* is composing several attributes rather than
-comparing one between two objects: a single attribute admits only 3 sizes
-choose 2, times 2 orderings, which is six captions no matter how many examples
-are generated. `ramp`, `pendulum` and `drop` each had exactly that ceiling.
-
-| archetype | attributes | captions |
-|---|---|---|
-| lever | size × distance × noun, both sides | 992 |
-| spring | load × stiffness × noun, both springs | 992 |
-| magnet | strength × distance × bolt material | 192 |
-| roll | push × surface × cart load | 116 |
-| scale | size × noun, both pans | 96 |
-| pendulum | length × bob mass × release angle | 96 |
-| drop | height × roll speed × ball weight | 96 |
-| pulley | size × noun, both sides | 96 |
-| stack | block count × shift × base width | 90 |
-| float | material × fluid × shape × size | 90 |
-| ramp | height × surface roughness | 62 |
-
-Eleven archetypes across statics, buoyancy, springs, pulleys, rolling friction
-and magnetism, plus three geometry archetypes — so no single heuristic
-(bigger is heavier, taller is faster) covers the corpus. `float` deliberately
-contradicts the bigger-is-heavier habit the lever and scale reward: a big cork
-floats and a small steel nut sinks.
-
-Some of those attributes are causal and some are deliberately not.
-Speed at the bottom of a ramp really does depend on height and roughness, and a
-tower really does tip when its top block passes the base edge. But a pendulum's
-period does not depend on bob mass, and fall time does not depend on how fast a
-ball rolls off or how heavy it is. Those are stated in the caption and drawn in
-the sketch anyway, so answering requires knowing which stated attribute matters
-rather than reading off the one number that varies. Every archetype's answers
-stay balanced, so none is guessable from its prior.
-
-`physics_sketch.py` prints per-archetype caption counts on every run, and the
-test suite pins a floor under them.
-
-### Multi-step chains: depth as the independent variable
-
-The archetypes above are all one step, so a scratchpad has nothing to hold.
-Chains make reasoning depth the only thing that varies:
-
-```bash
-python physics_sketch.py --n 24000 --depths 1,2,3,4 --style plain \
-  --max_text_length 420 --out data/physics_chains.jsonl
-python physics_sketch.py --preview --depths 1,2,3,4 --style plain
-```
-
-A chain stage *consumes* the previous stage's output and *produces* one for the
-next — a gate that routes a ball, a slope that turns a side into a speed, a gap
-that turns a speed into a landing, a seesaw that turns a landing back into a
-side. Depth 1 is a bare lever, so the sweep starts from the same one-step
-problem the standalone archetypes pose, and everything else — vocabulary,
-drawing style, answer format — is held constant.
-
-Each example carries per-step ground truth in `meta["steps"]`, so an
-*intermediate* state can be verified rather than only the final answer. Dense
-process reward is the reason to generate these rather than scrape them.
-
-**A stage caption never names the carry it received.** Stages say "that side"
-and describe a transformation ("sends the ball out the opposite way") rather
-than a state. An earlier version named it, and the final clause alone then
-predicted the answer 95% of the time at depth 4 — every earlier stage was
-decorative and a "depth 4" example was a depth-1 example wearing a label. A
-stage that ignores its carry (a gap nothing can clear) is also refused as a
-chain's last step, for the same reason. It is now ~57%, near the floor for a
-binary answer, and a test pins it.
-
-### Keeping sketches minimal
-
-`--style plain` drops the ink that carries no information about the answer.
-Ground hatching costs 111 tokens against 38 for a plain line, and a hatched
-crate 37 against 20 for a box, so decoration was most of a short scene.
-Roughness ticks stay in plain mode — they are the only thing in the drawing
-that carries the ramp's answer — but use fewer marks.
-
-Chain stages are also drawn at `CHAIN_SCALE`, since token cost is proportional
-to ink size at a fixed grid and a stage inside a chain is a schematic element
-rather than a whole picture. Together these took a depth-4 sketch from a p99 of
-568 tokens to 118, and made cost linear in depth:
-
-| depth | sketch tokens (p50 / p99) | caption chars (p99) |
-|---|---|---|
-| 1 | 18 / 22 | 105 |
-| 2 | 41 / 69 | 258 |
-| 3 | 64 / 93 | 330 |
-| 4 | 86 / 118 | 401 |
-
-Linearity is the point. If deeper problems also carried more decorative ink,
-sketch length would be confounded with reasoning depth and a scaling curve
-could not separate the two.
-
 ## Quick, Draw!
 
 [Quick, Draw!](https://github.com/googlecreativelab/quickdraw-dataset) is 50M
@@ -443,10 +307,8 @@ pengpt.py            the algorithm: config, ScribeTokens + BPE, data pipeline,
                      PenTransformer, sampling, and the train/sample/rank commands
 utils.py             per-dataset presets, converters, and corpus-building tools
                      (Quick, Draw! download/convert/rank, icon aggregation)
-physics_sketch.py    procedural physics problems: caption, sketch, answer
-sketch_style.py      hand-style variation for procedural sketches
 collect.html         self-contained data collection page
-tests/               pytest suite; pins tokenizer, data, model, and corpus properties
+tests/               pytest suite; pins tokenizer, data, and model properties
 ```
 
 By Sam Greydanus. Cursive model and dataset from the cursivetransformer project

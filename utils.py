@@ -56,18 +56,6 @@ PRESETS = {
         n_layer=6, n_embd=128, learning_rate=1e-3, batch_size=32,
         out_dir="out/quickdraw",
     ),
-    # Procedural physics problems (physics_sketch.py). max_text_length must
-    # cover the whole caption: these compare two clauses and the deciding one
-    # is usually second, so truncation makes examples with opposite answers
-    # share a prompt. physics_sketch.py refuses to write a corpus its stated
-    # length would make ambiguous, and prints the value to train with.
-    "physics": dict(
-        dataset="data/physics_v2.jsonl",
-        max_words=1, augment="general",
-        max_text_length=170, max_seq_length=160,
-        n_layer=6, n_embd=128, learning_rate=1e-3, batch_size=32,
-        out_dir="out/physics",
-    ),
     # Six stroke-native icon sets aggregated by `python utils.py icons`.
     # Designer geometry: the finer grid keeps small icon detail (0.020 is too
     # coarse for it), and tremor + rotation bridge ruler-perfect lines toward

@@ -16,7 +16,7 @@ quality = ["transformers", "Pillow"]   # utils.py rank: CLIP-based filtering
 icons = ["svgelements"]                # utils.py icons: SVG icon aggregation
 
 [tool.setuptools]
-py-modules = ["pengpt", "utils", "physics_sketch", "sketch_style"]
+py-modules = ["pengpt", "utils"]
 
 [build-system]
 requires = ["setuptools>=61"]

@@ -17,8 +17,8 @@ out/
 data/*.json
 !data/*.json.zip
 
-# Corpora are rebuilt by `python utils.py download` / `rank` / `icons` and
-# physics_sketch.py; the largest are far past the 100 MB file GitHub accepts.
+# Corpora are rebuilt by `python utils.py download` / `rank` / `icons`; the
+# largest are far past the 100 MB file GitHub accepts.
 data/*.jsonl
 data/*.jsonl.gz
 

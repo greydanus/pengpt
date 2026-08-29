@@ -103,6 +103,20 @@ class ModelConfig:
     n_layer: int = 5
     n_head: int = 4
     n_embd: int = 64
+    # Fourier features of the pen's absolute canvas position, added to the
+    # token embedding. The tokens are relative motion, so without this the
+    # model must integrate the whole walk with attention to know whether two
+    # strokes connect; with it, position is an input rather than a
+    # computation. On by default; the measured gain is real but small (~0.02
+    # nats per token on scene sketches, less on short drawings), so
+    # --pen_pos_bands 0 opts out. Wavelengths are 4 * 2^k grid cells; the
+    # longest period (4 * 2^(bands-1)) must exceed the largest within-sample
+    # position range plus twice the jitter, or positions alias.
+    pen_pos_bands: int = 8
+    # Training-time random canvas offset in grid cells. Absolute layout can't
+    # be memorized when the origin moves, but within-sample geometry -- which
+    # strokes touch, what is already drawn where -- survives translation.
+    pen_pos_jitter: int = 32
     vocab_size: int = -1
     block_size: int = -1
     context_vocab_size: int = -1
@@ -302,6 +316,21 @@ class ScribeTokenizer:
         self.DOWN, self.UP = DOWN, UP
         self.PAD, self.END, self.WORD, self.BOS = n, n + 1, n + 2, n + 3
         self.vocab_size = n + 4
+
+    def token_deltas(self):
+        """(vocab_size, 2) net pen displacement of every token, in grid cells.
+
+        Base direction tokens move one cell, pen-state and special tokens move
+        nothing, and a merged token moves by the sum of its children -- so the
+        pen's absolute position is the running sum of these deltas over any
+        token sequence, merged or not. This is what lets a model be told where
+        the pen is without changing the token stream.
+        """
+        deltas = np.zeros((self.vocab_size, 2), dtype=np.int64)
+        deltas[:len(DIRECTIONS)] = DIRECTIONS
+        for a, b, c in self.merges:
+            deltas[c] = deltas[a] + deltas[b]
+        return deltas
 
     def encode_word(self, points):
         """Tokens for one word, starting from the baseline at x = 0.
@@ -932,6 +961,14 @@ class PenTransformer(nn.Module):
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer))
         self.ln_f = nn.LayerNorm(cfg.n_embd)
         self.head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
+        if cfg.pen_pos_bands > 0:
+            # Net displacement per token in grid cells; filled from the
+            # tokenizer by attach_pen_deltas and restored from the state dict
+            # on load.
+            self.register_buffer("pen_deltas",
+                                 torch.zeros(cfg.vocab_size, 2, dtype=torch.long))
+            self.pen_pos_proj = nn.Linear(4 * cfg.pen_pos_bands, cfg.n_embd,
+                                          bias=False)
         self.apply(self._init_weights)
         print(f"PenTransformer parameters: {sum(p.numel() for p in self.parameters()):,}")
 
@@ -942,11 +979,30 @@ class PenTransformer(nn.Module):
             if getattr(module, "bias", None) is not None:
                 nn.init.zeros_(module.bias)
 
+    def _pen_features(self, idx):
+        """Fourier features of the pen's absolute position after each token.
+
+        Positions are the inclusive cumsum of per-token displacements, so a
+        token's feature reflects the pen after that token -- causal, since the
+        next-token prediction at position t may see everything through t.
+        """
+        positions = self.pen_deltas[idx].cumsum(dim=1)
+        if self.training and self.cfg.pen_pos_jitter > 0:
+            jitter = self.cfg.pen_pos_jitter
+            positions = positions + torch.randint(-jitter, jitter + 1,
+                                                  (idx.size(0), 1, 2),
+                                                  device=idx.device)
+        k = torch.arange(self.cfg.pen_pos_bands, device=idx.device)
+        angles = positions[..., None].float() * (torch.pi / (2.0 * 2.0 ** k))
+        return torch.cat([angles.sin(), angles.cos()], dim=-1).flatten(-2)
+
     def forward(self, idx, context, targets=None):
         T = idx.size(1)
         assert T <= self.cfg.block_size, f"sequence length {T} > block size {self.cfg.block_size}"
         pos = torch.arange(T, device=idx.device)
         x = self.tok_emb(idx) + self.pos_emb(pos)
+        if self.cfg.pen_pos_bands > 0:
+            x = x + self.pen_pos_proj(self._pen_features(idx))
 
         ctx_pos = torch.arange(context.size(1), device=idx.device)
         c = self.ctx_emb(context) + self.ctx_pos_emb(ctx_pos)
@@ -996,6 +1052,13 @@ class PenTransformer(nn.Module):
         return idx
 
 
+def attach_pen_deltas(model, stroke_tok):
+    """Copy the tokenizer's per-token displacement table into the model."""
+    if hasattr(model, "pen_deltas"):
+        model.pen_deltas.copy_(torch.as_tensor(stroke_tok.token_deltas(),
+                                               device=model.pen_deltas.device))
+
+
 def save_checkpoint(path, model, alphabet, data_config, merges=None, optimizer=None,
                     scheduler=None, step=None, best_loss=None):
     checkpoint = {
@@ -1018,8 +1081,12 @@ def load_checkpoint(path, device="cpu"):
     """Returns (model, checkpoint_dict). The checkpoint carries the alphabet
     and data config needed to rebuild matching tokenizers."""
     checkpoint = torch.load(path, map_location=device, weights_only=True)
-    cfg = ModelConfig(**_filter_config(ModelConfig, checkpoint["model_config"]))
-    model = PenTransformer(cfg)
+    saved = _filter_config(ModelConfig, checkpoint["model_config"])
+    # A checkpoint from before the feature existed has no pen_pos_bands key;
+    # letting it default on would pair trained weights with an untrained
+    # position projection. Absent key means the feature was off.
+    saved.setdefault("pen_pos_bands", 0)
+    model = PenTransformer(ModelConfig(**saved))
     model.load_state_dict(checkpoint["model"], strict=False)
     model.to(device)
     return model, checkpoint
@@ -1038,6 +1105,7 @@ def load_for_sampling(path, device="cpu", n_examples=200):
     _, dataset, stroke_tok, char_tok = create_datasets(cfg, merges=checkpoint["merges"])
     assert char_tok.alphabet == checkpoint["alphabet"], \
         "dataset alphabet does not match the checkpoint; use the training dataset"
+    attach_pen_deltas(model, stroke_tok)
     return model, dataset, cfg, checkpoint
 
 
@@ -1361,6 +1429,7 @@ def train(data_cfg, model_cfg, train_cfg):
     model_cfg.context_block_size = data_cfg.max_text_length
 
     model = PenTransformer(model_cfg).to(device)
+    attach_pen_deltas(model, stroke_tok)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.learning_rate,
                                   weight_decay=train_cfg.weight_decay,
                                   betas=(0.9, 0.99), eps=1e-8)
@@ -1554,7 +1623,7 @@ def main(argv=None):
     train_p = sub.add_parser("train", help="train a model on one dataset")
     train_p.add_argument("--preset", type=str, default="",
                          help="per-dataset settings from utils.PRESETS "
-                              "(cursive, quickdraw, physics, icons); "
+                              "(cursive, quickdraw, icons); "
                               "explicit flags override the preset")
     add_config_args(train_p)
 
