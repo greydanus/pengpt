@@ -44,7 +44,6 @@ PRESETS = {
     # ablated on this corpus, so the preset only names it.
     "cursive": dict(
         dataset="data/bigbank_3500.json.zip",
-        pen_pos_bands=0,  # A/B'd Aug 2026: position features buy 0.02 nats of loss but cost spelling
         out_dir="out/cursive",
     ),
     # quickdraw_balanced_fixed = quickdraw_balanced after the cumsum-corruption
