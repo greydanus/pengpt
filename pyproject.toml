@@ -2,6 +2,7 @@
 name = "pengpt"
 version = "0.1.0"
 description = "A minimal transformer for pen strokes: handwriting generation and friends"
+license = {text = "MIT"}
 requires-python = ">=3.9"
 dependencies = [
     "torch>=2.1",
