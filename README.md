@@ -11,7 +11,29 @@ This is a ground-up rewrite of
 rebuilt around a representation that is not specific to one writer or one
 dataset.
 
+The paper and this repo share the same skeleton — a small nanoGPT-lineage
+decoder with cross-attention over a character-level encoding of the prompt,
+about 440k parameters there and 420k here — so the difference is almost
+entirely in how ink becomes tokens. The paper turns each pen point into a
+stroke offset and then polar coordinates, spending two tokens per point (a
+220-bin angle, then a 150-bin radius that carries the pen state); this repo
+quantizes absolute position to a grid and encodes motion as a walk — eight
+directions plus pen up/down, compressed by BPE — which is shorter per word
+(99 tokens against 185), reconstructs more accurately, and barely changes
+when the same shape is recorded at a different sampling rate. Because the
+walk carries absolute position, words carry their own height, and the
+machinery the paper's codebase needed on top — per-writer character tables,
+generation seeded with real strokes from the training set, an inter-word
+carriage-jump formula — disappears. Trained head to head at matched wall
+clock, the new representation reached 3.43 bits per pen-point against 7.16,
+which is what shrank a full run from 125,000 steps on a rented A100 to
+20,000 steps in under an hour on a laptop.
+
 ![hero](static/hero.png)
+
+*One greedy pass from the bundled cursive model, untouched. Seven of these
+nine words never appear in the training data — the corpus is mostly random
+character strings, so spelling is character-level generalization, not recall.*
 
 The whole model lives in two files. `pengpt.py` is the algorithm — tokenizer,
 data pipeline, transformer, training loop, sampling — and `utils.py` is
@@ -20,13 +42,16 @@ corpus, plus the tools that build each corpus in the first place. The same
 core algorithm trains on every dataset; only lengths, augmentation, and model
 size move between presets.
 
-## Quality over a training run
+## Held-out prompts at the end of a run
 
 ![progress](static/progress.png)
 
-The same three prompts, rendered at each eval. Stroke control and slant arrive
-almost immediately; spelling follows. All three prompts are correct by step
-10,000, about 25 minutes in, and the rest of the run sharpens the penmanship.
+Eight test-split prompts at step 20,000, four samples down each column. This
+is the grid the trainer writes at every eval, with fixed prompts and seeds so
+consecutive images differ only by the model. Four samples per prompt is what
+makes it readable: one sample cannot tell a model ignoring its prompt from a
+model having a bad draw, and a column of four shows immediately whether the
+prompt controls the ink.
 
 ## Quickstart
 
@@ -53,11 +78,6 @@ out/cursive/
   progress/      one grid per eval: 8 prompts across, 4 samples down
   samples/       full-size renders, every fourth eval
 ```
-
-Progress images use the same prompts and seeds every time, so consecutive
-images differ only by the model. Four samples per prompt is what makes them
-readable: one sample cannot tell a model ignoring its prompt from a model
-having a bad draw.
 
 Add `--wandb --wandb_entity you` for Weights & Biases logging (optional).
 Resume with `--resume out/cursive/last.pt` — `last.pt`, not `best.pt`, which
@@ -100,14 +120,19 @@ its true label ranks (1 of N is perfect, (N+1)/2 is chance):
 python pengpt.py rank --checkpoint out/quickdraw/best.pt --per_label 8
 ```
 
-Generate handwriting from a trained model:
+Generate handwriting from a trained model — this is the command behind the
+image at the top of this page:
 
 ```bash
-python pengpt.py sample --checkpoint out/cursive/best.pt --text "The quick brown fox jumps over the lazy dog"
+python pengpt.py sample --checkpoint out/cursive/best.pt --greedy --text "The quick brown fox jumps over the lazy dog"
 ```
 
-If a word comes out misspelled, note its index (`--show_indices`) and regenerate
-just that word with `--redo 3,7`.
+`--greedy` (temperature 0) spells unfamiliar words markedly better than
+sampling: on that pangram, sampling misspells two or three words at any seed,
+and greedy writes all nine correctly. If a word still comes out wrong, note
+its index (`--show_indices`) and regenerate just that word with `--redo 3,7`
+— without `--greedy`, since a greedy redo deterministically reproduces the
+same word.
 
 ## How it works
 
@@ -124,7 +149,7 @@ token — which is what keeps sequences short.
 *Grey is the original, red is decoded from tokens. `grid=0.020` is the default:
 reconstruction error stays inside the width of a pen stroke at 99 tokens per word.*
 
-**Model**: a small GPT-style decoder (~410k params at the cursive default,
+**Model**: a small GPT-style decoder (~420k params at the cursive default,
 ~1.7M at the quickdraw preset) with cross-attention over the character
 embedding of the text prompt, in the makemore/nanoGPT lineage.
 
@@ -190,14 +215,15 @@ training set.
 ## Writing a paragraph
 
 ```bash
-python pengpt.py sample --checkpoint out/cursive/best.pt --text "Sing, O goddess, the anger of Achilles son of Peleus, that brought countless ills upon the Achaeans."
+python pengpt.py sample --checkpoint out/cursive/best.pt --greedy --text "Sing, O goddess, the anger of Achilles son of Peleus, that brought countless ills upon the Achaeans."
 ```
 
 ![iliad](static/iliad.png)
 
 Long text is generated a few words per model call and laid out with wrapping.
-If a word comes out wrong, find its index with `--show_indices` and regenerate
-only that word with `--redo 3,7`.
+Sixteen of these seventeen words came out right on the first greedy pass; the
+seventeenth ("Achaeans.") was regenerated on its own with `--redo 16`, which
+is the intended workflow for the occasional miss.
 
 ## Training on your own pen data
 
