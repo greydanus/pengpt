@@ -1,21 +1,10 @@
-# pengpt: a minimal transformer for pen strokes, in one file.
-#
-# Ink becomes tokens -- a walk on a grid (8 directions + pen DOWN/UP), shortened
-# by BPE -- and a small GPT-style decoder predicts the next move, steered by
-# cross-attention over the character-level text prompt. The file reads top to
-# bottom as the pipeline runs: config, tokenizer, data, model, sampling, commands.
-# Per-dataset presets and corpus-building tools live in utils.py.
-#
-#   python pengpt.py train --preset cursive    # ~45 min on an M-series laptop
-#   python pengpt.py sample --checkpoint out/cursive/best.pt --text "hello world"
-
 import argparse
 import collections
 import gzip
 import json
-import math
 import os
-import textwrap
+import queue
+import threading
 import time
 import zipfile
 from dataclasses import asdict, dataclass, fields, replace
@@ -24,9 +13,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 import matplotlib
-matplotlib.use("Agg")  # figures only ever go to files; interactive backends stall headless runs
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
@@ -36,21 +25,21 @@ class DataConfig:
     max_examples: int = 0
     train_size: int = 500_000
     test_size: int = 3_000
-    max_words: int = 8              # words packed per training sequence
+    max_words: int = 8
     max_seq_length: int = 512
     max_text_length: int = 50
-    grid: float = 0.020             # tokenizer cell size: reconstruction error vs sequence length
+    grid: float = 0.020
     n_merges: int = 512
     augment: str = "handwriting"
-    spacing: float = 0.0            # resample to uniform arc length; 0 = data already uniform
+    spacing: float = 0.0
     spacing_jitter: float = 0.20
     scale_jitter: float = 0.15
     rotate: float = 0.0
     shear_min: float = -0.22
     shear_max: float = -0.18
-    hflip: float = 0.0              # mirror drawings; skipped when the caption says left/right
-    tremor: float = 0.0             # humanize ruler-perfect ink (icon sets); wrong for human ink
-    stroke_dropout: float = 0.0     # drop whole strokes; scenes survive it, words do not
+    hflip: float = 0.0
+    tremor: float = 0.0
+    stroke_dropout: float = 0.0
     seed: int = 1337
 
 
@@ -59,8 +48,8 @@ class ModelConfig:
     n_layer: int = 5
     n_head: int = 4
     n_embd: int = 64
-    pen_pos_bands: int = 8          # fourier features of absolute pen position; 0 disables
-    pen_pos_jitter: int = 32        # train-time canvas offset, so layout cannot be memorized
+    pen_pos_bands: int = 8
+    pen_pos_jitter: int = 32
     vocab_size: int = -1
     block_size: int = -1
     context_vocab_size: int = -1
@@ -71,14 +60,18 @@ class ModelConfig:
 class TrainConfig:
     steps: int = 20_000
     batch_size: int = 16
+    optimizer: str = "muon"
     learning_rate: float = 3e-3
+    matrix_lr: float = 0.02
     weight_decay: float = 1e-4
     warmup: int = 200
+    warmdown: float = 0.4
     grad_clip: float = 1.0
     eval_every: int = 1_000
+    showcase: str = ""
     print_every: int = 100
-    num_workers: int = 0            # loading never bottlenecks; workers deadlock on macOS py3.14
     device: str = "auto"
+    compile: bool = True
     out_dir: str = "out/default"
     resume: str = ""
     wandb: bool = False
@@ -90,7 +83,7 @@ class TrainConfig:
 DERIVED_FIELDS = {"vocab_size", "block_size", "context_vocab_size",
                   "context_block_size"}
 
-CHOICES = {"augment": ("none", "general", "handwriting")}
+CHOICES = {"augment": ("none", "general", "handwriting"), "optimizer": ("muon", "adamw")}
 
 
 def add_config_args(parser):
@@ -112,14 +105,6 @@ def configs_from_args(args):
     return build(DataConfig), build(ModelConfig), build(TrainConfig)
 
 
-def _filter_config(cls, d):
-    known = {f.name for f in fields(cls)}
-    dropped = {k: v for k, v in d.items() if k not in known and v}
-    if dropped:
-        print(f"WARNING: checkpoint used removed features, ignoring {dropped}")
-    return {k: v for k, v in d.items() if k in known}
-
-
 DIRECTIONS = np.array([(1, 0), (1, 1), (0, 1), (-1, 1),
                        (-1, 0), (-1, -1), (0, -1), (1, -1)])
 DOWN, UP = 8, 9
@@ -134,7 +119,7 @@ def bresenham_steps(x0, y0, x1, y1):
     dx, dy = abs(x1 - x0), abs(y1 - y0)
     sx = 1 if x1 > x0 else -1
     sy = 1 if y1 > y0 else -1
-    err = dx - dy  # fixed tie-breaking: one line must always encode one way, or BPE splits it
+    err = dx - dy
     out, x, y = [], int(x0), int(y0)
     while x != x1 or y != y1:
         e2 = 2 * err
@@ -157,7 +142,7 @@ def _walk(grid_xy):
     deltas = deltas[moved]
     if not len(deltas):
         return []
-    if (np.abs(deltas) <= 1).all():  # dense recordings: every move is one direction token
+    if (np.abs(deltas) <= 1).all():
         return _DIR_LOOKUP[deltas[:, 0] + 1, deltas[:, 1] + 1].tolist()
     out = []
     for i in np.flatnonzero(moved):
@@ -210,20 +195,30 @@ class ScribeTokenizer:
         deltas = np.zeros((self.vocab_size, 2), dtype=np.int64)
         deltas[:len(DIRECTIONS)] = DIRECTIONS
         for a, b, c in self.merges:
-            deltas[c] = deltas[a] + deltas[b]  # a merged token moves by the sum of its children
+            deltas[c] = deltas[a] + deltas[b]
         return deltas
 
     def encode_word(self, points):
+        return self.apply_merges(self.encode_base(points))
+
+    def encode_many(self, base_words):
+        if not self._pairs or not base_words:
+            return [np.asarray(w, dtype=np.int64) for w in base_words]
+        flat = np.concatenate([np.r_[w, self.PAD] for w in base_words]).astype(np.int64)
+        merged = self.apply_merges(flat)
+        return [w[:-1] for w in np.split(merged, np.flatnonzero(merged == self.PAD) + 1)[:-1]]
+
+    def encode_base(self, points):
         points = np.asarray(points, dtype=float)
         grid_xy = np.rint(points[:, :2] / self.grid).astype(np.int64)
-        out, previous_end = [], np.array([0, 0], dtype=np.int64)  # start at the baseline origin, so tokens carry word height
+        out, previous_end = [], np.array([0, 0], dtype=np.int64)
         for start, stop in _stroke_spans(points[:, 2]):
             out.extend(_walk([previous_end, grid_xy[start]]))
             out.append(DOWN)
             out.extend(_walk(grid_xy[start:stop]))
             out.append(UP)
             previous_end = grid_xy[stop - 1]
-        return self.apply_merges(np.array(out, dtype=np.int64))
+        return np.array(out, dtype=np.int64)
 
     def encode_words(self, words):
         parts = []
@@ -237,16 +232,14 @@ class ScribeTokenizer:
         if not self._pairs:
             return tokens
         out = np.asarray(tokens, dtype=np.int64).copy()
-        for a, b, merged in self.merges:  # one pass per rule, in learned order: earlier rules win shared tokens
+        for a, b, merged in self.merges:
             matches = np.flatnonzero((out[:-1] == a) & (out[1:] == b))
             if not matches.size:
                 continue
-            if matches.size > 1 and (np.diff(matches) == 1).any():  # runs like [a,a,a] under rule (a,a)
-                kept, last = [], -2
-                for i in matches:
-                    if i > last + 1:
-                        kept.append(i); last = i
-                matches = np.array(kept)
+            if matches.size > 1 and (np.diff(matches) == 1).any():
+                starts = np.r_[True, np.diff(matches) != 1]
+                run_start = np.flatnonzero(starts)[np.cumsum(starts) - 1]
+                matches = matches[(np.arange(matches.size) - run_start) % 2 == 0]
             out[matches] = merged
             remove = np.ones(len(out), dtype=bool)
             remove[matches + 1] = False
@@ -304,12 +297,12 @@ def learn_merges(token_sequences, n_merges=512, min_count=20):
         counts = collections.Counter()
         for s in sequences:
             for pair in zip(s, s[1:]):
-                if DOWN not in pair and UP not in pair:  # never merge across a stroke boundary
+                if DOWN not in pair and UP not in pair:
                     counts[pair] += 1
         if not counts:
             break
         (a, b), count = counts.most_common(1)[0]
-        if count < min_count:  # a rule that rarely fires costs vocabulary without shortening anything
+        if count < min_count:
             break
         merges.append((a, b, next_id))
         for i, s in enumerate(sequences):
@@ -324,28 +317,19 @@ def learn_merges(token_sequences, n_merges=512, min_count=20):
     return merges
 
 
-class CharTokenizer:
+class ByteTokenizer:
 
     PAD = 0
+    vocab_size = 257
 
-    def __init__(self, alphabet):
-        self.alphabet = alphabet
-        self.stoi = {ch: i + 1 for i, ch in enumerate(alphabet)}
-        self.itos = {i: ch for ch, i in self.stoi.items()}
-        self.vocab_size = len(alphabet) + 1
-
-    def encode(self, text, length=None):
-        ids = [self.stoi.get(ch, self.PAD) for ch in text]
-        if length is not None:
-            ids = ids[:length] + [self.PAD] * max(0, length - len(ids))
-        return np.array(ids, dtype=np.int64)
+    def encode(self, text, length):
+        ids = [b + 1 for b in text.encode()][:length]
+        return np.array(ids + [self.PAD] * (length - len(ids)), dtype=np.int64)
 
     def decode(self, ids):
-        ids = np.asarray(ids)
-        pads = np.flatnonzero(ids == self.PAD)
-        if pads.size:
-            ids = ids[:pads[0]]
-        return "".join(self.itos.get(int(i), "") for i in ids)
+        ids = [int(i) for i in ids]
+        ids = ids[:ids.index(self.PAD)] if self.PAD in ids else ids
+        return bytes(i - 1 for i in ids).decode(errors="replace")
 
 
 IGNORE_INDEX = -1
@@ -359,7 +343,7 @@ def check_scale(examples, grid, n=200):
                if len(d) > 2]
     if not heights:
         return
-    ratio = float(np.median(heights)) / INK_HEIGHT  # token cost scales with ink size over grid size
+    ratio = float(np.median(heights)) / INK_HEIGHT
     if not 0.5 < ratio < 2:
         print(f"WARNING: ink is {ratio:.1f}x the usual size. "
               f"Sequences will be about {ratio:.1f}x as long; "
@@ -391,7 +375,7 @@ def load_examples(path, limit=None):
     for item in read_items(path, limit):
         points = np.array(item["points"], dtype=float)
         meta = item.get("metadata", {})
-        if "aspectRatio" in meta:  # collect.html format
+        if "aspectRatio" in meta:
             points[:, 0] *= meta["aspectRatio"]
             points[:, 1] -= Y_BASELINE
         points[:, 0] -= points[0, 0]
@@ -434,7 +418,7 @@ def prepare_word(points, cfg, rng=None):
     if rng is not None and cfg.augment != "none":
         points = points.copy()
         if cfg.augment == "handwriting":
-            points[:, 0] += rng.uniform(cfg.shear_min, cfg.shear_max) * points[:, 1]  # italic slant; presumes a baseline
+            points[:, 0] += rng.uniform(cfg.shear_min, cfg.shear_max) * points[:, 1]
         if cfg.rotate:
             a = np.deg2rad(rng.uniform(-cfg.rotate, cfg.rotate))
             c, s = np.cos(a), np.sin(a)
@@ -459,7 +443,7 @@ def _tremor(points, rng, amp, wavelength=0.055, end_scale=0.006):
         tangent = np.gradient(seg, axis=0)
         norm = np.hypot(tangent[:, 0], tangent[:, 1]) + 1e-9
         normal = np.column_stack([-tangent[:, 1], tangent[:, 0]]) / norm[:, None]
-        seg += offset[:, None] * normal  # smooth waver along the path, not per-point jitter
+        seg += offset[:, None] * normal
         for end, t in ((0, seg[0] - seg[1]), (-1, seg[-1] - seg[-2])):
             delta = rng.uniform(-end_scale, end_scale)
             if delta > 0:
@@ -470,7 +454,7 @@ def _tremor(points, rng, amp, wavelength=0.055, end_scale=0.006):
 
 def augment_drawing(points, text, cfg, rng):
     if cfg.tremor > 0:
-        points = _tremor(points, rng, rng.uniform(0.3, 1.0) * cfg.tremor)  # careful hands to casual ones
+        points = _tremor(points, rng, rng.uniform(0.3, 1.0) * cfg.tremor)
     if cfg.stroke_dropout > 0:
         spans = _stroke_spans(points[:, 2])
         if len(spans) > 1:
@@ -485,7 +469,7 @@ def augment_drawing(points, text, cfg, rng):
             points = points[keep]
     if cfg.hflip > 0 and rng.random() < cfg.hflip:
         lowered = text.lower()
-        if "left" not in lowered and "right" not in lowered:  # the text must never lie about the picture
+        if "left" not in lowered and "right" not in lowered:
             points = points.copy()
             points[:, 0] = points[:, 0].max() + points[:, 0].min() - points[:, 0]
     return points
@@ -512,44 +496,59 @@ class PenDataset(Dataset):
     def __len__(self):
         return self.length
 
-    def pick_words(self, rng):
-        block = self.cfg.max_seq_length
+    def draw_words(self, rng):
         draw = min(self.cfg.max_words, len(self.indices))
-        limit = rng.integers(1, draw + 1)  # sometimes stop short, so END decorrelates from block position
-        chosen, parts, total = [], [], 0
-        for i in rng.choice(self.indices, size=draw, replace=False)[:limit]:
+        limit = rng.integers(1, draw + 1)
+        chosen = rng.choice(self.indices, size=draw, replace=False)[:limit]
+        base = []
+        for i in chosen:
             word = prepare_word(self.bank_points[i], self.cfg,
                                 rng if self.augment else None)
             if self.augment:
                 word = augment_drawing(word, self.bank_texts[i], self.cfg, rng)
-            tokens = self.stroke_tok.encode_word(word)
+            base.append(self.stroke_tok.encode_base(word))
+        return chosen, base
+
+    def pack(self, chosen, words):
+        block = self.cfg.max_seq_length
+        kept, parts, total = [], [], 0
+        for i, tokens in zip(chosen, words):
             extra = len(tokens) + (2 if parts else 0)
-            if parts and total + extra > block - 2:  # never truncate mid-word; leave room for BOS and END
+            if parts and total + extra > block - 2:
                 break
             if parts:
                 parts.append(np.array([self.stroke_tok.WORD] * 2, dtype=np.int64))
             parts.append(tokens)
             total += extra
-            chosen.append(i)
-        return np.concatenate(parts), " ".join(self.bank_texts[i] for i in chosen)
+            kept.append(i)
+        return np.concatenate(parts), " ".join(self.bank_texts[i] for i in kept)
+
+    def pick_words(self, rng):
+        chosen, base = self.draw_words(rng)
+        return self.pack(chosen, self.stroke_tok.encode_many(base))
+
+    def batch(self, indices):
+        draws = [self.draw_words(np.random.default_rng([self.seed, int(i)])) for i in indices]
+        merged = iter(self.stroke_tok.encode_many([w for _, base in draws for w in base]))
+        items = [self.make_item(*self.pack(chosen, [next(merged) for _ in base]))
+                 for chosen, base in draws]
+        return tuple(torch.stack(t) for t in zip(*items))
 
     def __getitem__(self, idx):
-        rng = np.random.default_rng([self.seed, idx])
-        tokens, text = self.pick_words(rng)
+        return self.make_item(*self.pick_words(np.random.default_rng([self.seed, idx])))
+
+    def make_item(self, tokens, text):
         st, block = self.stroke_tok, self.cfg.max_seq_length
         x = torch.full((block,), st.PAD, dtype=torch.long)
         y = torch.full((block,), IGNORE_INDEX, dtype=torch.long)
         n = min(len(tokens), block - 2)
-        x[0] = st.BOS  # generation seeds with the same BOS, so its first step was seen in training
+        x[0] = st.BOS
         x[1:n + 1] = torch.from_numpy(tokens[:n])
         x[n + 1] = st.END
         y[:n + 1] = x[1:n + 2]
         if len(tokens) > n:
-            y[n] = IGNORE_INDEX  # a word cut by the block did not actually end there
+            y[n] = IGNORE_INDEX
         return x, torch.from_numpy(self.encode_text(text)), y
-
-    def text_for(self, idx):
-        return self.pick_words(np.random.default_rng([self.seed, idx]))[1]
 
 
 def create_datasets(cfg, merges=None):
@@ -557,8 +556,7 @@ def create_datasets(cfg, merges=None):
     check_scale(examples, cfg.grid)
     bank_points = [e["points"] for e in examples]
     bank_texts = [e["text"] for e in examples]
-    alphabet = " " + "".join(sorted(set("".join(bank_texts)) - {" "}))
-    char_tok = CharTokenizer(alphabet)
+    char_tok = ByteTokenizer()
 
     rng = np.random.default_rng(cfg.seed)
     perm = rng.permutation(len(examples))
@@ -580,17 +578,21 @@ def create_datasets(cfg, merges=None):
     train_dataset = build(train_ix, cfg.train_size, "train", cfg.seed)
     test_dataset = build(test_ix, cfg.test_size, "test", cfg.seed + 1)
     print(f"Word bank: {len(train_ix)} train / {len(test_ix)} test words; "
-          f"stroke vocab {stroke_tok.vocab_size}; "
-          f"alphabet ({len(alphabet)} chars): {alphabet!r}")
+          f"stroke vocab {stroke_tok.vocab_size}")
     return train_dataset, test_dataset, stroke_tok, char_tok
 
 
-def infinite_batches(dataset, **kwargs):
-    sampler = torch.utils.data.RandomSampler(dataset, replacement=True,
-                                             num_samples=int(1e10))
-    loader = DataLoader(dataset, sampler=sampler, **kwargs)
+def infinite_batches(dataset, batch_size, seed=0, prefetch=4):
+    rng = np.random.default_rng(seed)
+    q = queue.Queue(maxsize=prefetch)
+
+    def produce():
+        while True:
+            q.put(dataset.batch(rng.integers(0, len(dataset), batch_size)))
+
+    threading.Thread(target=produce, daemon=True).start()
     while True:
-        yield from loader
+        yield q.get()
 
 
 def _split_heads(t, n_head):
@@ -603,55 +605,60 @@ def _merge_heads(t):
     return t.transpose(1, 2).contiguous().view(B, T, nh * hs)
 
 
-class SelfAttention(nn.Module):
+def rms_norm(x):
+    return F.rms_norm(x, (x.size(-1),))
+
+
+def rotary_tables(T, head_dim, device, base=10_000):
+    inv_freq = base ** -(torch.arange(0, head_dim, 2, device=device).float() / head_dim)
+    angles = torch.outer(torch.arange(T, device=device).float(), inv_freq)
+    return angles.cos(), angles.sin()
+
+
+def apply_rotary(x, cos, sin):
+    d = x.size(-1) // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    return torch.cat([x1 * cos + x2 * sin, x2 * cos - x1 * sin], dim=-1)
+
+
+class Attention(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         assert cfg.n_embd % cfg.n_head == 0
-        self.qkv = nn.Linear(cfg.n_embd, 3 * cfg.n_embd)
-        self.proj = nn.Linear(cfg.n_embd, cfg.n_embd)
+        self.q = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
+        self.kv = nn.Linear(cfg.n_embd, 2 * cfg.n_embd, bias=False)
+        self.proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
+        self.q_norm = nn.RMSNorm(cfg.n_embd // cfg.n_head)
+        self.k_norm = nn.RMSNorm(cfg.n_embd // cfg.n_head)
         self.n_head = cfg.n_head
 
-    def forward(self, x):
-        q, k, v = (_split_heads(t, self.n_head) for t in self.qkv(x).split(x.size(-1), dim=2))
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        return self.proj(_merge_heads(y))
-
-
-class CrossAttention(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        assert cfg.n_embd % cfg.n_head == 0
-        self.q = nn.Linear(cfg.n_embd, cfg.n_embd)
-        self.kv = nn.Linear(cfg.n_embd, 2 * cfg.n_embd)
-        self.proj = nn.Linear(cfg.n_embd, cfg.n_embd)
-        self.n_head = cfg.n_head
-
-    def forward(self, x, context, mask=None):
+    def forward(self, x, source=None, rotary=None, mask=None, cache=None):
         q = _split_heads(self.q(x), self.n_head)
-        k, v = (_split_heads(t, self.n_head) for t in self.kv(context).split(x.size(-1), dim=2))
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        k, v = (_split_heads(t, self.n_head)
+                for t in self.kv(x if source is None else source).split(x.size(-1), dim=2))
+        if rotary is not None:
+            q, k = apply_rotary(q, *rotary), apply_rotary(k, *rotary)
+        q, k = self.q_norm(q), self.k_norm(k)
+        if cache is not None:
+            buf, slot = cache
+            buf.copy_(torch.where(slot, torch.stack([k, v]), buf))
+            k, v = buf
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=mask is None)
         return self.proj(_merge_heads(y))
 
 
 class Block(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.ln1 = nn.LayerNorm(cfg.n_embd)
-        self.attn = SelfAttention(cfg)
-        self.ln2 = nn.LayerNorm(cfg.n_embd)
-        self.cross_attn = CrossAttention(cfg)
-        self.ln3 = nn.LayerNorm(cfg.n_embd)
-        self.mlp = nn.Sequential(
-            nn.Linear(cfg.n_embd, 4 * cfg.n_embd),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(4 * cfg.n_embd, cfg.n_embd),
-        )
+        self.attn = Attention(cfg)
+        self.cross_attn = Attention(cfg)
+        self.fc = nn.Linear(cfg.n_embd, 4 * cfg.n_embd, bias=False)
+        self.fc_out = nn.Linear(4 * cfg.n_embd, cfg.n_embd, bias=False)
 
-    def forward(self, x, context, ctx_mask=None):
-        x = x + self.attn(self.ln1(x))
-        x = x + self.cross_attn(self.ln2(x), context, ctx_mask)
-        x = x + self.mlp(self.ln3(x))
-        return x
+    def forward(self, x, context, rotary, ctx_mask, self_mask=None, cache=None):
+        x = x + self.attn(rms_norm(x), rotary=rotary, mask=self_mask, cache=cache)
+        x = x + self.cross_attn(rms_norm(x), context, mask=ctx_mask)
+        return x + self.fc_out(F.relu(self.fc(rms_norm(x))).square())
 
 
 class PenTransformer(nn.Module):
@@ -660,57 +667,65 @@ class PenTransformer(nn.Module):
         assert cfg.vocab_size > 0, "fill in the derived ModelConfig fields first"
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)
-        self.pos_emb = nn.Embedding(cfg.block_size, cfg.n_embd)
         self.ctx_emb = nn.Embedding(cfg.context_vocab_size, cfg.n_embd)
         self.ctx_pos_emb = nn.Embedding(cfg.context_block_size, cfg.n_embd)
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer))
-        self.ln_f = nn.LayerNorm(cfg.n_embd)
+        self.resid_scale = nn.Parameter(torch.ones(cfg.n_layer))
+        self.x0_scale = nn.Parameter(torch.zeros(cfg.n_layer))
         self.head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
+        self.register_buffer("pen_deltas", torch.zeros(cfg.vocab_size, 2, dtype=torch.long))
         if cfg.pen_pos_bands > 0:
-            self.register_buffer("pen_deltas",
-                                 torch.zeros(cfg.vocab_size, 2, dtype=torch.long))
             self.pen_pos_proj = nn.Linear(4 * cfg.pen_pos_bands, cfg.n_embd, bias=False)
-        self.apply(self._init_weights)
+        self.init_weights()
         print(f"PenTransformer parameters: {sum(p.numel() for p in self.parameters()):,}")
 
-    @staticmethod
-    def _init_weights(module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if getattr(module, "bias", None) is not None:
-                nn.init.zeros_(module.bias)
+    @torch.no_grad()
+    def init_weights(self):
+        s = 3 ** 0.5 * self.cfg.n_embd ** -0.5
+        for name, p in self.named_parameters():
+            if name.endswith(("attn.proj.weight", "fc_out.weight")):
+                nn.init.zeros_(p)
+            elif name.endswith("fc.weight"):
+                nn.init.uniform_(p, -0.4 * s, 0.4 * s)
+            elif p.ndim == 2 and (name.startswith("blocks.") or name.startswith("pen_pos")):
+                nn.init.uniform_(p, -s, s)
+        for emb in (self.tok_emb, self.ctx_emb, self.ctx_pos_emb):
+            nn.init.normal_(emb.weight, std=0.8)
+        nn.init.normal_(self.head.weight, std=0.001)
 
-    def _pen_features(self, idx):
-        positions = self.pen_deltas[idx].cumsum(dim=1)  # inclusive cumsum: pen after each token, still causal
-        if self.training and self.cfg.pen_pos_jitter > 0:
-            jitter = self.cfg.pen_pos_jitter
-            positions = positions + torch.randint(-jitter, jitter + 1,
-                                                  (idx.size(0), 1, 2), device=idx.device)
-        k = torch.arange(self.cfg.pen_pos_bands, device=idx.device)
-        angles = positions[..., None].float() * (torch.pi / (2.0 * 2.0 ** k))
-        return torch.cat([angles.sin(), angles.cos()], dim=-1).flatten(-2)
+    def embed(self, idx, pen_xy):
+        x = self.tok_emb(idx)
+        if self.cfg.pen_pos_bands > 0:
+            k = torch.arange(self.cfg.pen_pos_bands, device=idx.device)
+            angles = pen_xy[..., None].float() * (torch.pi / 2 ** (k + 1))
+            x = x + self.pen_pos_proj(torch.cat([angles.sin(), angles.cos()], dim=-1).flatten(-2))
+        return rms_norm(x)
+
+    def encode_context(self, context):
+        c = rms_norm(self.ctx_emb(context) + self.ctx_pos_emb.weight[:context.size(1)])
+        mask = (context != 0)[:, None, None, :]
+        return c, mask | ~mask.any(-1, keepdim=True)
+
+    def logits(self, x, c, ctx_mask, rotary, self_mask=None, caches=None):
+        x0 = x
+        for i, block in enumerate(self.blocks):
+            x = block(self.resid_scale[i] * x + self.x0_scale[i] * x0, c, rotary, ctx_mask,
+                      self_mask, caches[i] if caches else None)
+        return 15 * torch.tanh(self.head(rms_norm(x)) / 15)
 
     def forward(self, idx, context, targets=None):
-        T = idx.size(1)
+        B, T = idx.shape
         assert T <= self.cfg.block_size, f"sequence length {T} > block size {self.cfg.block_size}"
-        pos = torch.arange(T, device=idx.device)
-        x = self.tok_emb(idx) + self.pos_emb(pos)
-        if self.cfg.pen_pos_bands > 0:
-            x = x + self.pen_pos_proj(self._pen_features(idx))
-
-        ctx_pos = torch.arange(context.size(1), device=idx.device)
-        c = self.ctx_emb(context) + self.ctx_pos_emb(ctx_pos)
-        ctx_mask = (context != 0)[:, None, None, :]
-        ctx_mask = ctx_mask | ~ctx_mask.any(-1, keepdim=True)  # all-pad prompt: attend uniformly rather than NaN
-
-        for block in self.blocks:
-            x = block(x, c, ctx_mask)
-        logits = self.head(self.ln_f(x))
-
+        pen_xy = self.pen_deltas[idx].cumsum(dim=1)
+        if self.training and self.cfg.pen_pos_jitter > 0:
+            j = self.cfg.pen_pos_jitter
+            pen_xy = pen_xy + torch.randint(-j, j + 1, (B, 1, 2), device=idx.device)
+        rotary = rotary_tables(T, self.cfg.n_embd // self.cfg.n_head, idx.device)
+        logits = self.logits(self.embed(idx, pen_xy), *self.encode_context(context), rotary)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
-                                   targets.reshape(-1), ignore_index=IGNORE_INDEX)
+            loss = F.cross_entropy(logits.flatten(0, 1).float(), targets.flatten(),
+                                   ignore_index=IGNORE_INDEX)
         return logits, loss
 
     @torch.inference_mode()
@@ -718,70 +733,141 @@ class PenTransformer(nn.Module):
                  do_sample=True, end_token=None, pad_token=None):
         was_training = self.training
         self.eval()
-        done = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.cfg.block_size:]
-            logits, _ = self(idx_cond, context)
-            logits = logits[:, -1, :] / temperature
+        B, T0 = idx.shape
+        n, dev = min(T0 + max_new_tokens, self.cfg.block_size), idx.device
+        head_dim = self.cfg.n_embd // self.cfg.n_head
+        caches = [torch.zeros(2, B, self.cfg.n_head, n, head_dim, device=dev) for _ in self.blocks]
+        cos, sin = rotary_tables(n, head_dim, dev)
+        c, ctx_mask = self.encode_context(context)
+        slots, t = torch.arange(n, device=dev), torch.zeros(1, dtype=torch.long, device=dev)
+        pen_xy = torch.zeros(B, 1, 2, dtype=torch.long, device=dev)
+        done = torch.zeros(B, dtype=torch.bool, device=dev)
+        tokens = list(idx.split(1, dim=1))
+        for step in range(n - 1):
+            pen_xy = pen_xy + self.pen_deltas[tokens[step]]
+            rotary = cos.index_select(0, t), sin.index_select(0, t)
+            mask = (slots <= t)[None, None, None]
+            slot = (slots == t)[:, None]
+            logits = self.logits(self.embed(tokens[step], pen_xy), c, ctx_mask, rotary, mask,
+                                 [(buf, slot) for buf in caches])[:, -1]
+            t += 1
+            if step < T0 - 1:
+                continue
+            logits = logits / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, top_k)
                 logits[logits < v[:, [-1]]] = -float("inf")
-            if do_sample:
-                idx_next = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
-            else:
-                idx_next = logits.argmax(dim=-1, keepdim=True)
+            nxt = (torch.multinomial(F.softmax(logits, dim=-1), 1) if do_sample
+                   else logits.argmax(dim=-1, keepdim=True))
             if end_token is not None:
-                idx_next[done] = pad_token if pad_token is not None else end_token
-                done |= idx_next.squeeze(1) == end_token
-            idx = torch.cat([idx, idx_next], dim=1)
+                nxt[done] = pad_token if pad_token is not None else end_token
+                done |= nxt.squeeze(1) == end_token
+            tokens.append(nxt)
             if end_token is not None and done.all():
                 break
         self.train(was_training)
-        return idx
+        return torch.cat(tokens, dim=1)
+
+
+POLAR_EXPRESS = [
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
+]
+
+
+def orthogonalize(G):
+    if G.size(-2) > G.size(-1):
+        return orthogonalize(G.mT).mT
+    X = G.float()
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
+    for a, b, c in POLAR_EXPRESS:
+        A = X @ X.mT
+        X = a * X + (b * A + c * A @ A) @ X
+    return X
+
+
+class Muon(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.02, momentum=0.95, weight_decay=0.0):
+        params = list(params)
+        groups = [dict(params=[p for p in params if p.shape == shape])
+                  for shape in sorted({p.shape for p in params})]
+        super().__init__(groups, dict(lr=lr, momentum=momentum, weight_decay=weight_decay))
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            params = group["params"]
+            grads = torch.stack([p.grad for p in params])
+            state = self.state[params[0]]
+            if "buf" not in state:
+                state["buf"] = torch.zeros_like(grads)
+            state["buf"].lerp_(grads, 1 - group["momentum"])
+            update = orthogonalize(grads.lerp_(state["buf"], group["momentum"]))
+            rows, cols = params[0].shape
+            lr = group["lr"] * max(1.0, rows / cols) ** 0.5
+            for p, u in zip(params, update):
+                p.mul_(1 - lr * group["weight_decay"]).add_(u.to(p.dtype), alpha=-lr)
+
+
+def make_optimizers(model, cfg):
+    matrices = [p for n, p in model.named_parameters() if p.ndim == 2 and n.startswith("blocks.")]
+    others = [p for n, p in model.named_parameters() if not (p.ndim == 2 and n.startswith("blocks."))]
+    if cfg.optimizer == "adamw":
+        matrices, others = [], list(model.parameters())
+    opts = [torch.optim.AdamW(others, lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
+                              betas=(0.9, 0.99), eps=1e-8)]
+    if matrices:
+        opts.append(Muon(matrices, lr=cfg.matrix_lr))
+    for opt in opts:
+        for group in opt.param_groups:
+            group["initial_lr"] = group["lr"]
+    return opts
+
+
+def lr_multiplier(step, cfg):
+    if step < cfg.warmup:
+        return (step + 1) / cfg.warmup
+    warmdown = max(1, int(cfg.warmdown * cfg.steps))
+    return min(1.0, max(0.0, (cfg.steps - step) / warmdown))
 
 
 def attach_pen_deltas(model, stroke_tok):
-    if hasattr(model, "pen_deltas"):
-        model.pen_deltas.copy_(torch.as_tensor(stroke_tok.token_deltas(),
+    model.pen_deltas.copy_(torch.as_tensor(stroke_tok.token_deltas(),
                                                device=model.pen_deltas.device))
 
 
-def save_checkpoint(path, model, alphabet, data_config, merges=None, optimizer=None,
-                    scheduler=None, step=None, best_loss=None):
+def save_checkpoint(path, model, data_config, merges=None, optimizers=None,
+                    step=None, best_loss=None):
     checkpoint = {
         "model": model.state_dict(),
         "model_config": asdict(model.cfg),
-        "alphabet": alphabet,
         "data_config": data_config,
         "merges": [[int(a), int(b), int(c)] for a, b, c in (merges or [])],
         "step": int(step) if step is not None else None,
         "best_loss": float(best_loss) if best_loss is not None else None,
     }
-    if optimizer is not None:
-        checkpoint["optimizer"] = optimizer.state_dict()
-    if scheduler is not None:
-        checkpoint["scheduler"] = scheduler.state_dict()
+    if optimizers is not None:
+        checkpoint["optimizer"] = [opt.state_dict() for opt in optimizers]
     torch.save(checkpoint, path)
 
 
 def load_checkpoint(path, device="cpu"):
     checkpoint = torch.load(path, map_location=device, weights_only=True)
-    saved = _filter_config(ModelConfig, checkpoint["model_config"])
-    saved.setdefault("pen_pos_bands", 0)  # absent key = checkpoint predates the feature
-    model = PenTransformer(ModelConfig(**saved))
-    model.load_state_dict(checkpoint["model"], strict=False)
+    model = PenTransformer(ModelConfig(**checkpoint["model_config"]))
+    model.load_state_dict(checkpoint["model"])
     model.to(device)
     return model, checkpoint
 
 
-def load_for_sampling(path, device="cpu", n_examples=200):
+def load_for_sampling(path, device="cpu"):
     model, checkpoint = load_checkpoint(path, device)
-    cfg = DataConfig(**_filter_config(DataConfig, checkpoint["data_config"]))
-    cfg.train_size = cfg.test_size = n_examples
-    _, dataset, stroke_tok, char_tok = create_datasets(cfg, merges=checkpoint["merges"])
-    assert char_tok.alphabet == checkpoint["alphabet"], \
-        "dataset alphabet does not match the checkpoint; use the training dataset"
+    cfg = DataConfig(**checkpoint["data_config"])
+    stroke_tok = ScribeTokenizer(grid=cfg.grid, merges=checkpoint["merges"])
     attach_pen_deltas(model, stroke_tok)
+    dataset = PenDataset([], [], [], stroke_tok, ByteTokenizer(), cfg, length=0)
     return model, dataset, cfg, checkpoint
 
 
@@ -805,7 +891,7 @@ def generate(model, dataset, text, params=None):
     st = dataset.stroke_tok
     device = next(model.parameters()).device
     context = torch.from_numpy(dataset.encode_text(text)).unsqueeze(0).to(device)
-    idx = torch.full((1, 1), st.BOS, dtype=torch.long, device=device)  # nothing from the training set seeds the sample
+    idx = torch.full((1, 1), st.BOS, dtype=torch.long, device=device)
     out = model.generate(idx, context, max_new_tokens=params.max_tokens,
                          temperature=params.temperature, top_k=params.top_k,
                          do_sample=params.do_sample, end_token=st.END, pad_token=st.PAD)
@@ -839,7 +925,7 @@ def layout_words(words, params=None):
         if x > 0 and x + width > params.line_width:
             x, y = 0.0, y + params.line_height
         points[:, 0] += x
-        points[:, 1] += y  # words carry their own height, so layout only advances and wraps
+        points[:, 1] += y
         placed.append(points)
         x += width + params.space_width
     return placed
@@ -885,7 +971,7 @@ def generate_paragraph(model, dataset, text, params=None, words=None, redo=None)
 
     if words is None:
         words = []
-        for i in range(0, len(prompt_words), params.n_at_a_time):  # neighbours act as context
+        for i in range(0, len(prompt_words), params.n_at_a_time):
             words += for_chunk(prompt_words[i:i + params.n_at_a_time])
     else:
         for i in redo or []:
@@ -894,80 +980,34 @@ def generate_paragraph(model, dataset, text, params=None, words=None, redo=None)
     return words
 
 
-def progress_prompts(dataset, n=8):
-    seen, out = set(), []
-    for i in range(min(len(dataset), 2000)):
-        text = dataset.text_for(i)  # prompts from the corpus itself are always in vocabulary
-        if text and text not in seen:
-            seen.add(text)
-            out.append(text)
-        if len(out) >= n:
-            break
-    if not out:
-        raise ValueError(f"{dataset.name or 'dataset'} yielded no text to prompt "
-                         "with; progress images need labelled examples")
-    return out
-
-
-def _cached_prompts(dataset):
-    if not hasattr(dataset, "_progress_prompts"):
-        dataset._progress_prompts = progress_prompts(dataset)
-    return dataset._progress_prompts
-
-
-def save_progress(model, dataset, out_dir, step, prompts=None, temperature=1.0,
-                  rows=4):
-    prompts = prompts or _cached_prompts(dataset)  # fixed prompts and seed: consecutive images differ only by the model
-    os.makedirs(out_dir, exist_ok=True)
-    params = SampleParams(temperature=temperature,
-                          max_tokens=dataset.cfg.max_seq_length - 1)
-    st = dataset.stroke_tok
-    device = next(model.parameters()).device
-    contexts = torch.stack([torch.from_numpy(dataset.encode_text(text))
-                            for text in prompts for _ in range(rows)]).to(device)
+def save_progress(model, dataset, out_dir, step, showcase=(), n=6, samples=4):
+    X, C, _ = dataset.batch(range(n))
+    C = torch.cat([C] + [torch.from_numpy(dataset.encode_text(t))[None] for t in showcase])
+    st, device, rows = dataset.stroke_tok, next(model.parameters()).device, len(C)
     torch.manual_seed(3)
-    idx = torch.full((len(contexts), 1), st.BOS, dtype=torch.long, device=device)
-    out = model.generate(idx, contexts, max_new_tokens=params.max_tokens,
-                         temperature=params.temperature, top_k=params.top_k,
-                         do_sample=params.do_sample, end_token=st.END,
-                         pad_token=st.PAD)
-
-    fig, axes = plt.subplots(rows, len(prompts),
-                             figsize=(1.9 * len(prompts), 1.9 * rows),
-                             squeeze=False)
-    for col in range(len(prompts)):
-        for row in range(rows):
-            words = st.decode(out[col * rows + row].cpu().numpy()[1:])
-            plot_words(words, params, ax=axes[row][col], color="k")
-    fig.suptitle(f"step {step:,}", fontsize=11)
-    fig.tight_layout(rect=[0, 0, 1, 0.94])
-    top = max(ax.get_position().y1 for ax in axes[0])
-    for col, text in enumerate(prompts):
-        box = axes[0][col].get_position()
-        fig.text(box.x0 + box.width / 2, top + 0.012,
-                 "\n".join(textwrap.wrap(text, width=24)),
-                 ha="center", va="bottom", fontsize=8)
+    out = model.generate(torch.full((rows * samples, 1), st.BOS, device=device),
+                         C.repeat_interleave(samples, 0).to(device),
+                         dataset.cfg.max_seq_length - 1, end_token=st.END, pad_token=st.PAD).cpu()
+    greedy = model.generate(torch.full((rows - n, 1), st.BOS, device=device), C[n:].to(device),
+                            dataset.cfg.max_seq_length - 1, do_sample=False, end_token=st.END,
+                            pad_token=st.PAD).cpu() if rows > n else []
+    fig, axes = plt.subplots(rows, samples + 1, figsize=(3 * (samples + 1), 1.1 * rows),
+                             squeeze=False, sharex="row", sharey="row")
+    params = SampleParams(line_width=2.5)
+    for i in range(rows):
+        drawings = list(out[i * samples:(i + 1) * samples]) + [X[i] if i < n else greedy[i - n]]
+        for j, ax in enumerate(axes[i]):
+            color = "k" if j < samples else "darkgreen" if i < n else "navy"
+            plot_words(st.decode(drawings[j].numpy()), params, ax=ax, color=color)
+        axes[i][0].set_title(dataset.char_tok.decode(C[i]), loc="left", fontsize=8, pad=2)
+    fig.suptitle(f"step {step:,}: samples (black), real test example (green), greedy (blue)",
+                 fontsize=10)
+    fig.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.95, wspace=0.03, hspace=0.3)
+    os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"step_{step:06d}.png")
-    fig.savefig(path, dpi=100, bbox_inches="tight")
+    fig.savefig(path, dpi=120, bbox_inches="tight", pad_inches=0.05)
     plt.close(fig)
     return path
-
-
-def save_samples(model, dataset, out_dir=".", num=3, do_sample=True):
-    os.makedirs(out_dir, exist_ok=True)
-    params = SampleParams(do_sample=do_sample,
-                          max_tokens=dataset.cfg.max_seq_length - 1)
-    paths = []
-    for i in range(num):
-        text = dataset.text_for(i)
-        words = generate(model, dataset, text, params)
-        fig, _, _ = plot_words(words, params, title=f'{dataset.name} {i}: "{text}"')
-        path = os.path.join(out_dir,
-                            f"{dataset.name}_{'sample' if do_sample else 'greedy'}_{i}.png")
-        fig.savefig(path, bbox_inches="tight")
-        plt.close(fig)
-        paths.append(path)
-    return paths
 
 
 def resolve_device(device):
@@ -983,15 +1023,18 @@ def resolve_device(device):
 @torch.inference_mode()
 def evaluate(model, dataset, device, batch_size=100, max_batches=10):
     model.eval()
-    loader = DataLoader(dataset, shuffle=True, batch_size=batch_size)
-    losses = []
-    for i, (X, C, Y) in enumerate(loader):
+    if not hasattr(dataset, "_eval_batches"):
+        n = min(len(dataset), batch_size * max_batches)
+        dataset._eval_batches = [dataset.batch(range(i, min(i + batch_size, n)))
+                                 for i in range(0, n, batch_size)]
+    total = count = 0
+    for X, C, Y in dataset._eval_batches:
         _, loss = model(X.to(device), C.to(device), Y.to(device))
-        losses.append(loss.item())
-        if i + 1 >= max_batches:
-            break
+        n_tok = (Y != IGNORE_INDEX).sum().item()
+        total += loss.item() * n_tok
+        count += n_tok
     model.train()
-    return sum(losses) / len(losses)
+    return total / count
 
 
 def train(data_cfg, model_cfg, train_cfg):
@@ -1002,21 +1045,18 @@ def train(data_cfg, model_cfg, train_cfg):
     ckpt = None
     if train_cfg.resume:
         _, ckpt = load_checkpoint(train_cfg.resume, device)
-        resumed_cfg = DataConfig(**_filter_config(DataConfig, ckpt["data_config"]))
+        resumed_cfg = DataConfig(**ckpt["data_config"])
         if asdict(resumed_cfg) != asdict(data_cfg):
             changed = {k: (v, getattr(data_cfg, k))
                        for k, v in asdict(resumed_cfg).items()
                        if getattr(data_cfg, k) != v}
             print(f"Using the checkpoint's data config; ignoring {changed} "
                   f"(checkpoint value, command-line value)")
-        data_cfg = resumed_cfg  # merges and alphabet define token ids; the checkpoint's config wins
+        data_cfg = resumed_cfg
 
     torch.manual_seed(data_cfg.seed)
     train_dataset, test_dataset, stroke_tok, char_tok = create_datasets(
         data_cfg, merges=ckpt["merges"] if ckpt else None)
-    if ckpt:
-        assert char_tok.alphabet == ckpt["alphabet"], \
-            "dataset alphabet does not match the checkpoint; resume needs its dataset"
     model_cfg.vocab_size = stroke_tok.vocab_size
     model_cfg.block_size = data_cfg.max_seq_length
     model_cfg.context_vocab_size = char_tok.vocab_size
@@ -1024,23 +1064,13 @@ def train(data_cfg, model_cfg, train_cfg):
 
     model = PenTransformer(model_cfg).to(device)
     attach_pen_deltas(model, stroke_tok)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.learning_rate,
-                                  weight_decay=train_cfg.weight_decay,
-                                  betas=(0.9, 0.99), eps=1e-8)
-
-    def lr_at(step):
-        if step < train_cfg.warmup:
-            return (step + 1) / train_cfg.warmup
-        t = (step - train_cfg.warmup) / max(1, train_cfg.steps - train_cfg.warmup)
-        return 0.5 * (1 + math.cos(math.pi * min(t, 1.0)))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_at)
+    optimizers = make_optimizers(model, train_cfg)
 
     step, best_loss = 0, None
     if ckpt:
         model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
+        for opt, state in zip(optimizers, ckpt["optimizer"]):
+            opt.load_state_dict(state)
         step, best_loss = ckpt["step"], ckpt["best_loss"]
         print(f"Resumed from {train_cfg.resume} at step {step} (best loss {best_loss})")
 
@@ -1052,59 +1082,64 @@ def train(data_cfg, model_cfg, train_cfg):
                          name=train_cfg.wandb_run_name or None,
                          config={**asdict(data_cfg), **asdict(model_cfg), **asdict(train_cfg)})
 
-    batches = infinite_batches(train_dataset, batch_size=train_cfg.batch_size,
-                               pin_memory=(device == "cuda"),
-                               num_workers=train_cfg.num_workers)
+    batches = infinite_batches(train_dataset, train_cfg.batch_size, seed=data_cfg.seed + step)
 
+    step_model = torch.compile(model) if train_cfg.compile and device != "cpu" else model
+    t_start = t_print = time.time()
     while step < train_cfg.steps:
-        t0 = time.time()
-        X, C, Y = [t.to(device) for t in next(batches)]
-        _, loss = model(X, C, Y)
+        X, C, Y = [t.to(device, non_blocking=True) for t in next(batches)]
+        _, loss = step_model(X, C, Y)
         model.zero_grad(set_to_none=True)
         loss.backward()
         if train_cfg.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
-        optimizer.step()
-        scheduler.step()
+        mult = lr_multiplier(step, train_cfg)
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["initial_lr"] * mult
+                if isinstance(opt, Muon):
+                    group["momentum"] = 0.85 + 0.10 * min(1.0, step / 300)
+            opt.step()
         step += 1
 
         if run:
             run.log({"train_loss_step": loss.item(), "step": step})
         if step % train_cfg.print_every == 0:
-            print(f"step {step} | loss {loss.item():.4f} | {(time.time()-t0)*1000:.0f} ms/step"
-                  f" | lr {scheduler.get_last_lr()[0]:.6f}")
+            ms = (time.time() - t_print) * 1000 / train_cfg.print_every
+            print(f"step {step} | loss {loss.item():.4f} | {ms:.0f} ms/step | lr x{mult:.3f}")
+            t_print = time.time()
         if step % train_cfg.eval_every != 0:
             continue
 
         train_loss = evaluate(model, train_dataset, device)
         test_loss = evaluate(model, test_dataset, device)
-        print(f"step {step} | train loss {train_loss:.4f} | test loss {test_loss:.4f}")
+        rank = text_rank(model, test_dataset, device)
+        print(f"step {step} | train loss {train_loss:.4f} | test loss {test_loss:.4f}"
+              f" | text rank {rank:.2f}/32 | {(time.time() - t_start) / 60:.1f} min")
         if run:
-            run.log({"train_loss": train_loss, "test_loss": test_loss, "step": step})
+            run.log({"train_loss": train_loss, "test_loss": test_loss, "text_rank": rank,
+                     "step": step})
 
         if best_loss is None or test_loss < best_loss:
             best_loss = test_loss
             print(f"New best test loss; saving checkpoint to {checkpoint_path}")
-            save_checkpoint(checkpoint_path, model, char_tok.alphabet, asdict(data_cfg),
-                            stroke_tok.merges, optimizer, scheduler, step, best_loss)
+            save_checkpoint(checkpoint_path, model, asdict(data_cfg),
+                            stroke_tok.merges, optimizers, step, best_loss)
             if run:
                 artifact = wandb.Artifact("best_checkpoint", type="model")
                 artifact.add_file(checkpoint_path)
                 run.log_artifact(artifact)
 
-        save_checkpoint(os.path.join(train_cfg.out_dir, "last.pt"), model,  # resume wants where the run stopped, not best
-                        char_tok.alphabet, asdict(data_cfg), stroke_tok.merges,
-                        optimizer, scheduler, step, best_loss)
+        save_checkpoint(os.path.join(train_cfg.out_dir, "last.pt"), model,
+                        asdict(data_cfg), stroke_tok.merges,
+                        optimizers, step, best_loss)
 
-        paths = [save_progress(model, test_dataset,
-                               os.path.join(train_cfg.out_dir, "progress"), step)]
-        if step % (train_cfg.eval_every * 4) == 0:
-            paths += save_samples(model, test_dataset,
-                                  os.path.join(train_cfg.out_dir, "samples"),
-                                  num=3, do_sample=True)
-        print(f"  wrote {paths[0]}")
+        path = save_progress(model, test_dataset, os.path.join(train_cfg.out_dir, "progress"), step,
+                             [t for t in train_cfg.showcase.split("|") if t])
+        print(f"  wrote {path}")
         if run:
-            run.log({os.path.basename(p): wandb.Image(p) for p in paths})
+            run.log({"progress": wandb.Image(path), "step": step})
+        t_print = time.time()
 
     if run:
         run.finish()
@@ -1112,7 +1147,7 @@ def train(data_cfg, model_cfg, train_cfg):
 
 def sample_command(args):
     device = resolve_device(args.device)
-    model, dataset, cfg, _ = load_for_sampling(args.checkpoint, device, n_examples=100)
+    model, dataset, cfg, _ = load_for_sampling(args.checkpoint, device)
     params = SampleParams(temperature=args.temperature, top_k=args.top_k,
                           do_sample=not args.greedy, n_at_a_time=args.n_at_a_time,
                           max_tokens=cfg.max_seq_length - 1, seed=args.seed)
@@ -1126,50 +1161,25 @@ def sample_command(args):
     print(f"Saved {args.out}")
 
 
-RANK_LABELS = ("cat,apple,car,fish,tree,house,star,umbrella,clock,ladder,"
-               "banana,bicycle")
+@torch.inference_mode()
+def text_rank(model, dataset, device, n=32):
+    X, C, Y = (t.to(device) for t in dataset.batch(range(n)))
+    model.eval()
+    nll = torch.stack([F.cross_entropy(model(X, C[j].expand_as(C))[0].transpose(1, 2), Y,
+                                       ignore_index=IGNORE_INDEX, reduction="none").sum(1)
+                       for j in range(n)], dim=1)
+    model.train()
+    return 1 + (nll < nll.diagonal()[:, None]).sum(1).float().mean().item()
 
 
 def rank_command(args):
-    labels = [l.strip() for l in args.labels.split(",") if l.strip()]
     device = resolve_device(args.device)
-    model, dataset, cfg, ckpt = load_for_sampling(args.checkpoint, device,
-                                                  n_examples=4000)
-
-    found = collections.defaultdict(list)
-    for i in range(len(dataset)):
-        text = dataset.text_for(i)
-        if text in labels and len(found[text]) < args.per_label:
-            found[text].append(i)
-        if len(found) >= len(labels) and all(
-                len(v) >= args.per_label for v in found.values()):
-            break
-    if not found:
-        raise SystemExit("none of those labels appear in the dataset")
-
-    ranks, spreads, by_label = [], [], {}
-    for true, indices in sorted(found.items()):
-        for i in indices:
-            x, _, y = dataset[i]
-            x, y = x.unsqueeze(0).to(device), y.unsqueeze(0).to(device)
-            scored = []
-            for label in labels:  # score one real drawing under every candidate label
-                context = torch.from_numpy(
-                    dataset.encode_text(label)).unsqueeze(0).to(device)
-                with torch.inference_mode():
-                    _, loss = model(x, context, y)
-                scored.append((label, loss.item()))
-            scored.sort(key=lambda r: r[1])
-            ranks.append([l for l, _ in scored].index(true) + 1)
-            spreads.append((scored[-1][1] - scored[0][1]) / scored[0][1] * 100)
-            by_label.setdefault(true, []).append(ranks[-1])
-
-    for true, rs in sorted(by_label.items(), key=lambda kv: np.mean(kv[1])):
-        print(f"  {true:12s} mean rank {np.mean(rs):4.1f}/{len(labels)}"
-              f"   over {len(rs)} drawings")
-    chance = (len(labels) + 1) / 2
-    print(f"\nstep {ckpt['step']}: mean rank {np.mean(ranks):.1f}/{len(labels)}"
-          f" (chance {chance:.1f}), mean spread {np.mean(spreads):.1f}%")
+    _, _, cfg, ckpt = load_for_sampling(args.checkpoint, device)
+    model, _ = load_checkpoint(args.checkpoint, device)
+    _, test, stroke_tok, _ = create_datasets(cfg, merges=ckpt["merges"])
+    attach_pen_deltas(model, stroke_tok)
+    print(f"step {ckpt['step']}: true text ranks {text_rank(model, test, device, args.n):.2f} "
+          f"of {args.n} (chance {(args.n + 1) / 2:.1f})")
 
 
 def main(argv=None):
@@ -1198,12 +1208,10 @@ def main(argv=None):
     sample_p.add_argument("--show_indices", action="store_true")
     sample_p.add_argument("--device", type=str, default="auto")
 
-    rank_p = sub.add_parser("rank", help="measure prompt conditioning: rank the "
-                                         "true label among candidates")
-    rank_p.add_argument("--checkpoint", type=str, default="out/quickdraw/best.pt")
-    rank_p.add_argument("--labels", type=str, default=RANK_LABELS)
-    rank_p.add_argument("--per_label", type=int, default=8,
-                        help="drawings per label; per-label ranks are bimodal, one is not enough")
+    rank_p = sub.add_parser("rank", help="prompt conditioning: rank each test drawing's "
+                                         "true text among other test texts")
+    rank_p.add_argument("--checkpoint", type=str, default="out/cursive/best.pt")
+    rank_p.add_argument("--n", type=int, default=32)
     rank_p.add_argument("--device", type=str, default="auto")
 
     known, _ = parser.parse_known_args(argv)

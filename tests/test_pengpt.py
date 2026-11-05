@@ -3,19 +3,18 @@ import pytest
 import torch
 
 from pengpt import (DataConfig, ModelConfig, PenTransformer, PenDataset,
-                    ScribeTokenizer, CharTokenizer, learn_merges,
+                    ScribeTokenizer, ByteTokenizer, learn_merges,
                     IGNORE_INDEX, prepare_word, resample, augment_drawing,
                     save_checkpoint, load_checkpoint, attach_pen_deltas,
                     bresenham_steps, DIRECTIONS, DOWN, UP, _walk)
 
 
 def make_word(n=40, seed=0):
-    """A synthetic word: a smooth random walk with one pen lift in the middle."""
     rng = np.random.default_rng(seed)
     steps = rng.normal(scale=0.02, size=(n, 2)) + [0.01, 0.0]
     points = np.cumsum(steps, axis=0)
     pen = np.ones(n)
-    pen[n // 2] = 0  # one pen-up move
+    pen[n // 2] = 0
     return np.column_stack([points, pen])
 
 
@@ -26,7 +25,7 @@ def test_bresenham_lands_on_endpoint():
         steps = bresenham_steps(a[0], a[1], b[0], b[1])
         end = a + DIRECTIONS[steps].sum(0) if len(steps) else a
         assert tuple(end) == tuple(b)
-        assert all(0 <= s < 8 for s in steps)      # only direction tokens
+        assert all(0 <= s < 8 for s in steps)
 
 
 def test_encode_decode_roundtrip():
@@ -36,7 +35,6 @@ def test_encode_decode_roundtrip():
     assert tokens.min() >= 0 and tokens.max() < st.vocab_size
     out = st.decode(np.concatenate([tokens, [st.END]]))
     assert len(out) == 1
-    # reconstruction stays within a couple of grid cells of the original
     orig = word[word[:, 2] == 1][:, :2]
     rec = out[0][out[0][:, 2] == 1][:, :2]
     orig, rec = orig - orig[0], rec - rec[0]
@@ -45,12 +43,6 @@ def test_encode_decode_roundtrip():
 
 
 def test_baseline_height_survives_roundtrip():
-    """A word's height above the baseline is carried by the tokens.
-
-    Words that start at the cap line (digits) and words that start on the
-    baseline must stay distinguishable after decoding, with no per-alphabet
-    table to tell them apart.
-    """
     st = ScribeTokenizer(grid=0.01)
     high = make_word(seed=1)
     high[:, 1] -= 0.20
@@ -64,10 +56,9 @@ def test_baseline_height_survives_roundtrip():
 
 
 def test_pen_state_structure():
-    """Every stroke is delimited by DOWN ... UP, and only by those."""
     st = ScribeTokenizer(grid=0.01)
     tokens = list(st.encode_word(make_word()))
-    assert tokens.count(DOWN) == tokens.count(UP) == 2   # two strokes, one lift
+    assert tokens.count(DOWN) == tokens.count(UP) == 2
     assert tokens.index(DOWN) < tokens.index(UP)
 
 
@@ -80,26 +71,16 @@ def test_merges_are_lossless():
     assert st2.vocab_size > st.vocab_size
     for w, b in zip(words, base):
         merged = st2.encode_word(w)
-        assert len(merged) <= len(b)                    # never longer
-        assert list(st2.expand(merged)) == list(b)      # and exactly reversible
+        assert len(merged) <= len(b)
+        assert list(st2.expand(merged)) == list(b)
 
 
 def test_merges_apply_in_learned_order():
-    """Encoding must reproduce what learn_merges produced, not just something
-    reversible.
-
-    Rule order is priority order. A left-to-right scan that takes whichever
-    rule matches first is reversible and shorter than the base sequence, so
-    losslessness alone does not catch it -- but it is a different encoding, and
-    it leaves a third of the compression on the table.
-    """
     st = ScribeTokenizer(grid=0.01, merges=[(0, 1, 10), (2, 0, 11)])
-    # rule (0,1) was learned first, so it wins the shared 0.
     assert list(st.apply_merges(np.array([2, 0, 1]))) == [2, 10]
 
 
 def test_merges_match_sequential_application():
-    """The same check against learned merges on many words."""
     st0 = ScribeTokenizer(grid=0.01)
     words = [make_word(n=60, seed=s) for s in range(20)]
     base = [st0.encode_word(w) for w in words]
@@ -108,7 +89,7 @@ def test_merges_match_sequential_application():
 
     def sequential(seq):
         s = [int(t) for t in seq]
-        for a, b, c in merges:                      # one pass per rule, in order
+        for a, b, c in merges:
             out, j = [], 0
             while j < len(s):
                 if j + 1 < len(s) and s[j] == a and s[j + 1] == b:
@@ -126,7 +107,6 @@ def test_word_separation_and_end():
     st = ScribeTokenizer(grid=0.01)
     words = [make_word(seed=s) for s in range(3)]
     tokens = st.encode_words(words)
-    # append END plus garbage; decode must ignore everything after END
     tokens = np.concatenate([tokens, [st.END], tokens[:7], [st.PAD] * 5])
     assert len(st.decode(tokens)) == 3
 
@@ -137,14 +117,6 @@ def curve(n, freq=3.0, amp=0.2):
 
 
 def test_sampling_invariance_when_samples_do_not_skip_cells():
-    """Identical tokens for two samplings of one shape.
-
-    Invariance requires consecutive samples to land in the same or an adjacent
-    grid cell. Then both recordings walk the same cells in the same order and
-    Bresenham has no gap to bridge. Sampling more finely than that changes
-    nothing, which is the property that lets one model see data from recorders
-    of different rates.
-    """
     st = ScribeTokenizer(grid=0.05)
     t = np.linspace(0, 1, 120)
     at_cell_scale = np.column_stack([t, 0.5 * t, np.ones(len(t))])
@@ -155,13 +127,11 @@ def test_sampling_invariance_when_samples_do_not_skip_cells():
 
 
 def test_sampling_density_changes_tokens_when_grid_is_fine():
-    """The converse, pinned down so the limit is not forgotten."""
     st = ScribeTokenizer(grid=0.008)
     assert not np.array_equal(st.encode_word(curve(60)), st.encode_word(curve(600)))
 
 
 def test_sampling_density_stays_close_at_the_default_grid():
-    """Even without exact invariance, both encodings track the same curve."""
     st = ScribeTokenizer(grid=0.012)
     a = st.decode(np.concatenate([st.encode_word(curve(60)), [st.END]]))[0]
     b = st.decode(np.concatenate([st.encode_word(curve(600)), [st.END]]))[0]
@@ -171,7 +141,6 @@ def test_sampling_density_stays_close_at_the_default_grid():
 
 
 def test_scale_changes_token_count_proportionally():
-    """Token cost tracks ink size, which is why datasets must be normalized."""
     st = ScribeTokenizer(grid=0.01)
     word = make_word(n=60)
     small = len(st.encode_word(word * np.array([1.0, 1.0, 1.0])))
@@ -180,7 +149,6 @@ def test_scale_changes_token_count_proportionally():
 
 
 def test_decode_survives_random_tokens():
-    """Model output early in training is noise; decoding must not raise."""
     st = ScribeTokenizer(grid=0.01)
     rng = np.random.default_rng(0)
     for _ in range(20):
@@ -204,22 +172,16 @@ def test_prepare_word_is_deterministic_and_optional():
     cfg = DataConfig(spacing=0.0)
     word = make_word(n=50)
     plain = prepare_word(word, cfg)
-    assert np.array_equal(plain, word)          # no rng means no change
+    assert np.array_equal(plain, word)
 
     a = prepare_word(word, cfg, np.random.default_rng(7))
     b = prepare_word(word, cfg, np.random.default_rng(7))
-    assert np.array_equal(a, b)                 # same seed, same augmentation
+    assert np.array_equal(a, b)
     assert not np.array_equal(a, word)
-    assert np.array_equal(a[:, 2], word[:, 2])  # pen states untouched
+    assert np.array_equal(a[:, 2], word[:, 2])
 
 
 def test_works_without_word_structure():
-    """Data that is not handwriting: one trajectory per example, no words.
-
-    A sketch or a signature has no word boundaries, so the WORD token and the
-    packing loop must be inert rather than in the way. Nothing here should need
-    a code path of its own -- only max_words=1.
-    """
     t = np.linspace(0, 4 * np.pi, 200)
     shapes = []
     for s in range(6):
@@ -235,34 +197,27 @@ def test_works_without_word_structure():
     st = ScribeTokenizer(grid=cfg.grid,
                          merges=learn_merges([st.encode_word(p) for p in shapes],
                                              64, min_count=2))
-    ct = CharTokenizer(" " + "".join(sorted(set("".join(labels)) - {" "})))
+    ct = ByteTokenizer()
     ds = PenDataset(shapes, labels, np.arange(6), st, ct, cfg, length=6,
                     augment=False, name="sketch")
 
     x, c, _ = ds[0]
     assert (x != st.PAD).sum() > 20
-    assert st.WORD not in set(x.tolist())      # no word separators at all
-    assert len(st.decode(x.numpy())) == 1      # one trajectory back
+    assert st.WORD not in set(x.tolist())
+    assert len(st.decode(x.numpy())) == 1
 
 
 def test_normalize_absolute_bypasses_delta_detection():
-    """Sparse absolute drawings must not be read as deltas.
-
-    A square is five points after RDP simplification, so its span is small
-    relative to its mean step and the delta heuristic fires; cumsum then turns
-    it into a diagonal staircase. This corrupted 24% of a filtered Quick, Draw!
-    corpus. absolute=True is how a caller that knows its format opts out.
-    """
     from utils import normalize
     square = np.array([[0, 0, 1], [255, 0, 1], [255, 255, 1],
                        [0, 255, 1], [0, 0, 1]], dtype=float)
     out = normalize(square.copy(), absolute=True)
-    assert np.allclose(out[0, :2], out[-1, :2])       # the square stays closed
-    assert (np.diff(out[:, 0]) < 0).any()             # a cumsum'd square is monotone
+    assert np.allclose(out[0, :2], out[-1, :2])
+    assert (np.diff(out[:, 0]) < 0).any()
 
 
 def test_bradley_terry_recovers_an_ordering():
-    from utils import bradley_terry, spearman
+    from tools.quickdraw import bradley_terry, spearman
     truth = np.arange(20, dtype=float)
     rng = np.random.default_rng(0)
     comparisons = []
@@ -274,38 +229,35 @@ def test_bradley_terry_recovers_an_ordering():
 
 
 def test_select_per_class_keeps_class_balance():
-    from utils import select_per_class
+    from tools.quickdraw import select_per_class
     labels = np.array(["cat"] * 40 + ["car"] * 40)
-    scores = np.r_[np.arange(40), np.arange(40) * -1.0]   # opposite orderings
+    scores = np.r_[np.arange(40), np.arange(40) * -1.0]
     keep = select_per_class(scores, labels, fraction=0.25)
     assert len(keep) == 20
     assert (labels[keep] == "cat").sum() == (labels[keep] == "car").sum() == 10
 
 
-def test_char_tokenizer():
-    ct = CharTokenizer(" abcdefgh")
-    ids = ct.encode("bad cafe", length=12)
-    assert ids.shape == (12,) and ids[-1] == ct.PAD
-    assert ct.decode(ids) == "bad cafe"
-    assert ct.decode(ct.encode("abz")) == "ab"  # unknown chars become PAD, ending decode
+def test_byte_tokenizer():
+    ct = ByteTokenizer()
+    ids = ct.encode("bad café", length=12)
+    assert ids.shape == (12,) and ids[-1] == ct.PAD and ids.max() < ct.vocab_size
+    assert ct.decode(ids) == "bad café"
+    assert ct.decode(ct.encode("Kmxqngyo?", length=4)) == "Kmxq"
 
 
 def test_resample_is_uniform_and_keeps_lifts():
     word = make_word(n=80)
     out = resample(word, 0.02)
-    assert (out[:, 2] == 0).sum() == (word[:, 2] == 0).sum()   # lifts survive
+    assert (out[:, 2] == 0).sum() == (word[:, 2] == 0).sum()
 
-    # On a straight path, arc and chord coincide, so spacing is exactly uniform.
     line = np.column_stack([np.linspace(0, 1, 50), np.zeros(50), np.ones(50)])
     steps = np.diff(resample(line, 0.05)[:, 0])
     assert np.allclose(steps[:-1], 0.05, atol=1e-6)
 
-    # On a curved path the chords are shorter than the spacing, never longer.
     first_lift = np.flatnonzero(out[:, 2] == 0)[0]
     chords = np.hypot(*np.diff(out[:first_lift, :2], axis=0).T)
     assert chords.max() <= 0.02 + 1e-9
 
-    # denser spacing yields more points
     assert len(resample(word, 0.01)) > len(resample(word, 0.04))
 
 
@@ -316,7 +268,7 @@ def tiny_dataset():
     bank = [make_word(seed=s) for s in range(6)]
     texts = ["cab", "face", "bag", "dad", "egg", "fed"]
     st = ScribeTokenizer(grid=cfg.grid)
-    ct = CharTokenizer(" abcdefg")
+    ct = ByteTokenizer()
     return PenDataset(bank, texts, np.arange(6), st, ct, cfg, length=8,
                       augment=True, name="tiny")
 
@@ -325,16 +277,15 @@ def test_dataset_item(tiny_dataset):
     x, c, y = tiny_dataset[0]
     st, cfg = tiny_dataset.stroke_tok, tiny_dataset.cfg
     assert x.shape == (cfg.max_seq_length,) and c.shape == (cfg.max_text_length,)
-    assert x[0] == st.BOS                         # generation starts here too
-    end = (x == st.END).nonzero().item()          # exactly one END in the input
-    assert y[end - 1] == st.END                   # END is the last thing predicted...
-    assert (y[end:] == IGNORE_INDEX).all()        # ...and nothing is predicted from it
+    assert x[0] == st.BOS
+    end = (x == st.END).nonzero().item()
+    assert y[end - 1] == st.END
+    assert (y[end:] == IGNORE_INDEX).all()
     assert (x[end + 1:] == st.PAD).all()
-    assert tiny_dataset.char_tok.decode(c) == tiny_dataset.text_for(0)
+    assert tiny_dataset.char_tok.decode(c) == tiny_dataset.pick_words(np.random.default_rng([0, 0]))[1]
 
 
 def test_targets_are_inputs_shifted_by_one(tiny_dataset):
-    """The supervised span must line up exactly, or every token is off by one."""
     x, _, y = tiny_dataset[0]
     st = tiny_dataset.stroke_tok
     end = (x == st.END).nonzero().item()
@@ -342,19 +293,12 @@ def test_targets_are_inputs_shifted_by_one(tiny_dataset):
 
 
 def test_generation_prefix_occurs_in_training(tiny_dataset):
-    """What generate() seeds with has to be what position 0 saw in training.
-
-    Seeding from a token the model never saw first leaves the opening move --
-    the pen's entry point and the word's height above the baseline -- to a
-    prefix with no training support.
-    """
     st = tiny_dataset.stroke_tok
     firsts = {tiny_dataset[i][0][0].item() for i in range(len(tiny_dataset))}
     assert firsts == {st.BOS}
 
 
 def test_dataset_never_truncates_mid_word(tiny_dataset):
-    """Packing stops before overflow, so a word is never cut in half."""
     st = tiny_dataset.stroke_tok
     for i in range(len(tiny_dataset)):
         x, _, _ = tiny_dataset[i]
@@ -364,30 +308,22 @@ def test_dataset_never_truncates_mid_word(tiny_dataset):
 
 
 def test_truncated_word_does_not_supervise_end():
-    """When a word overflows the block, the END written at the cut must not be
-    a training target: the drawing did not actually end there."""
     cfg = DataConfig(max_seq_length=16, max_text_length=8, max_words=1, grid=0.005)
-    st, ct = ScribeTokenizer(grid=cfg.grid), CharTokenizer(" abc")
+    st, ct = ScribeTokenizer(grid=cfg.grid), ByteTokenizer()
     long_word = make_word(n=200)
     ds = PenDataset([long_word], ["cab"], np.arange(1), st, ct, cfg, length=1,
                     augment=False)
     x, _, y = ds[0]
     end = (x == st.END).nonzero().item()
-    assert end == cfg.max_seq_length - 1          # cut at the block edge
-    assert y[end - 1] == IGNORE_INDEX             # END not supervised
-    assert (y[:end - 1] != IGNORE_INDEX).all()    # everything before it is
+    assert end == cfg.max_seq_length - 1
+    assert y[end - 1] == IGNORE_INDEX
+    assert (y[:end - 1] != IGNORE_INDEX).all()
 
 
 def test_bank_smaller_than_max_words():
-    """max_words is a ceiling, not a requirement.
-
-    The test split is 5% of a corpus and floors at ten words, so a bank with
-    fewer words than max_words is ordinary rather than exotic; drawing without
-    replacement must not ask for more than exists.
-    """
     cfg = DataConfig(max_seq_length=256, max_text_length=20, max_words=8,
                      grid=0.01, seed=0)
-    st, ct = ScribeTokenizer(grid=0.01), CharTokenizer(" abcdefg")
+    st, ct = ScribeTokenizer(grid=0.01), ByteTokenizer()
     for n_bank in (1, 2, 7):
         bank = [make_word(seed=s) for s in range(n_bank)]
         texts = ["cab", "face", "bag", "dad", "egg", "fed", "gag"][:n_bank]
@@ -411,21 +347,18 @@ def test_model_forward_and_generate(tiny_dataset):
 
     out = model.generate(x[:, :10], c, max_new_tokens=20, end_token=st.END, pad_token=st.PAD)
     assert out.shape[1] <= 30
-    assert st.decode(out[0].numpy()) is not None  # arbitrary output decodes safely
+    assert st.decode(out[0].numpy()) is not None
 
 
 def test_checkpoint_roundtrip(tiny_dataset, tmp_path):
-    """A saved model reloads with identical weights, config, and merges --
-    including through the field filtering that tolerates old checkpoints."""
     st, ct, cfg = tiny_dataset.stroke_tok, tiny_dataset.char_tok, tiny_dataset.cfg
     mcfg = ModelConfig(n_layer=2, n_head=2, n_embd=32, vocab_size=st.vocab_size,
                        block_size=cfg.max_seq_length, context_vocab_size=ct.vocab_size,
                        context_block_size=cfg.max_text_length)
     model = PenTransformer(mcfg)
     path = tmp_path / "ckpt.pt"
-    save_checkpoint(str(path), model, ct.alphabet, {"dataset": "x"}, st.merges)
+    save_checkpoint(str(path), model, {"dataset": "x"}, st.merges)
     reloaded, ckpt = load_checkpoint(str(path))
-    assert ckpt["alphabet"] == ct.alphabet
     assert reloaded.cfg == model.cfg
     for k, v in model.state_dict().items():
         assert torch.equal(reloaded.state_dict()[k], v)
@@ -439,7 +372,6 @@ def test_checkpoint_roundtrip(tiny_dataset, tmp_path):
 
 
 def _apply_merges_reference(merges, pairs, tokens):
-    """The pre-vectorization implementation, kept to pin exact equivalence."""
     if not pairs:
         return np.asarray(tokens)
     out = [int(t) for t in tokens]
@@ -470,15 +402,13 @@ def test_vectorized_tokenizer_matches_reference(tiny_dataset):
     st = tiny_dataset.stroke_tok
     rng = np.random.default_rng(7)
     for trial in range(30):
-        # Walks with dense unit steps, repeats, and occasional long jumps.
         steps = rng.integers(-1, 2, size=(rng.integers(2, 60), 2))
         steps[rng.random(len(steps)) < 0.1] *= rng.integers(2, 9)
         grid = np.cumsum(steps, axis=0)
         assert _walk(grid) == _walk_reference(grid)
 
-        # Token streams engineered to hit overlapping-run merges too.
         tokens = rng.integers(0, st.vocab_size // 2, size=rng.integers(2, 200))
-        tokens[rng.random(len(tokens)) < 0.3] = tokens[0]  # force runs
+        tokens[rng.random(len(tokens)) < 0.3] = tokens[0]
         got = st.apply_merges(np.asarray(tokens))
         want = _apply_merges_reference(st.merges, st._pairs, tokens)
         assert (got == want).all(), trial
@@ -491,17 +421,14 @@ def test_augment_drawing():
                     [2, 2, 1], [3, 2, 1], [3, 2, 0],
                     [5, 1, 1], [6, 1, 1], [6, 1, 0]], dtype=float)
 
-    # Defaults are inert.
     cfg = SimpleNamespace(stroke_dropout=0.0, hflip=0.0, tremor=0.0)
     assert (augment_drawing(pts, "a scene", cfg, rng) == pts).all()
 
-    # Dropout removes whole strokes with their lift rows, never all of them.
     cfg = SimpleNamespace(stroke_dropout=0.999, hflip=0.0, tremor=0.0)
     out = augment_drawing(pts, "a scene", cfg, rng)
     assert len(out) in (3, 6) and (out[:, 2] == 1).sum() >= 2
     assert (out[-1, 2] == 0)
 
-    # Flip reflects x within the bbox, but never when the caption is sided.
     cfg = SimpleNamespace(stroke_dropout=0.0, hflip=1.0, tremor=0.0)
     out = augment_drawing(pts, "a scene", cfg, rng)
     assert np.isclose(out[:, 0].min(), pts[:, 0].min())
@@ -510,9 +437,6 @@ def test_augment_drawing():
     kept = augment_drawing(pts, "a tree on the left", cfg, rng)
     assert (kept == pts).all()
 
-    # Tremor perturbs a dense stroke without changing its structure: same
-    # point count, pen states untouched, displacement bounded near the
-    # amplitude (perpendicular noise plus endpoint slop, never a redraw).
     line = np.column_stack([np.linspace(0, 1, 60), np.zeros(60), np.ones(60)])
     line[-1, 2] = 0
     cfg = SimpleNamespace(stroke_dropout=0.0, hflip=0.0, tremor=0.004)
@@ -521,14 +445,11 @@ def test_augment_drawing():
     assert (out[:, 2] == line[:, 2]).all()
     assert not np.allclose(out[:, :2], line[:, :2])
     assert np.abs(out[:, 1]).max() < 6 * cfg.tremor
-    # Two-point strokes have no interior to wave; they pass through untouched.
     assert (augment_drawing(pts, "a scene", cfg,
                             np.random.default_rng(2)) == pts).all()
 
 
 def test_token_deltas_track_pen_position():
-    """The per-token displacement table must integrate to the true pen path,
-    through BPE merges, or pen-position features would silently lie."""
     words = [make_word(n=60, seed=s) for s in range(10)]
     st0 = ScribeTokenizer(grid=0.01)
     merges = learn_merges([st0.encode_word(w) for w in words], 64, min_count=2)
@@ -537,7 +458,7 @@ def test_token_deltas_track_pen_position():
     rng = np.random.default_rng(0)
     points = np.column_stack([np.cumsum(rng.normal(0, 0.05, (30, 2)), axis=0),
                               np.ones(30)])
-    points[9, 2] = 0  # a lift mid-way
+    points[9, 2] = 0
     tokens = st.encode_word(points)
     summed = deltas[tokens].sum(axis=0)
     grid_end = np.rint(points[-1, :2] / st.grid).astype(int)
@@ -557,34 +478,41 @@ def test_pen_pos_features_are_causal_and_checkpoint_safe(tiny_dataset, tmp_path)
     logits, loss = model(x, c, y)
     assert torch.isfinite(loss)
 
-    # Causality: changing a suffix token must not change earlier logits.
     x2 = x.clone()
     x2[0, -1] = (x2[0, -1] + 1) % st.vocab_size
     logits2, _ = model(x2, c, y)
     assert torch.allclose(logits[0, :-1], logits2[0, :-1], atol=1e-5)
 
-    # Round-trip through a checkpoint, table included.
     path = tmp_path / "ckpt.pt"
-    save_checkpoint(str(path), model, ct.alphabet, {"dataset": "x"}, st.merges)
+    save_checkpoint(str(path), model, {"dataset": "x"}, st.merges)
     reloaded, _ = load_checkpoint(str(path))
     assert (reloaded.pen_deltas == model.pen_deltas).all()
 
-    # A checkpoint from before the feature existed -- no pen_pos_bands key, no
-    # pen weights -- must load with the feature off, not with an untrained
-    # projection silently attached.
-    old = torch.load(str(path), weights_only=True)
-    del old["model_config"]["pen_pos_bands"]
-    del old["model"]["pen_deltas"], old["model"]["pen_pos_proj.weight"]
-    old_path = tmp_path / "old.pt"
-    torch.save(old, str(old_path))
-    legacy, _ = load_checkpoint(str(old_path))
-    assert legacy.cfg.pen_pos_bands == 0
-    assert not hasattr(legacy, "pen_deltas")
-
-    # Opting out (--pen_pos_bands 0) still trains and generates.
     mcfg0 = ModelConfig(n_layer=2, n_head=2, n_embd=32, pen_pos_bands=0,
                         vocab_size=st.vocab_size, block_size=cfg.max_seq_length,
                         context_vocab_size=ct.vocab_size,
                         context_block_size=cfg.max_text_length)
     logits0, _ = PenTransformer(mcfg0)(x, c, y)
     assert logits0.shape == logits.shape
+
+
+def test_cached_generation_matches_full_recompute(tiny_dataset):
+    st, ct, cfg = tiny_dataset.stroke_tok, tiny_dataset.char_tok, tiny_dataset.cfg
+    mcfg = ModelConfig(n_layer=2, n_head=2, n_embd=32, vocab_size=st.vocab_size,
+                       block_size=cfg.max_seq_length, context_vocab_size=ct.vocab_size,
+                       context_block_size=cfg.max_text_length)
+    torch.manual_seed(0)
+    model = PenTransformer(mcfg)
+    for p in model.parameters():
+        p.data.normal_(0, 0.3)
+    attach_pen_deltas(model, st)
+    model.eval()
+    x, c, _ = (t[:2] for t in tiny_dataset.batch(range(2)))
+    prefix = x[:, :3]
+    cached = model.generate(prefix, c, max_new_tokens=40, do_sample=False)
+    full = prefix
+    with torch.inference_mode():
+        for _ in range(40):
+            logits, _ = model(full, c)
+            full = torch.cat([full, logits[:, -1].argmax(-1, keepdim=True)], dim=1)
+    assert torch.equal(cached, full)

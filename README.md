@@ -13,7 +13,7 @@ dataset.
 
 The paper and this repo share the same skeleton — a small nanoGPT-lineage
 decoder with cross-attention over a character-level encoding of the prompt,
-about 440k parameters there and 420k here — so the difference is almost
+about 440k parameters there and 385k here — so the difference is almost
 entirely in how ink becomes tokens. The paper turns each pen point into a
 stroke offset and then polar coordinates, spending two tokens per point (a
 220-bin angle, then a 150-bin radius that carries the pen state); this repo
@@ -35,23 +35,25 @@ which is what shrank a full run from 125,000 steps on a rented A100 to
 nine words never appear in the training data — the corpus is mostly random
 character strings, so spelling is character-level generalization, not recall.*
 
-The whole model lives in two files. `pengpt.py` is the algorithm — tokenizer,
-data pipeline, transformer, training loop, sampling — and `utils.py` is
-everything specific to one dataset: a preset of settled training settings per
-corpus, plus the tools that build each corpus in the first place. The same
+The whole model lives in one file. `pengpt.py` is the algorithm — tokenizer,
+data pipeline, transformer, training loop, sampling — and `utils.py` holds a
+preset of settled training settings per corpus plus `normalize`, which brings
+outside pen data to the expected conventions. The scripts that build each
+corpus in the first place live in `tools/`. The same
 core algorithm trains on every dataset; only lengths, augmentation, and model
 size move between presets.
 
-## Held-out prompts at the end of a run
+## What the trainer shows you
 
 ![progress](static/progress.png)
 
-Eight test-split prompts at step 20,000, four samples down each column. This
-is the grid the trainer writes at every eval, with fixed prompts and seeds so
-consecutive images differ only by the model. Four samples per prompt is what
-makes it readable: one sample cannot tell a model ignoring its prompt from a
-model having a bad draw, and a column of four shows immediately whether the
-prompt controls the ink.
+The grid written at every eval, here at step 6,000 — about five minutes of
+training. Each of the top six rows is a held-out test prompt: four samples in
+black, then the real drawing in green. The bottom rows are showcase phrases
+(`--showcase`, set per preset) with no ground truth; their last column is the
+greedy sample in blue. Prompts and seeds are fixed, so consecutive grids differ
+only by the model. Four samples per prompt is what makes it readable: one
+sample cannot tell a model ignoring its prompt from a model having a bad draw.
 
 ## Quickstart
 
@@ -61,7 +63,8 @@ pip install -e ".[dev]"   # + pytest
 pytest tests/             # a few seconds
 ```
 
-Train — about 45 minutes on an M-series laptop, no GPU rental needed:
+Train — about 15 minutes on an M-series laptop (43 ms/step on an M3 Pro), no GPU
+rental needed:
 
 ```bash
 python pengpt.py train --preset cursive
@@ -75,23 +78,25 @@ overrides the preset. Each run owns a folder under `out/`:
 out/cursive/
   best.pt        lowest test loss so far
   last.pt        the most recent eval, for --resume
-  progress/      one grid per eval: 8 prompts across, 4 samples down
-  samples/       full-size renders, every fourth eval
+  progress/      one grid per eval: test prompts and showcase phrases, 4 samples each
 ```
 
 Add `--wandb --wandb_entity you` for Weights & Biases logging (optional).
 Resume with `--resume out/cursive/last.pt` — `last.pt`, not `best.pt`, which
 lags whenever test loss has stopped improving. Resuming rebuilds the tokenizer
 from the checkpoint rather than from the command line, and says so when a data
-flag disagrees: merges and alphabet decide what every token id means, so a
+flag disagrees: the merges decide what every ink token id means, so a
 re-derived vocabulary would load the weights against ids they were never
-trained on. For a faster run, `--n_layer 3` roughly halves the time and scored
-within noise of the default in ablations.
+trained on. Prompts are raw UTF-8 bytes, so text ids are the same for every
+dataset.
 
-Checkpoints from before the repo was consolidated around `pengpt.py` may have
-been trained with features that no longer exist (alternate text encoders,
-pen-position inputs); the loader warns and ignores those config keys, and a
-checkpoint that actually used them should be retrained.
+Each eval logs train and test loss on a fixed set of items, and `text rank`:
+each of 32 test examples is scored under its own prompt and the other 31, and
+the true prompt's mean rank is reported (1 is perfect, 16.5 is chance). It
+catches a model whose loss falls while it ignores the prompt.
+
+Checkpoints from earlier architectures do not load; retrain, or sample with the
+commit that wrote them.
 
 ### Drawings rather than handwriting
 
@@ -113,11 +118,12 @@ delta-detection bug that cumsum'd 24% of drawings into diagonal staircases
 
 Loss alone will not tell you whether the prompt is being read — a model can
 post a falling loss while drawing the corpus average for every prompt. Measure
-it directly: score one real drawing under every candidate label and see where
-its true label ranks (1 of N is perfect, (N+1)/2 is chance):
+it directly: score each of 32 held-out examples under its own text and the
+other 31, and see where the true text ranks (1 is perfect, 16.5 is chance).
+Training logs this as `text rank` at every eval, on any dataset:
 
 ```bash
-python pengpt.py rank --checkpoint out/quickdraw/best.pt --per_label 8
+python pengpt.py rank --checkpoint out/quickdraw/best.pt
 ```
 
 Generate handwriting from a trained model — this is the command behind the
@@ -149,9 +155,21 @@ token — which is what keeps sequences short.
 *Grey is the original, red is decoded from tokens. `grid=0.020` is the default:
 reconstruction error stays inside the width of a pen stroke at 99 tokens per word.*
 
-**Model**: a small GPT-style decoder (~420k params at the cursive default,
-~1.7M at the quickdraw preset) with cross-attention over the character
-embedding of the text prompt, in the makemore/nanoGPT lineage.
+**Model**: a small GPT-style decoder (~385k params at the cursive default)
+with cross-attention over byte embeddings of the text prompt, built the way
+[nanochat](https://github.com/karpathy/nanochat) builds its GPT: rotary
+positions, parameter-free RMSNorm, QK-norm, ReLU² MLPs, no biases, zero-init
+output projections, per-layer residual and input-embedding scalars, and a
+logit soft cap. Attention and MLP matrices train with Muon (momentum, then
+each update orthogonalized); embeddings and the head train with AdamW. The
+learning rate warms up, holds, and decays linearly over the last 40% of steps,
+and the training step is `torch.compile`d. Generation uses a fixed-shape key/value
+cache, so every decoding step has the same tensor shapes.
+
+On the bundled cursive at matched steps (6,000, same seed), this reached a
+test loss of 2.01 against 2.12 for the previous LayerNorm + AdamW + cosine
+recipe, at 43 ms per step against roughly 100. The previous recipe needed
+20,000 steps to reach 1.98.
 
 The prompt reaches the model only through that cross-attention, never as a class
 index, so the same architecture takes a word to write or the name of an object
@@ -282,16 +300,16 @@ doodles across 345 categories under CC-BY-4.0. Its format is already what pengpt
 expects — strokes with pen lifts at the boundaries — so the converter is thin:
 
 ```bash
-python utils.py convert --quickdraw cat.ndjson --out data/cats.json
+python -m tools.quickdraw convert --quickdraw cat.ndjson --out data/cats.json
 python pengpt.py train --dataset data/cats.json --max_words 1 --augment general
 ```
 
 Much of it is sloppy, and mean quality matters more than raw count, so
-`utils.py rank` keeps the best fraction of each category:
+`tools/quickdraw.py rank` keeps the best fraction of each category:
 
 ```bash
-python utils.py download --out_dir qd_raw
-python utils.py rank --raw_dir qd_raw --out data/top25.jsonl --resume
+python -m tools.quickdraw download --out_dir qd_raw
+python -m tools.quickdraw rank --raw_dir qd_raw --out data/top25.jsonl --resume
 ```
 
 It renders each drawing, embeds it with CLIP, and scores it with a probe
@@ -309,7 +327,7 @@ rented GPU does it in one to three, since 92% of the time is CLIP inference.
 
 Six open icon sets ship SVGs whose paths are literal pen centerlines — Lucide,
 Tabler outline, Feather, Iconoir regular, Heroicons outline, and Akar.
-`utils.py icons` aggregates them into one corpus of 8,770 sketchable icons
+`tools/icons.py` aggregates them into one corpus of 8,770 sketchable icons
 across 7,541 compositional labels ("arrow down left from circle"), rejecting
 filled shapes, un-pennable geometry (30+ strokes, dot-by-dot dashes), and
 near-identical renditions that shared ancestry produces (Lucide forked
@@ -317,7 +335,7 @@ Feather). Strokes are greedily reordered to minimize pen-up travel, the way a
 person sketches. Requires `svgelements`.
 
 ```bash
-python utils.py icons --raw_dir data/raw --out data/icons.jsonl
+python -m tools.icons --raw_dir data/raw --out data/icons.jsonl
 python pengpt.py train --preset icons
 ```
 
@@ -331,8 +349,8 @@ tremor bridges it toward human ink.
 ```
 pengpt.py            the algorithm: config, ScribeTokens + BPE, data pipeline,
                      PenTransformer, sampling, and the train/sample/rank commands
-utils.py             per-dataset presets, converters, and corpus-building tools
-                     (Quick, Draw! download/convert/rank, icon aggregation)
+utils.py             per-dataset presets and normalize
+tools/               corpus builders: Quick, Draw! download/convert/rank, icons
 collect.html         self-contained data collection page
 tests/               pytest suite; pins tokenizer, data, and model properties
 ```

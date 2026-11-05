@@ -13,8 +13,8 @@ dependencies = [
 [project.optional-dependencies]
 wandb = ["wandb"]
 dev = ["pytest"]
-quality = ["transformers", "Pillow"]   # utils.py rank: CLIP-based filtering
-icons = ["svgelements"]                # utils.py icons: SVG icon aggregation
+quality = ["transformers", "Pillow"]
+icons = ["svgelements"]
 
 [tool.setuptools]
 py-modules = ["pengpt", "utils"]
@@ -22,3 +22,6 @@ py-modules = ["pengpt", "utils"]
 [build-system]
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
