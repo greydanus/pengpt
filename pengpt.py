@@ -993,6 +993,9 @@ def save_progress(model, dataset, out_dir, step, showcase=(), n=6, samples=3):
         for j, (ax, tokens) in enumerate(zip(axes[i], drawings)):
             words = [] if tokens is None else st.decode(tokens.numpy())
             plot_words(words, params, ax=ax, color=("darkgreen", "navy")[j] if j < 2 else "k")
+            if tokens is None:
+                ax.text(0.5, 0.5, "showcase prompt:\nno real drawing", transform=ax.transAxes,
+                        ha="center", va="center", color="0.6", fontsize=8)
         axes[i][0].set_title(dataset.char_tok.decode(C[i]), loc="left", fontsize=8, pad=2)
     fig.suptitle(f"step {step:,}: real test example (green), greedy (blue), samples (black)",
                  fontsize=10)
