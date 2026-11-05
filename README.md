@@ -13,7 +13,7 @@ dataset.
 
 The paper and this repo share the same skeleton — a small nanoGPT-lineage
 decoder with cross-attention over a character-level encoding of the prompt,
-about 440k parameters there and 385k here — so the difference is almost
+about 440k parameters there and 400k here — so the difference is almost
 entirely in how ink becomes tokens. The paper turns each pen point into a
 stroke offset and then polar coordinates, spending two tokens per point (a
 220-bin angle, then a 150-bin radius that carries the pen state); this repo
@@ -26,8 +26,8 @@ machinery the paper's codebase needed on top — per-writer character tables,
 generation seeded with real strokes from the training set, an inter-word
 carriage-jump formula — disappears. Trained head to head at matched wall
 clock, the new representation reached 3.43 bits per pen-point against 7.16,
-which is what shrank a full run from 125,000 steps on a rented A100 to
-20,000 steps in under an hour on a laptop.
+which, with a nanochat-style model and the Muon optimizer, shrank a full run
+from 125,000 steps on a rented A100 to 20,000 steps in 15 minutes on a laptop.
 
 ![hero](static/hero.png)
 
@@ -47,13 +47,14 @@ size move between presets.
 
 ![progress](static/progress.png)
 
-The grid written at every eval, here at step 6,000 — about five minutes of
-training. Each of the top six rows is a held-out test prompt: four samples in
-black, then the real drawing in green. The bottom rows are showcase phrases
-(`--showcase`, set per preset) with no ground truth; their last column is the
-greedy sample in blue. Prompts and seeds are fixed, so consecutive grids differ
-only by the model. Four samples per prompt is what makes it readable: one
-sample cannot tell a model ignoring its prompt from a model having a bad draw.
+The grid written at every eval, here at the end of a 20,000-step run (14
+minutes). Every column means one thing: the real test drawing (green), the
+greedy sample (blue), then three random samples (black). The top six rows are
+held-out test prompts; the bottom rows are showcase phrases (`--showcase`, set
+per preset), which have no real drawing. Prompts and seeds are fixed, so
+consecutive grids differ only by the model. Several samples per prompt is what
+makes it readable: one sample cannot tell a model ignoring its prompt from a
+model having a bad draw.
 
 ## Quickstart
 
@@ -63,7 +64,7 @@ pip install -e ".[dev]"   # + pytest
 pytest tests/             # a few seconds
 ```
 
-Train — about 15 minutes on an M-series laptop (43 ms/step on an M3 Pro), no GPU
+Train — about 15 minutes on an M-series laptop (14.4 on an M3 Pro), no GPU
 rental needed:
 
 ```bash
@@ -155,7 +156,7 @@ token — which is what keeps sequences short.
 *Grey is the original, red is decoded from tokens. `grid=0.020` is the default:
 reconstruction error stays inside the width of a pen stroke at 99 tokens per word.*
 
-**Model**: a small GPT-style decoder (~385k params at the cursive default)
+**Model**: a small GPT-style decoder (~400k params at the cursive default)
 with cross-attention over byte embeddings of the text prompt, built the way
 [nanochat](https://github.com/karpathy/nanochat) builds its GPT: rotary
 positions, parameter-free RMSNorm, QK-norm, ReLU² MLPs, no biases, zero-init
@@ -166,10 +167,14 @@ learning rate warms up, holds, and decays linearly over the last 40% of steps,
 and the training step is `torch.compile`d. Generation uses a fixed-shape key/value
 cache, so every decoding step has the same tensor shapes.
 
-On the bundled cursive at matched steps (6,000, same seed), this reached a
-test loss of 2.01 against 2.12 for the previous LayerNorm + AdamW + cosine
-recipe, at 43 ms per step against roughly 100. The previous recipe needed
-20,000 steps to reach 1.98.
+On the bundled cursive, a full 20,000-step run reaches a test loss of 1.95 in
+14 minutes; the previous LayerNorm + AdamW + cosine recipe reached 1.98 in 51.
+Measured at matched steps (6,000, same seed), the new recipe scores 2.01
+against 2.12. Two heads rather than four lost nothing and cut the step from
+43 ms to 28, because attention on MPS is bound by memory traffic that scales
+with head count, and doubling both learning rates reached the same loss in a
+quarter fewer steps; three layers, wider models, and AdamW alone all lost at
+matched wall clock.
 
 The prompt reaches the model only through that cross-attention, never as a class
 index, so the same architecture takes a word to write or the name of an object
@@ -240,8 +245,9 @@ python pengpt.py sample --checkpoint out/cursive/best.pt --greedy --text "Sing, 
 
 Long text is generated a few words per model call and laid out with wrapping.
 Sixteen of these seventeen words came out right on the first greedy pass; the
-seventeenth ("Achaeans.") was regenerated on its own with `--redo 16`, which
-is the intended workflow for the occasional miss.
+seventeenth ("ills", written "ill") was resampled on its own, which is the
+intended workflow for the occasional miss. All four seeds tried spelled it
+correctly.
 
 ## Training on your own pen data
 

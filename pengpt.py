@@ -46,7 +46,7 @@ class DataConfig:
 @dataclass
 class ModelConfig:
     n_layer: int = 5
-    n_head: int = 4
+    n_head: int = 2
     n_embd: int = 64
     pen_pos_bands: int = 8
     pen_pos_jitter: int = 32
@@ -60,9 +60,8 @@ class ModelConfig:
 class TrainConfig:
     steps: int = 20_000
     batch_size: int = 16
-    optimizer: str = "muon"
-    learning_rate: float = 3e-3
-    matrix_lr: float = 0.02
+    learning_rate: float = 6e-3
+    matrix_lr: float = 0.04
     weight_decay: float = 1e-4
     warmup: int = 200
     warmdown: float = 0.4
@@ -83,7 +82,7 @@ class TrainConfig:
 DERIVED_FIELDS = {"vocab_size", "block_size", "context_vocab_size",
                   "context_block_size"}
 
-CHOICES = {"augment": ("none", "general", "handwriting"), "optimizer": ("muon", "adamw")}
+CHOICES = {"augment": ("none", "general", "handwriting")}
 
 
 def add_config_args(parser):
@@ -813,14 +812,11 @@ class Muon(torch.optim.Optimizer):
 
 
 def make_optimizers(model, cfg):
-    matrices = [p for n, p in model.named_parameters() if p.ndim == 2 and n.startswith("blocks.")]
-    others = [p for n, p in model.named_parameters() if not (p.ndim == 2 and n.startswith("blocks."))]
-    if cfg.optimizer == "adamw":
-        matrices, others = [], list(model.parameters())
-    opts = [torch.optim.AdamW(others, lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
-                              betas=(0.9, 0.99), eps=1e-8)]
-    if matrices:
-        opts.append(Muon(matrices, lr=cfg.matrix_lr))
+    is_matrix = lambda n, p: p.ndim == 2 and n.startswith("blocks.")
+    opts = [torch.optim.AdamW([p for n, p in model.named_parameters() if not is_matrix(n, p)],
+                              lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
+                              betas=(0.9, 0.99), eps=1e-8),
+            Muon([p for n, p in model.named_parameters() if is_matrix(n, p)], lr=cfg.matrix_lr)]
     for opt in opts:
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
@@ -980,27 +976,25 @@ def generate_paragraph(model, dataset, text, params=None, words=None, redo=None)
     return words
 
 
-def save_progress(model, dataset, out_dir, step, showcase=(), n=6, samples=4):
+def save_progress(model, dataset, out_dir, step, showcase=(), n=6, samples=3):
     X, C, _ = dataset.batch(range(n))
     C = torch.cat([C] + [torch.from_numpy(dataset.encode_text(t))[None] for t in showcase])
     st, device, rows = dataset.stroke_tok, next(model.parameters()).device, len(C)
+    gen = lambda k, do_sample: model.generate(
+        torch.full((rows * k, 1), st.BOS, device=device), C.repeat_interleave(k, 0).to(device),
+        dataset.cfg.max_seq_length - 1, do_sample=do_sample, end_token=st.END, pad_token=st.PAD).cpu()
     torch.manual_seed(3)
-    out = model.generate(torch.full((rows * samples, 1), st.BOS, device=device),
-                         C.repeat_interleave(samples, 0).to(device),
-                         dataset.cfg.max_seq_length - 1, end_token=st.END, pad_token=st.PAD).cpu()
-    greedy = model.generate(torch.full((rows - n, 1), st.BOS, device=device), C[n:].to(device),
-                            dataset.cfg.max_seq_length - 1, do_sample=False, end_token=st.END,
-                            pad_token=st.PAD).cpu() if rows > n else []
-    fig, axes = plt.subplots(rows, samples + 1, figsize=(3 * (samples + 1), 1.1 * rows),
+    greedy, out = gen(1, False), gen(samples, True)
+    fig, axes = plt.subplots(rows, samples + 2, figsize=(3 * (samples + 2), 1.1 * rows),
                              squeeze=False, sharex="row", sharey="row")
     params = SampleParams(line_width=2.5)
     for i in range(rows):
-        drawings = list(out[i * samples:(i + 1) * samples]) + [X[i] if i < n else greedy[i - n]]
-        for j, ax in enumerate(axes[i]):
-            color = "k" if j < samples else "darkgreen" if i < n else "navy"
-            plot_words(st.decode(drawings[j].numpy()), params, ax=ax, color=color)
+        drawings = [X[i] if i < n else None, greedy[i]] + list(out[i * samples:(i + 1) * samples])
+        for j, (ax, tokens) in enumerate(zip(axes[i], drawings)):
+            words = [] if tokens is None else st.decode(tokens.numpy())
+            plot_words(words, params, ax=ax, color=("darkgreen", "navy")[j] if j < 2 else "k")
         axes[i][0].set_title(dataset.char_tok.decode(C[i]), loc="left", fontsize=8, pad=2)
-    fig.suptitle(f"step {step:,}: samples (black), real test example (green), greedy (blue)",
+    fig.suptitle(f"step {step:,}: real test example (green), greedy (blue), samples (black)",
                  fontsize=10)
     fig.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.95, wspace=0.03, hspace=0.3)
     os.makedirs(out_dir, exist_ok=True)
@@ -1108,7 +1102,7 @@ def train(data_cfg, model_cfg, train_cfg):
             ms = (time.time() - t_print) * 1000 / train_cfg.print_every
             print(f"step {step} | loss {loss.item():.4f} | {ms:.0f} ms/step | lr x{mult:.3f}")
             t_print = time.time()
-        if step % train_cfg.eval_every != 0:
+        if step % train_cfg.eval_every and step < train_cfg.steps:
             continue
 
         train_loss = evaluate(model, train_dataset, device)
