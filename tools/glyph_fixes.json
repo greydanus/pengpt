@@ -15,11 +15,11 @@
         "note": "one stroke instead of two"
       },
       "x": {
-        "prompt": "Recognize and derender.",
-        "note": "the text-hint prompt drew only the hump, no cross stroke; its cross stroke is drawn after the word",
+        "context": false,
         "marks": [
           1
-        ]
+        ],
+        "note": "inside n_n InkSight traces x as one hump with no cross; traced alone, the cross is drawn after the word"
       },
       "D": {
         "note": "first stroke runs leftward into the loop; correct for cursive D"

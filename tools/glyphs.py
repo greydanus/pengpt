@@ -17,6 +17,16 @@ STORE, FIXES = "data/glyphs.json", "tools/glyph_fixes.json"
 SIZE, PAD = 200, 8
 
 
+def thin_font(path, size):
+    font = ImageFont.truetype(path, size)
+    try:
+        axes = font.get_variation_axes()
+        font.set_variation_by_axes([a["minimum"] if a["name"] == b"Weight" else a["default"] for a in axes])
+    except OSError:
+        pass
+    return font
+
+
 def slug(font_path):
     return os.path.splitext(os.path.basename(font_path))[0].lower().replace("-", "_")
 
@@ -26,19 +36,21 @@ def advance(font, text, i):
 
 
 def contexts(c, cursive):
-    if cursive and c in string.ascii_lowercase:
+    if not cursive:
+        return c, 0
+    if c in string.ascii_lowercase:
         return "n" + c + "n", 1
-    if cursive and c in string.ascii_uppercase:
+    if c in string.ascii_uppercase:
         return c + "n", 0
     return c, 0
 
 
-def render(font_path, out, cursive):
-    font = ImageFont.truetype(font_path, SIZE)
+def render(font_path, out, cursive, alone=""):
+    font = thin_font(font_path, SIZE)
     os.makedirs(f"{out}/images", exist_ok=True)
     rows = []
     for k, c in enumerate(CHARS):
-        text, pos = contexts(c, cursive)
+        text, pos = contexts(c, cursive and c not in alone)
         left, top, right, bottom = font.getbbox(text, anchor="ls")
         img = Image.new("RGB", (right - left + 2 * PAD, bottom - top + 2 * PAD), "white")
         ImageDraw.Draw(img).text((PAD - left, PAD - top), text, font=font, fill="black", anchor="ls")
@@ -133,7 +145,7 @@ def apply_ops(strokes, ops):
 def build(font_path, fixes):
     s = slug(font_path)
     out, fix = f"data/raw/glyphs/{s}", fixes.get(s, {})
-    font = ImageFont.truetype(font_path, SIZE)
+    font = thin_font(font_path, SIZE)
     xh = np.median([np.ptp(font.getbbox(c, anchor="ls")[1::2]) for c in SHORT])
     shift = ink_baseline(font)
     rows = {r["image"]: r for r in read_jsonl(f"{out}/manifest.jsonl")}
@@ -150,6 +162,8 @@ def build(font_path, fixes):
             strokes = snap_dots(strokes, dots(image, lo, hi, xh), xh)
         origin = [row["x0"] + advance(font, row["text"], row["pos"]), row["baseline"] + shift]
         strokes = [(p - origin) / xh for p in strokes]
+        if fix.get("cursive") and c.islower():
+            strokes = [p for p in strokes if len(p) == 1 or np.ptp(p, 0).max() > 0.15 or is_mark(p, c)]
         marks = g.get("marks", [k for k, p in enumerate(strokes) if is_mark(p, c)])
         glyphs[c] = {"strokes": [p.round(4).tolist() for p in strokes], "marks": marks}
     return {"font": os.path.basename(font_path), "size": SIZE, "xh": float(xh), "cursive": bool(fix.get("cursive")),
@@ -173,10 +187,43 @@ def against_grain(entry):
 def retrace(p, s, gap=0.25):
     if len(s) < 3 or np.hypot(*(p - s[0])) < gap:
         ahead = np.flatnonzero(s[:, 0] >= p[0] - 0.02)
-        return s[ahead[0]:] if len(ahead) and ahead[0] < len(s) // 2 else s
+        walked = np.r_[0, np.cumsum(np.hypot(*np.diff(s, axis=0).T))]
+        return s[ahead[0]:] if len(ahead) and walked[ahead[0]] < 0.2 else s
     head = s[:max(2, len(s) * 3 // 5)]
     j = int(np.argmin(np.hypot(*(head - p).T)))
     return np.vstack([s[j::-1], s[1:]]) if j > 0 else s
+
+
+def curve(a, b, n=8):
+    p0, p1 = a[-1], b[0]
+    gap = np.hypot(*(p1 - p0))
+    if gap < 0.05 or len(a) < 3 or len(b) < 3:
+        return np.zeros((0, 2))
+    unit = lambda v: v / (np.linalg.norm(v) + 1e-9)
+    m0, m1 = unit(a[-1] - a[-3]) * gap, unit(b[2] - b[0]) * gap
+    t = np.linspace(0, 1, n + 2)[1:-1, None]
+    return (2 * t**3 - 3 * t**2 + 1) * p0 + (t**3 - 2 * t**2 + t) * m0 + (-2 * t**3 + 3 * t**2) * p1 + (t**3 - t**2) * m1
+
+
+def ends(s, reach, last):
+    walked = np.r_[0, np.cumsum(np.hypot(*np.diff(s[::-1] if last else s, axis=0).T))]
+    k = np.flatnonzero(walked <= reach)
+    return len(s) - 1 - k if last else k
+
+
+def settle(tail, start, window=0.6):
+    if tail[-1, 1] > start[1] - 0.2:
+        return tail
+    near = ends(tail, window, True)
+    m = near[np.argmax(tail[near, 1])]
+    return tail[:m + 1] if tail[m, 1] > -0.3 else tail
+
+
+def splice(tail, s, reach=0.6, close=0.08):
+    a, b = ends(tail, reach, True), ends(s, reach, False)
+    d = np.hypot(*(tail[a][:, None] - s[b][None]).transpose(2, 0, 1))
+    i, j = np.unravel_index(np.argmin(d), d.shape)
+    return (tail[:a[i] + 1], s[b[j]:]) if d[i, j] < close else None
 
 
 def compose(entry, text, xs, bridge=1.0):
@@ -193,7 +240,13 @@ def compose(entry, text, xs, bridge=1.0):
                 continue
             joined = k > 0 or (prev or "").islower() or ((prev or "").isupper() and np.hypot(*(out[-1][-1] - s[0])) < bridge)
             if entry["cursive"] and c.islower() and out and joined:
-                out[-1] = np.vstack([out[-1], retrace(out[-1][-1], s)])
+                cut = splice(out[-1], s)
+                if cut:
+                    out[-1] = np.vstack(cut)
+                    continue
+                tail = settle(out[-1], s[0]) if k == 0 else out[-1]
+                s = retrace(tail[-1], s)
+                out[-1] = np.vstack([tail, curve(tail, s), s])
             else:
                 out.append(s)
         prev = c
@@ -201,7 +254,7 @@ def compose(entry, text, xs, bridge=1.0):
 
 
 def layout(entry, text, font_dir="data/raw/fonts"):
-    font = ImageFont.truetype(f"{font_dir}/{entry['font']}", entry["size"])
+    font = thin_font(f"{font_dir}/{entry['font']}", entry["size"])
     return [advance(font, text, i) / entry["xh"] for i in range(len(text))]
 
 
@@ -256,7 +309,9 @@ def sheet(entry, path, words=("minimum", "Ithaca,", "quick brown", "Hello!", "ju
 def trace_command(args):
     fixes = load(args.fixes)
     out = f"data/raw/glyphs/{slug(args.font)}"
-    rows = render(args.font, out, bool(fixes.get(slug(args.font), {}).get("cursive")))
+    fix = fixes.get(slug(args.font), {})
+    alone = "".join(c for c, g in fix.get("glyphs", {}).items() if g.get("context") is False)
+    rows = render(args.font, out, bool(fix.get("cursive")), alone)
     trace(rows, f"{out}/traces.jsonl", args.weights, args.batch)
 
 
