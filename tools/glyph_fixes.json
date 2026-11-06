@@ -186,9 +186,11 @@
       },
       "Q": {
         "prompt": "Recognize and derender.",
-        "note": "user: two strokes, the loop then the tail",
+        "note": "user: the loop, then the tail starting near the middle of the O",
         "ops": [
-          "split:0,20"
+          "split:0,20",
+          "split:1,3",
+          "drop:1"
         ]
       },
       "D": {
@@ -229,7 +231,8 @@
         "note": "drawn top-down"
       }
     },
-    "reviewed": true
+    "reviewed": true,
+    "signed_off": true
   },
   "architectsdaughter_regular": {
     "cursive": false,
