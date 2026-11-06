@@ -392,14 +392,14 @@ def joins_sheet(entry, path, words=("whitewater", "tattoo", "outstanding", "brow
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     font = ImageFont.truetype(f"data/raw/fonts/{entry['font']}", entry["size"])
-    fig, axes = plt.subplots(2 * len(words), 1, figsize=(15, 2.2 * 2 * len(words)))
+    fig, axes = plt.subplots(3 * len(words), 1, figsize=(15, 2.2 * 3 * len(words)))
     for k, w in enumerate(words):
         left, top, right, bottom = font.getbbox(w, anchor="ls")
         img = Image.new("L", (right - left + 2 * PAD, bottom - top + 2 * PAD), 255)
         ImageDraw.Draw(img).text((PAD - left, PAD - top), w, font=font, fill=0, anchor="ls")
         x0, base, xh = PAD - left, PAD - top + ink_baseline(font), entry["xh"]
         extent = (-x0 / xh, (img.size[0] - x0) / xh, -(img.size[1] - base) / xh, base / xh)
-        a, b = axes[2 * k], axes[2 * k + 1]
+        a, b, d = axes[3 * k], axes[3 * k + 1], axes[3 * k + 2]
         a.imshow(img, cmap="gray", alpha=0.25, extent=extent)
         n = 0
         for c, x in zip(w, layout(entry, w)):
@@ -415,9 +415,14 @@ def joins_sheet(entry, path, words=("whitewater", "tattoo", "outstanding", "brow
             b.plot(st[:, 0], -st[:, 1], color="#1c3f73", lw=1.3)
         for seg in log:
             b.plot(seg[:, 0], -seg[:, 1], color="#eb6834", lw=3, alpha=0.8)
+        d.imshow(img, cmap="gray", alpha=0.12, extent=extent)
+        for i, st in enumerate(strokes):
+            d.plot(st[:, 0], -st[:, 1], color=plt.cm.tab10(i % 10), lw=1.6)
+            d.plot(st[0, 0], -st[0, 1], "o", color=plt.cm.tab10(i % 10), ms=5)
         a.set_title(f"{w!r}: per-glyph InkSight strokes over the font (one colour per stroke, dot = start)", loc="left", fontsize=10)
         b.set_title(f"final: {len(strokes)} strokes; joins along the font's centerline in orange", loc="left", fontsize=10)
-        for ax in (a, b):
+        d.set_title(f"final strokes, one colour per pen-down (dot = start): {len(strokes)} strokes", loc="left", fontsize=10)
+        for ax in (a, b, d):
             ax.set_xlim(extent[0], extent[1])
             ax.set_ylim(extent[2], extent[3])
             ax.set_aspect("equal")
