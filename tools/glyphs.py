@@ -281,7 +281,7 @@ def compose(entry, text, xs, bridge=1.0, rails=None, log=None):
                         log.append(np.vstack([out[-1][-1:], gap if gap is not None else np.zeros((0, 2)), s[:1]]))
                     out[-1] = chain
                     continue
-            out.append(s)
+            out, marks = out + marks + [s], []
         prev = c
     return out + marks
 
@@ -419,9 +419,10 @@ def joins_sheet(entry, path, words=("whitewater", "tattoo", "outstanding", "brow
         for i, st in enumerate(strokes):
             d.plot(st[:, 0], -st[:, 1], color=plt.cm.tab10(i % 10), lw=1.6)
             d.plot(st[0, 0], -st[0, 1], "o", color=plt.cm.tab10(i % 10), ms=5)
+            d.text(st[0, 0] - 0.05, -st[0, 1] + 0.08, str(i + 1), color=plt.cm.tab10(i % 10), fontsize=10, ha="right")
         a.set_title(f"{w!r}: per-glyph InkSight strokes over the font (one colour per stroke, dot = start)", loc="left", fontsize=10)
         b.set_title(f"final: {len(strokes)} strokes; joins along the font's centerline in orange", loc="left", fontsize=10)
-        d.set_title(f"final strokes, one colour per pen-down (dot = start): {len(strokes)} strokes", loc="left", fontsize=10)
+        d.set_title(f"final strokes, one colour per pen-down, numbered in drawing order: {len(strokes)} strokes", loc="left", fontsize=10)
         for ax in (a, b, d):
             ax.set_xlim(extent[0], extent[1])
             ax.set_ylim(extent[2], extent[3])

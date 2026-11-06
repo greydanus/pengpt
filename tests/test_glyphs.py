@@ -65,3 +65,10 @@ def test_dots_snap_to_the_ink_and_missing_dots_are_added():
     v = np.array([[0.0, -1.0], [0.5, 0.0], [1.0, -1.0]])
     out = apply_ops([v], ["split:0,1", "reverse:0"])
     assert np.allclose(out[0], v[1::-1]) and np.allclose(out[1], v[1:])
+
+
+def test_dots_and_crosses_come_before_the_pen_moves_on():
+    strokes = compose(entry(True), "ni!", [0, 1, 2])
+    assert len(strokes) == 4
+    assert np.allclose(strokes[1], [[1.3, -1.2]])
+    assert np.allclose(strokes[2], [[2, 0], [2.1, 0]])
