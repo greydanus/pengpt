@@ -13,10 +13,11 @@ def entry(cursive):
         "!": {"strokes": [line(0, 0.1), [[0.05, 0.1]]], "marks": []}}}
 
 
-def test_cursive_word_is_one_stroke_with_marks_after():
+def test_cursive_word_lifts_only_to_dot_and_resumes_where_it_stopped():
     strokes = compose(entry(True), "nicn", [0, 1, 2, 3])
-    assert len(strokes) == 2
-    assert len(strokes[0]) == 10 and np.allclose(strokes[-1], [[1.3, -1.2]])
+    assert len(strokes) == 3
+    assert len(strokes[0]) == 4 and np.allclose(strokes[1], [[1.3, -1.2]])
+    assert np.allclose(strokes[2][0], strokes[0][-1]) and len(strokes[2]) == 7
 
 
 def test_space_and_punctuation_break_the_pen():

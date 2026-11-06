@@ -260,30 +260,40 @@ class Rails:
 
 
 def compose(entry, text, xs, bridge=1.0, rails=None, log=None):
-    g = entry["glyphs"]
-    out, marks, prev = [], [], None
+    g, cursive = entry["glyphs"], entry["cursive"]
+    out, prev, end, open_chain = [], None, None, False
     for c, x in zip(text, xs):
         if c not in g:
-            out, marks, prev = out + marks, [], None
+            prev, end, open_chain = None, None, False
             continue
+        marks = []
         for k, s in enumerate(g[c]["strokes"]):
             s = np.asarray(s) + [x, 0]
             if k in g[c]["marks"]:
-                (marks if entry["cursive"] else out).append(s)
+                marks.append(s)
                 continue
-            if rails and entry["cursive"] and (c.isalpha() or k == 0):
+            if rails and cursive and (c.isalpha() or k == 0):
                 s = rails.snap(s)
-            if entry["cursive"] and c.islower() and out and (k > 0 or (prev or "").isalpha()):
-                gap = rails.link(out[-1][-1], s[0]) if rails else np.zeros((0, 2))
-                chain = np.vstack([out[-1], gap if gap is not None else np.zeros((0, 2)), s])
-                if k > 0 or (prev or "").islower() or walk(chain[len(out[-1]) - 1:len(out[-1]) + 1 + (0 if gap is None else len(gap))])[-1] < bridge:
+            if cursive and c.islower() and end is not None and (k > 0 or (prev or "").isalpha()):
+                gap = rails.link(end, s[0]) if rails else None
+                gap = np.zeros((0, 2)) if gap is None else gap
+                piece = np.vstack([end[None], gap, s])
+                if k > 0 or (prev or "").islower() or walk(piece[:len(gap) + 2])[-1] < bridge:
                     if log is not None:
-                        log.append(np.vstack([out[-1][-1:], gap if gap is not None else np.zeros((0, 2)), s[:1]]))
-                    out[-1] = chain
+                        log.append(piece[:len(gap) + 2])
+                    if open_chain:
+                        out[-1] = np.vstack([out[-1], piece[1:]])
+                    else:
+                        out.append(piece)
+                    end, open_chain = out[-1][-1], True
                     continue
-            out, marks = out + marks + [s], []
+            out.append(s)
+            end, open_chain = s[-1], True
+        if marks:
+            out += marks
+            open_chain = False
         prev = c
-    return out + marks
+    return out
 
 
 def unloop(s, reach=0.05, close=0.02):
