@@ -241,6 +241,13 @@ class Rails:
             path.append(prev[path[-1]])
         return path[::-1]
 
+    def ends(self, s, reach=0.3):
+        w = walk(s)
+        if w[-1] < 3 * reach:
+            return self.snap(s)
+        a, b = np.searchsorted(w, reach), np.searchsorted(w, w[-1] - reach)
+        return np.vstack([self.snap(s[:a + 1]), s[a + 1:b], self.snap(s[b:])])
+
     def snap(self, s, step=0.04):
         if len(s) < 2:
             return s
@@ -273,7 +280,7 @@ def compose(entry, text, xs, bridge=1.0, detour=2.0, rails=None, log=None):
                 marks.append(s)
                 continue
             if rails and cursive and (c.isalpha() or k == 0):
-                s = rails.snap(s)
+                s = rails.ends(s)
             if cursive and c.islower() and end is not None and (k > 0 or (prev or "").isalpha()):
                 gap = rails.link(end, s[0]) if rails else np.zeros((0, 2))
                 if gap is not None and len(s) > 3 and walk(np.vstack([end[None], gap, s[:1]]))[-1] > detour * np.hypot(*(s[0] - end)):
