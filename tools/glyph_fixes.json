@@ -137,7 +137,8 @@
         "note": "user: top bar right-to-left, down, bottom bar as one stroke; then the middle bar"
       }
     },
-    "reviewed": true
+    "reviewed": true,
+    "signed_off": true
   },
   "kalam_regular": {
     "cursive": false,

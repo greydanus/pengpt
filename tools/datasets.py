@@ -1,5 +1,6 @@
 import argparse
 import glob
+import hashlib
 import json
 import os
 import pickle
@@ -12,6 +13,7 @@ import numpy as np
 from pengpt import INK_HEIGHT, SHORT_LETTERS, SPACING, X_HEIGHT, _stroke_spans, save_ink
 
 RAW = "data/raw"
+LIBRARY = "glyphs"
 
 
 class SafeUnpickler(pickle.Unpickler):
@@ -284,6 +286,19 @@ def sheet(records, path, n=40, seed=0):
     plt.close(fig)
 
 
+def glyph_library(entry, license, step=0.02, font_dir=f"{RAW}/fonts"):
+    from PIL import ImageFont
+    path = f"{font_dir}/{entry['font']}"
+    font, xh = ImageFont.truetype(path, entry["size"]), entry["xh"]
+    chars = list(entry["glyphs"])
+    kern = {a + b: round((font.getlength(a + b) - font.getlength(a) - font.getlength(b)) / xh, 4) for a in chars for b in chars}
+    return {"font": entry["font"], "sha256": hashlib.sha256(open(path, "rb").read()).hexdigest(), "license": license,
+            "cursive": entry["cursive"], "size": entry["size"], "xh": xh, "step": step,
+            "width": {c: round(font.getlength(c) / xh, 4) for c in chars}, "kern": {k: v for k, v in kern.items() if v},
+            "glyphs": {c: {"strokes": [resample_stroke(np.asarray(s, float), step).round(4).tolist() for s in g["strokes"]],
+                           "marks": g["marks"]} for c, g in entry["glyphs"].items()}}
+
+
 def glyphs_main(args):
     from tools.glyphs import FIXES, load
     fixes = load(FIXES)
@@ -291,6 +306,10 @@ def glyphs_main(args):
     for name in names:
         if not fixes.get(name, {}).get("signed_off"):
             raise SystemExit(f"{name}: no human sign-off on its stroke library in {FIXES}")
+        from tools.glyphs import STORE
+        entry = load(STORE)[name]
+        os.makedirs(LIBRARY, exist_ok=True)
+        json.dump(glyph_library(entry, font_license(entry["font"])), open(f"{LIBRARY}/{name}.json", "w"))
         records = standardize(load_glyphs(name, args.n))
         out = f"{RAW}/glyphs/{name}/{name}.ink.npz"
         os.makedirs(os.path.dirname(out), exist_ok=True)
