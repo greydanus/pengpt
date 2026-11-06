@@ -387,6 +387,45 @@ def sheet(entry, path, words=("minimum", "Ithaca,", "quick brown", "Hello!", "ju
     fig.savefig(path, dpi=80)
 
 
+def joins_sheet(entry, path, words=("whitewater", "tattoo", "outstanding", "brown fox", "Queen", "jumps over")):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    font = ImageFont.truetype(f"data/raw/fonts/{entry['font']}", entry["size"])
+    fig, axes = plt.subplots(2 * len(words), 1, figsize=(15, 2.2 * 2 * len(words)))
+    for k, w in enumerate(words):
+        left, top, right, bottom = font.getbbox(w, anchor="ls")
+        img = Image.new("L", (right - left + 2 * PAD, bottom - top + 2 * PAD), 255)
+        ImageDraw.Draw(img).text((PAD - left, PAD - top), w, font=font, fill=0, anchor="ls")
+        x0, base, xh = PAD - left, PAD - top + ink_baseline(font), entry["xh"]
+        extent = (-x0 / xh, (img.size[0] - x0) / xh, -(img.size[1] - base) / xh, base / xh)
+        a, b = axes[2 * k], axes[2 * k + 1]
+        a.imshow(img, cmap="gray", alpha=0.25, extent=extent)
+        n = 0
+        for c, x in zip(w, layout(entry, w)):
+            for st in map(np.asarray, entry["glyphs"].get(c, {}).get("strokes", [])):
+                st = st + [x, 0]
+                a.plot(st[:, 0], -st[:, 1], color=plt.cm.tab10(n % 10), lw=1.8)
+                a.plot(st[0, 0], -st[0, 1], "o", color=plt.cm.tab10(n % 10), ms=4)
+                n += 1
+        log = []
+        strokes = write(entry, w, log=log)
+        b.imshow(img, cmap="gray", alpha=0.12, extent=extent)
+        for st in strokes:
+            b.plot(st[:, 0], -st[:, 1], color="#1c3f73", lw=1.3)
+        for seg in log:
+            b.plot(seg[:, 0], -seg[:, 1], color="#eb6834", lw=3, alpha=0.8)
+        a.set_title(f"{w!r}: per-glyph InkSight strokes over the font (one colour per stroke, dot = start)", loc="left", fontsize=10)
+        b.set_title(f"final: {len(strokes)} strokes; joins along the font's centerline in orange", loc="left", fontsize=10)
+        for ax in (a, b):
+            ax.set_xlim(extent[0], extent[1])
+            ax.set_ylim(extent[2], extent[3])
+            ax.set_aspect("equal")
+            ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(path, dpi=60)
+
+
 def trace_command(args):
     fixes = load(args.fixes)
     out = f"data/raw/glyphs/{slug(args.font)}"
@@ -403,6 +442,8 @@ def build_command(args):
     json.dump(store, open(args.store, "w"))
     path = f"data/raw/glyphs/{slug(args.font)}/review.png"
     sheet(entry, path)
+    if entry["cursive"]:
+        joins_sheet(entry, path.replace("review", "joins"))
     print(f"{slug(args.font)}: {len(entry['glyphs'])} glyphs -> {args.store}; review sheet {path}")
     flags = against_grain(entry)
     if flags:
