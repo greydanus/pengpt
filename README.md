@@ -154,7 +154,9 @@ one scale per recording frame, plus a sheet of samples to eyeball. Sources:
   does it in one streaming, resumable pass: raw, cleaned and monoline image
   variants, InkSight traces tried until one passes QC (2.7 per word on average),
   pen lifts joined along continuous ink; it writes `accepted.jsonl` and
-  `rejected.jsonl` with reasons.
+  `rejected.jsonl` with reasons. It first traces 10 words from each source
+  (writer or page) and drops sources whose sample mostly fails QC.
+  `python -m tools.transcribe` labels unlabeled crops with Claude Sonnet 5.5.
 - Fonts: `tools/glyphs.py` traces each of a font's 70 characters once with
   InkSight (cursive letters inside an "n_n" context so their joins come out),
   then assembles any word from those glyphs. `trace --font F` takes about a

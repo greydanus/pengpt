@@ -32,3 +32,9 @@ def test_pick_keeps_the_candidate_on_the_ink():
     off = [[(x, y + 20) for x, y in WAVE]]
     best = pick((clean, "wave", [("mono", TEXT, off, ""), ("clean", TEXT, [WAVE], "")], None))
     assert best["key"][0] and best["candidate"] == "clean/text"
+
+
+def test_source_rates_score_each_writer_by_its_qc_pass_rate():
+    from tools.harvest import source_rates
+    rows = [({"writer": "a"}, True)] * 3 + [({"writer": "a"}, False)] + [({"writer": "b"}, False)] * 2 + [({"source": "page.jpg"}, True)]
+    assert source_rates(rows) == {"a": 0.75, "b": 0.0, "page.jpg": 1.0}
