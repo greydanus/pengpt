@@ -269,7 +269,8 @@ def test_glyph_words_export_at_the_shared_scale():
     o = [[0.5, -1.0], [0.0, -0.5], [0.5, 0.0], [1.0, -0.5], [0.5, -1.0]]
     entry = {"font": "f.ttf", "cursive": False, "glyphs": {c: {"strokes": [o], "marks": []} for c in "acemnorsuvwxz"}}
     words = ["moon", "sun", "cow", "ear", "vase", "swan"]
-    samples = glyph_samples(entry, words, [[1.1 * i for i in range(len(w))] for w in words], "f", "OFL")
+    from tools.glyphs import compose
+    samples = glyph_samples(entry, words, [compose(entry, w, [1.1 * i for i in range(len(w))]) for w in words], "f", "OFL")
     records = standardize(samples)
     assert [r["text"] for r in records] == words and all(len(r["strokes"]) == len(w) for r, w in zip(records, words))
     assert all(r["writer"] == "f" and r["license"] == "OFL" for r in records)

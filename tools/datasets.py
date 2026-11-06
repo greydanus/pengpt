@@ -238,10 +238,9 @@ def load_traces(path=f"{RAW}/traces/accepted.jsonl"):
     return samples
 
 
-def glyph_samples(entry, words, xs, name, license):
-    from tools.glyphs import compose
-    return [{"text": w, "strokes": [np.asarray(s, float) for s in compose(entry, w, x)], "baseline": 0.0, "frame": name,
-             "writer": name, "style": name, "source": entry["font"], "license": license} for w, x in zip(words, xs)]
+def glyph_samples(entry, words, strokes, name, license):
+    return [{"text": w, "strokes": [np.asarray(s, float) for s in st], "baseline": 0.0, "frame": name,
+             "writer": name, "style": name, "source": entry["font"], "license": license} for w, st in zip(words, strokes)]
 
 
 def font_license(font):
@@ -253,11 +252,11 @@ def font_license(font):
 
 
 def load_glyphs(name, n):
-    from tools.glyphs import STORE, layout, load
+    from tools.glyphs import STORE, load, write
     from tools.ink import synth_words
     entry = load(STORE)[name]
     words = synth_words(n, seed=zlib.crc32(name.encode()) % 2 ** 31)
-    return glyph_samples(entry, words, [layout(entry, w) for w in words], name, font_license(entry["font"]))
+    return glyph_samples(entry, words, [write(entry, w) for w in words], name, font_license(entry["font"]))
 
 
 LOADERS = {"brush": load_brush, "uji": load_uji, "mathwriting": load_mathwriting, "collect": load_collect,
