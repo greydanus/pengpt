@@ -9,7 +9,19 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from utils import normalize
+from pengpt import INK_HEIGHT
+
+
+def normalize(points):
+    points = np.asarray(points, dtype=float).copy()
+    down = points[points[:, 2] == 1]
+    if len(down) < 2:
+        down = points
+    height = np.quantile(down[:, 1], 0.95) - np.quantile(down[:, 1], 0.05)
+    points[:, :2] *= INK_HEIGHT / max(height, 1e-6)
+    points[:, 0] -= points[0, 0]
+    points[:, 1] -= np.quantile(points[points[:, 2] == 1][:, 1], 0.95)
+    return points
 
 
 def convert_quickdraw(path, max_items=None, categories=None):

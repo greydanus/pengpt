@@ -6,7 +6,7 @@ import os
 
 import numpy as np
 
-from utils import normalize
+from deprecated.quickdraw import normalize
 
 
 ICON_SETS = [

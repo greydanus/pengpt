@@ -1,5 +1,6 @@
 import argparse
 import glob
+import json
 import os
 import pickle
 import random
@@ -7,12 +8,9 @@ import zipfile
 
 import numpy as np
 
-from pengpt import INK_HEIGHT, save_ink
+from pengpt import INK_HEIGHT, SHORT_LETTERS, SPACING, X_HEIGHT, _stroke_spans, save_ink
 
 RAW = "data/raw"
-XHEIGHT = 0.123
-SPACING = 0.010
-XLETTERS = set("acemnorsuvwxz")
 
 
 class SafeUnpickler(pickle.Unpickler):
@@ -67,7 +65,7 @@ def resample_stroke(p, spacing=SPACING):
 
 def group_xheight(group):
     words = [np.ptp(np.quantile(np.concatenate(s["strokes"])[:, 1], [0.02, 0.98])) for s in group
-             if len(s["text"]) >= 2 and set(s["text"]) <= XLETTERS]
+             if len(s["text"]) >= 2 and set(s["text"]) <= SHORT_LETTERS]
     if len(words) >= 5:
         return float(np.median(words)), "words"
     letters = [h for s in group for h in s.get("xh", [])]
@@ -84,12 +82,12 @@ def standardize(samples):
     for frame, group in by_frame.items():
         xh, how[frame] = group_xheight(group)
         if xh:
-            k = XHEIGHT / xh
+            k = X_HEIGHT / xh
             if how[frame] in ("words", "letters"):
                 trial = [[resample_stroke(np.column_stack([st[:, 0] * k, st[:, 1] * k])) for st in s["strokes"]] for s in group
-                         if set(s["text"]) <= XLETTERS and len(s["text"]) >= (2 if how[frame] == "words" else 1)]
+                         if set(s["text"]) <= SHORT_LETTERS and len(s["text"]) >= (2 if how[frame] == "words" else 1)]
                 got = np.median([np.ptp(np.quantile(np.concatenate(t)[:, 1], [0.02, 0.98])) for t in trial])
-                k *= XHEIGHT / got
+                k *= X_HEIGHT / got
         else:
             heights = [np.ptp(np.quantile(np.concatenate(s["strokes"])[:, 1], [0.05, 0.95])) for s in group]
             k = INK_HEIGHT / max(np.median(heights), 1e-9)
@@ -118,7 +116,7 @@ def brush_words(drawing, sentence, label):
             continue
         idx = np.flatnonzero(keep)
         breaks = ends[idx] | np.r_[np.diff(idx) > 1, True]
-        xh = [np.ptp(xy[char == c, 1]) for c in range(a, b) if sentence[c] in XLETTERS and (char == c).sum() > 2]
+        xh = [np.ptp(xy[char == c, 1]) for c in range(a, b) if sentence[c] in SHORT_LETTERS and (char == c).sum() > 2]
         yield token, split_strokes(xy[idx], breaks), xh
 
 
@@ -189,7 +187,7 @@ def load_uji():
         n = int(lines[i + 1].split()[1])
         strokes = [np.array(lines[i + 2 + k].split("#")[1].split(), float).reshape(-1, 2) for k in range(n)]
         writer = tag.split("_")[-1].split("-")[0]
-        xh = [np.ptp(np.concatenate(strokes)[:, 1])] if text in XLETTERS else []
+        xh = [np.ptp(np.concatenate(strokes)[:, 1])] if text in SHORT_LETTERS else []
         samples.append({"text": text, "strokes": strokes, "baseline": baseline(strokes, text), "xh": xh, "frame": "uji", "writer": f"uji_{writer}",
                         "style": f"uji_{writer}", "source": "UJIpenchars2 (UCI)", "license": "CC BY 4.0"})
     return samples
@@ -211,7 +209,36 @@ def load_mathwriting():
     return samples
 
 
-LOADERS = {"brush": load_brush, "uji": load_uji, "mathwriting": load_mathwriting}
+def points_to_strokes(points):
+    points = np.asarray(points, dtype=float)
+    return [points[a:b, :2].round(5).tolist() for a, b in _stroke_spans(points[:, 2])]
+
+
+def load_collect():
+    samples = []
+    for path in sorted(glob.glob(f"{RAW}/collect/*.json")):
+        for item in json.load(open(path)):
+            meta = item["metadata"]
+            points = np.asarray(item["points"], float) * [meta["aspectRatio"], 1, 1]
+            strokes = [np.asarray(s) for s in points_to_strokes(points)]
+            text, author = meta["asciiSequence"], meta["author"]
+            samples.append({"text": text, "strokes": strokes, "baseline": baseline(strokes, text), "frame": f"collect_{author}",
+                            "writer": author, "style": author, "source": "collect.html", "license": "unspecified"})
+    return samples
+
+
+def load_traces(path=f"{RAW}/traces/accepted.jsonl"):
+    samples = []
+    for r in map(json.loads, open(path)):
+        strokes = [np.asarray(s, float) for s in r["strokes"] if len(s)]
+        samples.append({"text": r["text"], "strokes": strokes, "baseline": r["baseline"], "frame": r["source"],
+                        "writer": r.get("writer", r["source"]), "style": r["style"], "source": r["source"],
+                        "license": r["license"]})
+    return samples
+
+
+LOADERS = {"brush": load_brush, "uji": load_uji, "mathwriting": load_mathwriting, "collect": load_collect,
+           "traces": load_traces}
 
 
 def sheet(records, path, n=40, seed=0):

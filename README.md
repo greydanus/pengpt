@@ -77,8 +77,8 @@ within the sequence, not on the page. `--pen_pos_bands 0` turns them off.
 **Batches.** Each training sequence comes from one writer. It packs a random
 1 to `--max_words` words, separated by `WORD` tokens, and never cuts a word in
 half. One augmentation is applied to the whole sequence: slant ±0.1, stretch
-±10%, rotation ±2°, and a shift of up to half a grid cell. Test data is never
-augmented.
+±10%, rotation ±2°, and a shift of up to half a grid cell (`--no-augment` turns
+it off). Test data is never augmented.
 
 **Writers.** Each writer gets a learned style vector that sits in front of the
 prompt. 10% of the time, training swaps in a shared "unknown writer" vector.
@@ -98,15 +98,16 @@ save_ink([{"text": "hello", "strokes": [[[0.0, 0.0], [0.01, -0.02], ...], ...],
          "data/mine.ink.npz")
 ```
 
-Coordinates: y points down, the baseline is y = 0, the x-height is 0.12, and
-points are about 0.01 apart. Check a file before training on it:
+Coordinates: y points down, the baseline is y = 0, the x-height (measured on
+words like "moon") is 0.123, and points are about 0.01 apart. Check a file
+before training on it:
 
 ```bash
 python pengpt.py check --dataset data/mine.ink.npz
 ```
 
 Training runs the same check and refuses a dataset whose x-height is outside
-0.6–1.7× of 0.12, or whose baseline is off by more than 0.06. If your points
+0.6–1.7× of 0.123, or whose baseline is off by more than 0.06. If your points
 are unevenly spaced, `--spacing 0.01` resamples them.
 
 Mix datasets with sampling weights. Each dataset keeps its own fixed
@@ -116,25 +117,24 @@ train/test split:
 python pengpt.py train --preset cursive --dataset "data/bigbank_3500.ink.npz:3,data/raw/brush/brush.ink.npz:1"
 ```
 
-Ways to get handwriting:
+`python -m tools.datasets <name>` converts a source in `data/raw/<name>/` to
+`data/raw/<name>/<name>.ink.npz`, rescaled to the shared x-height. It writes
+one scale per recording frame, plus a sheet of samples to eyeball. Sources:
 
-- `collect.html`: write in the browser and export JSON (legacy
-  `{"text", "points"}` JSON still loads). This is how `bigbank_3500` was made:
-  3,500 words from one writer.
-- `python -m tools.datasets brush uji mathwriting` converts those public
-  datasets from `data/raw/<name>/` to `.ink.npz` at the shared scale.
-- `tools/ink.py` turns images into strokes: `render` (from a font) or
-  `segment` (from a page scan) makes word images, `trace` traces them with
-  InkSight, and `qc` keeps traces that match the ink (`pip install -e ".[ink]"`;
-  `trace` also needs TensorFlow). `utils.export_traces`
-  then writes the accepted traces as `.ink.npz`.
-- `utils.normalize` rescales raw absolute `(x, y, pen)` points.
+- `collect`: JSON exported from `collect.html`, the in-browser collection page
+  (this is how `bigbank_3500` was made: 3,500 words from one writer).
+- `brush`, `uji`, `mathwriting`: public datasets.
+- `traces`: `accepted.jsonl` from `tools/ink.py`, which turns images into
+  strokes. `render` (from a font) or `segment` (from a page scan) makes word
+  images, `trace` traces them with InkSight, and `qc --out
+  data/raw/traces/accepted.jsonl` keeps traces that match the ink
+  (`pip install -e ".[ink]"`; `trace` also needs TensorFlow).
 
 ## Repo map
 
 ```
 pengpt.py     tokenizer, data, model, training, sampling; train/sample/rank/check commands
-utils.py      presets, normalize, export_traces
+utils.py      training presets
 tools/        datasets.py (public corpora), ink.py (image tracing)
 collect.html  data collection page
 tests/        pytest suite

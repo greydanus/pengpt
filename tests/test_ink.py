@@ -4,10 +4,10 @@ from argparse import Namespace
 import numpy as np
 from PIL import Image, ImageDraw
 
-from pengpt import load_examples, read_ink, save_ink, strokes_to_points
+from pengpt import INK_HEIGHT, load_examples, read_ink, save_ink
 from tools.ink import (detokenize, segment_command, file_hash, levenshtein, on_ink, qc_command, read_jsonl,
                        replace_rows, score, split_line, write_jsonl)
-from utils import INK_HEIGHT, export_traces, points_to_strokes
+from tools.datasets import load_traces, points_to_strokes, standardize
 
 
 def ink_row(spans, h=20, width=400):
@@ -64,9 +64,13 @@ def test_score_separates_faithful_from_wrong_traces(tmp_path):
     assert score(item, {"strokes": []})["coverage"] == 0
 
 
-def test_strokes_points_roundtrip():
-    strokes = [[[0.0, 0.0], [0.1, 0.05], [0.2, 0.0]], [[0.3, -0.1]], [[0.4, 0.0], [0.5, 0.1]]]
-    assert points_to_strokes(strokes_to_points(strokes)) == strokes
+def test_points_to_strokes_splits_at_lifts():
+    points = [[0.0, 0.0, 1], [0.1, 0.05, 1], [0.1, 0.05, 0], [0.3, -0.1, 1], [0.3, -0.1, 0]]
+    assert points_to_strokes(points) == [[[0.0, 0.0], [0.1, 0.05]], [[0.3, -0.1]]]
+
+
+def export_traces(accepted, out):
+    save_ink(standardize(load_traces(accepted)), out)
 
 
 def test_export_keeps_relative_size_and_baseline(tmp_path):
@@ -138,11 +142,6 @@ def test_ink_npz_roundtrip_and_limit(tmp_path):
     assert len(load_examples(str(tmp_path / "d.ink.npz"), limit=2)) == 2
 
 
-def test_empty_strokes_are_skipped():
-    points = strokes_to_points([[[0.0, 0.0], [0.1, 0.1]], [], [[0.2, 0.0]]])
-    assert points.shape == (5, 3) and points[:, 2].tolist() == [1, 1, 0, 1, 0]
-
-
 def test_score_flags_traces_drawn_twice_and_counts_faint_ink(tmp_path):
     path = [(20, 60), (60, 20), (100, 60), (140, 20), (180, 60)]
     img = Image.new("RGB", (200, 80), "white")
@@ -170,3 +169,21 @@ def test_segment_writes_a_manifest_and_reruns_idempotently(tmp_path):
     rows = read_jsonl(str(tmp_path / "words" / "manifest.jsonl"))
     assert [r["text"] for r in rows] == ["hello", "there", "hi", "everyone"]
     assert all(isinstance(r["baseline"], int) and r["baseline"] > 0 for r in rows)
+
+
+def test_collect_export_converts_to_shared_scale(tmp_path, monkeypatch):
+    import tools.datasets as datasets
+    monkeypatch.setattr(datasets, "RAW", str(tmp_path))
+    (tmp_path / "collect").mkdir()
+    entries = []
+    for i, text in enumerate(["moon", "sun", "cow", "ear", "vase", "swan"]):
+        t = np.linspace(0, 6 * np.pi, 80)
+        pts = [[0.2 + 0.01 * k, 0.6 - 0.05 * (1 + np.sin(a)), 1] for k, a in enumerate(t)]
+        entries.append({"metadata": {"author": "me", "asciiSequence": text, "aspectRatio": 2.0},
+                        "points": pts + [[pts[-1][0], pts[-1][1], 0]]})
+    (tmp_path / "collect" / "export.json").write_text(json.dumps(entries))
+    save_ink(datasets.standardize(datasets.load_collect()), str(tmp_path / "c.ink.npz"))
+    words = load_examples(str(tmp_path / "c.ink.npz"))
+    assert [w["writer"] for w in words] == ["me"] * 6 and words[0]["points"][0, 0] == 0
+    from pengpt import check_data
+    assert check_data(words, 0.02)[1] == []

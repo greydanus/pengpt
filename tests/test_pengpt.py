@@ -5,7 +5,7 @@ import torch
 from pengpt import (augment_params, DataConfig, ModelConfig, PenTransformer, PenDataset, create_datasets,
                     load_for_sampling, save_ink, writer_id, generate, SampleParams,
                     ScribeTokenizer, ByteTokenizer, learn_merges,
-                    IGNORE_INDEX, prepare_word, resample, augment_drawing,
+                    IGNORE_INDEX, prepare_word, resample,
                     save_checkpoint, load_checkpoint, attach_pen_deltas,
                     bresenham_steps, DIRECTIONS, DOWN, UP, _walk)
 
@@ -208,15 +208,6 @@ def test_works_without_word_structure():
     assert len(st.decode(x.numpy())) == 1
 
 
-def test_normalize_keeps_sparse_absolute_shapes():
-    from utils import normalize
-    square = np.array([[0, 0, 1], [255, 0, 1], [255, 255, 1],
-                       [0, 255, 1], [0, 0, 1]], dtype=float)
-    out = normalize(square.copy())
-    assert np.allclose(out[0, :2], out[-1, :2])
-    assert (np.diff(out[:, 0]) < 0).any()
-
-
 def test_byte_tokenizer():
     ct = ByteTokenizer()
     ids = ct.encode("bad café", length=12)
@@ -366,41 +357,6 @@ def test_vectorized_tokenizer_matches_reference():
         steps[rng.random(len(steps)) < 0.1] *= rng.integers(2, 9)
         grid = np.cumsum(steps, axis=0)
         assert _walk(grid) == _walk_reference(grid), trial
-
-
-def test_augment_drawing():
-    from types import SimpleNamespace
-    rng = np.random.default_rng(0)
-    pts = np.array([[0, 0, 1], [1, 0, 1], [1, 0, 0],
-                    [2, 2, 1], [3, 2, 1], [3, 2, 0],
-                    [5, 1, 1], [6, 1, 1], [6, 1, 0]], dtype=float)
-
-    cfg = SimpleNamespace(stroke_dropout=0.0, hflip=0.0, tremor=0.0)
-    assert (augment_drawing(pts, "a scene", cfg, rng) == pts).all()
-
-    cfg = SimpleNamespace(stroke_dropout=0.999, hflip=0.0, tremor=0.0)
-    out = augment_drawing(pts, "a scene", cfg, rng)
-    assert len(out) in (3, 6) and (out[:, 2] == 1).sum() >= 2
-    assert (out[-1, 2] == 0)
-
-    cfg = SimpleNamespace(stroke_dropout=0.0, hflip=1.0, tremor=0.0)
-    out = augment_drawing(pts, "a scene", cfg, rng)
-    assert np.isclose(out[:, 0].min(), pts[:, 0].min())
-    assert np.isclose(out[:, 0].max(), pts[:, 0].max())
-    assert np.isclose(out[0, 0], 6.0)
-    kept = augment_drawing(pts, "a tree on the left", cfg, rng)
-    assert (kept == pts).all()
-
-    line = np.column_stack([np.linspace(0, 1, 60), np.zeros(60), np.ones(60)])
-    line[-1, 2] = 0
-    cfg = SimpleNamespace(stroke_dropout=0.0, hflip=0.0, tremor=0.004)
-    out = augment_drawing(line.copy(), "a scene", cfg, np.random.default_rng(1))
-    assert out.shape == line.shape
-    assert (out[:, 2] == line[:, 2]).all()
-    assert not np.allclose(out[:, :2], line[:, :2])
-    assert np.abs(out[:, 1]).max() < 6 * cfg.tremor
-    assert (augment_drawing(pts, "a scene", cfg,
-                            np.random.default_rng(2)) == pts).all()
 
 
 def test_token_deltas_track_pen_position():
@@ -568,3 +524,15 @@ def test_check_data_accepts_style_and_rejects_bad_scale():
     caps = fake_words(x_height=0.2, text="MANN")
     assert check_data(caps, 0.02)[0]["x_height"] is None and check_data(caps, 0.02)[1] == []
     assert check_data(fake_words(x_height=2.0, text="MANN"), 0.02)[1]
+
+
+def test_worker_batches_match_single_process():
+    from pengpt import infinite_batches
+    cfg = DataConfig(max_seq_length=256, max_words=2, max_text_length=20)
+    words = [make_word(seed=s) for s in range(20)]
+    st = ScribeTokenizer(grid=0.02)
+    ds = PenDataset(words, [f"w{s}" for s in range(20)], np.arange(20), st, ByteTokenizer(), cfg, length=100)
+    inline, pooled = infinite_batches(ds, 4, seed=7, workers=0), infinite_batches(ds, 4, seed=7, workers=2)
+    for _ in range(6):
+        assert all((a == b).all() for a, b in zip(next(inline), next(pooled)))
+    pooled.close()

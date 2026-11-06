@@ -20,3 +20,12 @@ def test_select_per_class_keeps_class_balance():
     keep = select_per_class(scores, labels, fraction=0.25)
     assert len(keep) == 20
     assert (labels[keep] == "cat").sum() == (labels[keep] == "car").sum() == 10
+
+
+def test_normalize_keeps_sparse_absolute_shapes():
+    from deprecated.quickdraw import normalize
+    square = np.array([[0, 0, 1], [255, 0, 1], [255, 255, 1],
+                       [0, 255, 1], [0, 0, 1]], dtype=float)
+    out = normalize(square.copy())
+    assert np.allclose(out[0, :2], out[-1, :2])
+    assert (np.diff(out[:, 0]) < 0).any()
