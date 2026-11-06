@@ -30,8 +30,9 @@ def bucket(rel, bidirectional, n_buckets=32, max_distance=128):
 
 class InkSight:
 
-    def __init__(self, path="inksight", device="cuda", dtype=torch.float32):
+    def __init__(self, path="inksight", device=None, dtype=torch.float32):
         import sentencepiece
+        device = device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
         z = np.load(f"{path}/weights.npz")
         w = {k: torch.from_numpy(z[k]).to(device=device, dtype=dtype) for k in z.files}
         self.w, self.device, self.dtype = w, device, dtype
