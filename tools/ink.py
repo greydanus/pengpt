@@ -63,10 +63,8 @@ LETTER_WEIGHTS = np.maximum([6, 1.5, 2.8, 4.3, 6, 2.2, 2, 6.1, 6, 4, 0.77, 4, 2.
 
 def synth_words(n, seed=0):
     rng = np.random.default_rng(seed)
-    lengths = np.arange(3, 11)
-    p = np.maximum(1 - 0.85 * (lengths - 3) / 7, 0)
-    p[0] *= 0.5
-    p[1] /= 0.8
+    lengths = np.arange(3, 13)
+    p = np.where(lengths >= 8, 4.0, np.where(lengths >= 6, 2.0, 1.0))
     p /= p.sum()
     letters = LETTER_WEIGHTS / LETTER_WEIGHTS.sum()
     words = []

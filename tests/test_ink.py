@@ -200,6 +200,8 @@ def test_synth_words_match_the_bigbank_mix():
     assert 0.12 < share(lambda w: w[-1] in ",.?!") < 0.2
     assert 0.08 < share(lambda w: "(" in w or ")" in w) < 0.12
     assert set("".join(words)) <= set(string.ascii_letters + string.digits + "\"'(),.?!")
+    letters = [len(core(w).replace("'", "")) for w in words if core(w).replace("'", "").isalpha()]
+    assert 8.5 < np.mean(letters) < 9.2 and 0.7 < np.mean([8 <= n <= 12 for n in letters]) < 0.78 and min(letters) == 3
 
 
 def test_score_catches_a_skipped_period(tmp_path):
