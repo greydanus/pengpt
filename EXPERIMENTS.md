@@ -182,3 +182,5 @@ p95 distance from decoded strokes to the original ink, as % of x-height, with to
 | 0.0075 | 16.4 | 2.7 | 2.5 | 2.4 | 119 |
 
 Decode smoothing can't recover detail below the grid: unsmoothed decoding already sits at about half a cell. 0.0125 is the candidate for traced fonts: its p95 error (~0.005 units) is about one InkSight pixel. Finer grids mostly encode tracer noise. Word score is per base pen move, so it doesn't compare across grids.
+
+Trained on bigbank at 4k steps, grid 0.0125 with block 384 ran at 46.8 ms/step (1.8× the 0.02 grid's 25.6) and wrote greedy pangram 8/9 and Iliad 15/17, against 9/9 and 16/17 at grid 0.02. Corners look slightly cleaner, but on this cursive the finer grid doesn't pay for its cost, so 0.02 stays the default. Revisit when traced fonts join the mix; `--grid` is a data setting and can differ per preset.
