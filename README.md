@@ -49,6 +49,11 @@ reported (1 is perfect, 16.5 is chance). This catches a model that ignores
 its prompt. `python pengpt.py rank --checkpoint ...` computes it for a
 saved checkpoint.
 
+`python -m tools.interp --checkpoint out/cursive/best.pt --text "goddess countless"`
+writes four figures to `out/interp/`: which prompt letter each stroke attends
+to, the shape of the next-pen distribution at every step, the token
+embeddings drawn as their strokes, and what each layer encodes.
+
 ## How it works
 
 **Tokens** ([ScribeTokens](https://arxiv.org/abs/2603.02805)). Pen points are
@@ -158,7 +163,7 @@ one scale per recording frame, plus a sheet of samples to eyeball. Sources:
 ```
 pengpt.py     tokenizer, data, model, training, sampling; train/sample/rank/check commands
 utils.py      training presets
-tools/        datasets.py (public corpora), ink.py (image tracing), inksight.py (InkSight in PyTorch), glyphs.py (fonts), pod.sh (RunPod)
+tools/        datasets.py (public corpora), ink.py (image tracing), inksight.py (InkSight in PyTorch), glyphs.py (fonts), pod.sh (RunPod), interp.py (model internals)
 collect.html  data collection page
 tests/        pytest suite
 EXPERIMENTS.md  measured results behind the defaults
