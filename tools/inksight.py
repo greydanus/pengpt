@@ -87,8 +87,10 @@ class InkSight:
         return rms(x, w["encoder__encoder_norm__scale"]), valid
 
     @torch.inference_mode()
-    def generate(self, img, tokens, max_len=MAX_LEN):
+    def generate(self, img, tokens, max_len=MAX_LEN, static=None):
         w, B, dev = self.w, len(img), self.device
+        static = dev != "cuda" if static is None else static
+        slots = torch.arange(max_len, device=dev)
         enc, valid = self.encode(img, tokens)
         cross = [(self.heads(enc, wl["encoder_decoder_attention__key__kernel"]), self.heads(enc, wl["encoder_decoder_attention__value__kernel"]))
                  for wl in self.dec]
@@ -98,11 +100,13 @@ class InkSight:
         tok, out, done = torch.zeros(B, dtype=torch.long, device=dev), [], torch.zeros(B, dtype=torch.bool, device=dev)
         for t in range(max_len):
             x = w["token_embedder__embedding"][tok][:, None]
-            bias = self.dec_bias[..., :t + 1].flip(-1)
+            n = max_len if static else t + 1
+            bias = (self.dec_bias[..., (t - slots).clamp(min=0)] + torch.zeros(max_len, device=dev, dtype=self.dtype).masked_fill(slots > t, -1e10)
+                    if static else self.dec_bias[..., :t + 1].flip(-1))
             for l, wl in enumerate(self.dec):
                 h = rms(x, wl["pre_self_attention_layer_norm__scale"])
                 q, kc[l, :, :, t], vc[l, :, :, t] = (h[:, 0] @ wl["qkv"]).view(B, 3, H, HD).unbind(1)
-                o = F.scaled_dot_product_attention(q[:, :, None], kc[l, :, :, :t + 1], vc[l, :, :, :t + 1], attn_mask=bias[l], scale=1.0)
+                o = F.scaled_dot_product_attention(q[:, :, None], kc[l, :, :, :n], vc[l, :, :, :n], attn_mask=bias[l], scale=1.0)
                 x = x + o.transpose(1, 2).reshape(B, 1, D) @ wl["self_attention__out__kernel"]
                 h = rms(x, wl["pre_cross_attention_layer_norm__scale"])
                 o = F.scaled_dot_product_attention(self.heads(h, wl["encoder_decoder_attention__query__kernel"]), *cross[l], attn_mask=cmask, scale=1.0)
