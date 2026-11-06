@@ -1,6 +1,7 @@
 import argparse
 import collections
 import gzip
+import itertools
 import json
 import os
 import queue
@@ -350,28 +351,36 @@ def check_scale(examples, grid, n=200):
 
 
 def read_items(path, limit=None):
-    path = str(path)
+    yield from itertools.islice(_read_items(str(path)), limit)
+
+
+def _read_items(path):
     if path.endswith(".zip"):
         with zipfile.ZipFile(path) as zf:
             with zf.open(zf.namelist()[0]) as f:
                 yield from json.load(f)
         return
     opener = gzip.open if path.endswith(".gz") else open
-    if ".jsonl" in path:
-        with opener(path, "rt") as f:
-            for n, line in enumerate(f):
-                if limit and n >= limit:
-                    return
-                if line.strip():
-                    yield json.loads(line)
-    else:
-        with opener(path, "rt") as f:
+    with opener(path, "rt") as f:
+        if ".jsonl" in path:
+            yield from (json.loads(line) for line in f if line.strip())
+        else:
             yield from json.load(f)
+
+
+def strokes_to_points(strokes):
+    rows = []
+    for stroke in filter(len, strokes):
+        rows += [(x, y, 1.0) for x, y in stroke] + [(*stroke[-1], 0.0)]
+    return np.array(rows, dtype=float).reshape(-1, 3)
 
 
 def load_examples(path, limit=None):
     examples = []
     for item in read_items(path, limit):
+        if "strokes" in item:
+            examples.append({"text": item["text"], "points": strokes_to_points(item["strokes"])})
+            continue
         points = np.array(item["points"], dtype=float)
         meta = item.get("metadata", {})
         if "aspectRatio" in meta:

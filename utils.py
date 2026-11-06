@@ -1,6 +1,9 @@
+import json
+import zipfile
+
 import numpy as np
 
-from pengpt import INK_HEIGHT
+from pengpt import INK_HEIGHT, _stroke_spans
 
 
 PRESETS = {
@@ -49,3 +52,31 @@ def normalize(points, pen_down_is=1, height_quantile=0.95, absolute=False):
     points[:, 0] -= points[0, 0]
     points[:, 1] -= np.quantile(points[points[:, 2] == 1][:, 1], 0.95)
     return points
+
+
+def points_to_strokes(points):
+    points = np.asarray(points, dtype=float)
+    return [points[a:b, :2].round(5).tolist() for a, b in _stroke_spans(points[:, 2])]
+
+
+def save_strokes(records, path):
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(path.split("/")[-1].removesuffix(".zip"), json.dumps(records))
+
+
+def export_traces(accepted_path, out_path):
+    rows = [json.loads(line) for line in open(accepted_path)]
+    heights = {}
+    for r in rows:
+        ys = np.concatenate([np.asarray(s)[:, 1] for s in r["strokes"]])
+        heights.setdefault(r["source"], []).append(np.quantile(ys, 0.95) - np.quantile(ys, 0.05))
+    scale = {src: INK_HEIGHT / np.median(h) for src, h in heights.items()}
+    records = []
+    for r in rows:
+        k, x0 = scale[r["source"]], r["strokes"][0][0][0]
+        strokes = [[[round((x - x0) * k, 5), round((y - r["baseline"]) * k, 5)] for x, y in s] for s in r["strokes"]]
+        records.append({"text": r["text"], "strokes": strokes, "style": r["style"], "source": r["source"],
+                        "license": r["license"], "qc": {key: r["qc"][key] for key in ("coverage", "precision")}})
+    save_strokes(records, out_path)
+    print(f"exported {len(records)} words from {len(scale)} sources to {out_path}")
+
