@@ -339,9 +339,9 @@ def clean(s, step=0.02, sigma=0.04):
     return np.vstack(out)
 
 
-def write(entry, text, log=None, smooth=True):
+def write(entry, text, log=None):
     strokes = compose(entry, text, layout(entry, text), rails=Rails(entry, text) if entry["cursive"] else None, log=log)
-    return [clean(s) for s in strokes] if entry["cursive"] and smooth else strokes
+    return [clean(s) for s in strokes] if entry["cursive"] else strokes
 
 
 def layout(entry, text, font_dir="data/raw/fonts"):
@@ -392,7 +392,7 @@ def sheet(entry, path, words=("minimum", "Ithaca,", "quick brown", "Hello!", "ju
         ax.set_xlim(pts[:, 0].min() - 0.2, pts[:, 0].min() + max(np.ptp(pts[:, 0]) + 0.4, 9))
         ax.set_ylim(-pts[:, 1].max() - 0.15, -pts[:, 1].min() + 0.15)
         ax.text(pts[:, 0].min() - 0.2, -pts[:, 1].min() + 0.1, f"{w!r}: {len(strokes)} strokes", fontsize=9, va="bottom")
-    fig.suptitle(f"{entry['font']}: strokes numbered in drawing order, dot = start, arrow = direction, dashed = drawn after the word; "
+    fig.suptitle(f"{entry['font']}: strokes numbered in drawing order, dot = start, arrow = direction, dashed = dot or cross; "
                  "grey lines = baseline and x-height", fontsize=11)
     fig.savefig(path, dpi=80)
 
@@ -466,19 +466,8 @@ def build_command(args):
         print(f"  check by eye, strokes against the usual direction: {', '.join(flags)}")
 
 
-def words_command(args):
-    entry = load(args.store)[args.name]
-    rows = []
-    for text in (w.strip() for w in open(args.words) if w.strip()):
-        strokes = write(entry, text)
-        rows.append({"text": text, "strokes": [s.round(4).tolist() for s in strokes], "baseline": 0.0, "style": args.name,
-                     "writer": args.name, "source": entry["font"], "license": args.license})
-    write_jsonl(args.out, rows)
-    print(f"wrote {len(rows)} words in {args.name} to {args.out}")
-
-
 def main():
-    parser = argparse.ArgumentParser(description="pen strokes for a font: trace each glyph with InkSight, review, assemble words")
+    parser = argparse.ArgumentParser(description="pen strokes for a font: trace each glyph with InkSight, review, save the glyphs")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("trace", help="render every glyph (cursive: inside joining context) and trace it with InkSight")
     p.add_argument("--font", required=True)
@@ -489,14 +478,8 @@ def main():
     p.add_argument("--font", required=True)
     p.add_argument("--fixes", default=FIXES)
     p.add_argument("--store", default=STORE)
-    p = sub.add_parser("words", help="assemble words from stored glyphs, as rows like tools/ink.py qc writes")
-    p.add_argument("--name", required=True)
-    p.add_argument("--words", required=True)
-    p.add_argument("--out", required=True)
-    p.add_argument("--license", required=True)
-    p.add_argument("--store", default=STORE)
     args = parser.parse_args()
-    {"trace": trace_command, "build": build_command, "words": words_command}[args.command](args)
+    {"trace": trace_command, "build": build_command}[args.command](args)
 
 
 if __name__ == "__main__":

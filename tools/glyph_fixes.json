@@ -26,9 +26,17 @@
       },
       "F": {
         "note": "leftward hook stroke is part of the letterform"
+      },
+      "H": {
+        "ops": [
+          "drop:4",
+          "join:2,3"
+        ],
+        "note": "user: right stem flows into the crossbar loop; the hook was traced twice"
       }
     },
-    "todo": "H traces as 5 strokes and 4/5 have extra pieces; review once capitals and digits matter"
+    "reviewed": true,
+    "signed_off": true
   },
   "patrickhand_regular": {
     "cursive": false,

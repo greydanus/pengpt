@@ -166,8 +166,12 @@ one scale per recording frame, plus a sheet of samples to eyeball. Sources:
   then assembles any word from those glyphs. `trace --font F` takes about a
   minute on a laptop GPU; `build --font F` applies the by-eye review fixes in
   `tools/glyph_fixes.json`, saves the glyphs to `data/glyphs.json` and draws a
-  review sheet; `words` writes rows for `traces`. Cursive words come out as one
-  stroke, with i/j dots and t/x crosses drawn after the word.
+  review sheet. A cursive word is one stroke that lifts only to dot an i/j or
+  cross a t/x right after that letter, then resumes where it stopped; letters
+  join along the font's centerline. Once a font is signed off in the fixes file,
+  `python -m tools.datasets glyphs --fonts NAME --n 3500` writes its stroke
+  library to `glyphs/` and a dataset of synthetic words to
+  `data/raw/glyphs/NAME/NAME.ink.npz`.
 
 ## Repo map
 
