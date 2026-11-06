@@ -109,9 +109,20 @@ def snap_dots(strokes, found, xh):
     return out
 
 
-def is_mark(s, c):
+def to_path(p, path):
+    a, ab = path[:-1], np.diff(path, axis=0)
+    t = np.clip(((p[:, None] - a[None]) * ab[None]).sum(-1) / ((ab ** 2).sum(-1) + 1e-12), 0, 1)
+    return np.hypot(*(p[:, None] - (a[None] + t[..., None] * ab[None])).transpose(2, 0, 1)).min(1)
+
+
+def is_mark(s, c, others=()):
     ext = np.ptp(s, 0) if len(s) > 1 else np.zeros(2)
-    return (c in "ij" and ext.max() < 0.4) or (c in "tx" and ext[0] > 1.5 * ext[1] and ext[1] < 0.5)
+    if c in "ij":
+        return ext.max() < 0.4
+    if c not in "tx" or ext[0] < 1.5 * ext[1] or ext[1] > 0.5 or len(s) < 5:
+        return False
+    mid = s[len(s) // 4:-(len(s) // 4)]
+    return any(len(o) > 1 and to_path(mid, np.asarray(o)).min() < 0.06 for o in others)
 
 
 def apply_ops(strokes, ops):
@@ -152,10 +163,12 @@ def build(font_path, fixes):
         origin = [row["x0"] + advance(font, row["text"], row["pos"]), row["baseline"] + shift]
         strokes = [(p - origin) / xh for p in strokes]
         if fix.get("cursive") and c.islower():
-            strokes = [p for p in strokes if len(p) == 1 or np.ptp(p, 0).max() > 0.15 or is_mark(p, c)]
-        marks = [k for k, p in enumerate(strokes) if is_mark(p, c)] if high else g.get("marks", [k for k, p in enumerate(strokes) if is_mark(p, c)])
+            strokes = [p for p in strokes if len(p) == 1 or np.ptp(p, 0).max() > 0.15 or c in "ij"]
+        marks = [k for k, p in enumerate(strokes) if is_mark(p, c, strokes[:k] + strokes[k + 1:])] if high else g.get("marks", [k for k, p in enumerate(strokes) if is_mark(p, c, strokes[:k] + strokes[k + 1:])])
         if high:
-            glyphs[c]["high"] = {"strokes": [p.round(4).tolist() for p in strokes], "marks": marks}
+            flat = lambda p: np.ptp(p, 0)[1] < 0.15 and np.ptp(p, 0)[0] < 0.6 and p[:, 1].mean() < -0.6
+            main = [p for p in strokes if not (c in "ij" and np.ptp(p, 0).max() < 0.4) and not (c in "tx" and flat(p))]
+            glyphs[c]["high"] = {"strokes": [p.round(4).tolist() for p in main], "marks": []}
         else:
             glyphs[c] = {**glyphs.get(c, {}), "strokes": [p.round(4).tolist() for p in strokes], "marks": marks}
     return {"font": os.path.basename(font_path), "size": SIZE, "xh": float(xh), "cursive": bool(fix.get("cursive")),
@@ -240,10 +253,12 @@ def compose(entry, text, xs, bridge=1.0, high=-0.55, log=None):
         if c not in g:
             out, marks, prev = out + marks, [], None
             continue
-        glyph = g[c]["high"] if "high" in g[c] and (prev or "").islower() and out and out[-1][-1, 1] < high else g[c]
-        for k, s in enumerate(glyph["strokes"]):
+        use_high = "high" in g[c] and (prev or "").islower() and out and out[-1][-1, 1] < high
+        pieces = [(s, False) for s in g[c]["high"]["strokes"]] + [(g[c]["strokes"][k], True) for k in g[c]["marks"]] if use_high else \
+            [(s, k in g[c]["marks"]) for k, s in enumerate(g[c]["strokes"])]
+        for k, (s, is_mark_piece) in enumerate(pieces):
             s = np.asarray(s) + [x, 0]
-            if k in glyph["marks"]:
+            if is_mark_piece:
                 (marks if entry["cursive"] else out).append(s)
                 continue
             joined = k > 0 or (prev or "").islower() or ((prev or "").isupper() and np.hypot(*(out[-1][-1] - s[0])) < bridge)
