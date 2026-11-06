@@ -5,6 +5,7 @@ import os
 import pickle
 import random
 import zipfile
+import zlib
 
 import numpy as np
 
@@ -237,6 +238,28 @@ def load_traces(path=f"{RAW}/traces/accepted.jsonl"):
     return samples
 
 
+def glyph_samples(entry, words, xs, name, license):
+    from tools.glyphs import compose
+    return [{"text": w, "strokes": [np.asarray(s, float) for s in compose(entry, w, x)], "baseline": 0.0, "frame": name,
+             "writer": name, "style": name, "source": entry["font"], "license": license} for w, x in zip(words, xs)]
+
+
+def font_license(font):
+    for path in glob.glob(f"{RAW}/*/images/manifest.jsonl"):
+        row = json.loads(open(path).readline())
+        if row.get("source") == font:
+            return row["license"]
+    return "unspecified"
+
+
+def load_glyphs(name, n):
+    from tools.glyphs import STORE, layout, load
+    from tools.ink import synth_words
+    entry = load(STORE)[name]
+    words = synth_words(n, seed=zlib.crc32(name.encode()) % 2 ** 31)
+    return glyph_samples(entry, words, [layout(entry, w) for w in words], name, font_license(entry["font"]))
+
+
 LOADERS = {"brush": load_brush, "uji": load_uji, "mathwriting": load_mathwriting, "collect": load_collect,
            "traces": load_traces}
 
@@ -262,10 +285,29 @@ def sheet(records, path, n=40, seed=0):
     plt.close(fig)
 
 
+def glyphs_main(args):
+    from tools.glyphs import FIXES, load
+    fixes = load(FIXES)
+    names = args.fonts or [k for k, f in fixes.items() if f.get("signed_off")]
+    for name in names:
+        if not fixes.get(name, {}).get("signed_off"):
+            raise SystemExit(f"{name}: no human sign-off on its stroke library in {FIXES}")
+        records = standardize(load_glyphs(name, args.n))
+        out = f"{RAW}/glyphs/{name}/{name}.ink.npz"
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        save_ink(records, out)
+        sheet(records, f"{RAW}/glyphs/{name}/{name}_samples.png")
+        print(f"{name}: {len(records)} words -> {out}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="convert downloaded pen datasets to pengpt stroke records")
-    parser.add_argument("names", nargs="+", choices=sorted(LOADERS))
+    parser.add_argument("names", nargs="+", choices=sorted(LOADERS) + ["glyphs"])
+    parser.add_argument("--fonts", nargs="*", default=[], help="glyphs: store names; default every font signed off in tools/glyph_fixes.json")
+    parser.add_argument("--n", type=int, default=3000, help="glyphs: words per font")
     args = parser.parse_args()
+    if args.names == ["glyphs"]:
+        return glyphs_main(args)
     for name in args.names:
         records = standardize(LOADERS[name]())
         out = f"{RAW}/{name}/{name}.ink.npz"

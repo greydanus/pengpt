@@ -65,6 +65,202 @@
           "join:0,1"
         ],
         "note": "one stroke: the traced bar-and-stem stroke flows into the bowl"
+      },
+      "t": {
+        "ops": [
+          "order:1,0"
+        ],
+        "note": "stem first, then the crossbar"
+      },
+      ",": {
+        "prompt": "Derender the ink: {text}",
+        "note": "the recognize prompt draws the comma upward"
+      }
+    },
+    "reviewed": true
+  },
+  "kalam_regular": {
+    "cursive": false,
+    "glyphs": {
+      "h": {
+        "ops": [
+          "join:0,1"
+        ],
+        "note": "the foot of the arch is traced as a separate tiny piece"
+      },
+      "H": {
+        "ops": [
+          "drop:3"
+        ],
+        "note": "stray fragment at the bottom-left"
+      },
+      "T": {
+        "ops": [
+          "reverse:1",
+          "order:1,0"
+        ],
+        "note": "bar first, left to right, then the stem"
+      },
+      ",": {
+        "ops": [
+          "join:0,1",
+          "reverse:0"
+        ],
+        "note": "one stroke, from the head down the tail"
+      },
+      "N": {
+        "note": "starting bottom-left and going up is a normal way to write N"
+      },
+      "Q": {
+        "prompt": "Recognize and derender.",
+        "note": "auto: 1 strokes, cover 1.00 vs 12 strokes, cover 1.00 with the text-hint prompt"
+      }
+    },
+    "reviewed": true
+  },
+  "architectsdaughter_regular": {
+    "cursive": false,
+    "glyphs": {
+      "L": {
+        "prompt": "Recognize and derender.",
+        "note": "auto: 1 strokes, cover 0.95 vs 1 strokes, cover 0.96 with the text-hint prompt"
+      },
+      "'": {
+        "prompt": "Recognize and derender.",
+        "note": "auto: 1 strokes, cover 0.86 vs 1 strokes, cover 0.77 with the text-hint prompt"
+      },
+      "!": {
+        "prompt": "Recognize and derender.",
+        "note": "auto: 1 strokes, cover 0.97 vs 0 strokes, cover 0.09 with the text-hint prompt"
+      },
+      "J": {
+        "prompt": "Recognize and derender. @aspect4",
+        "note": "auto: Recognize and derender. @aspect4, cover 0.92 vs 0.06 with the text-hint prompt"
+      },
+      "x": {
+        "ops": [
+          "reverse:1"
+        ],
+        "note": "second stroke runs top-right to bottom-left"
+      },
+      "A": {
+        "ops": [
+          "reverse:2"
+        ],
+        "note": "crossbar left to right"
+      },
+      "Q": {
+        "ops": [
+          "reverse:0",
+          "order:1,0"
+        ],
+        "note": "bowl first, then the tail flicked down and out"
+      },
+      "4": {
+        "ops": [
+          "reverse:0"
+        ],
+        "note": "starts at the bar and ends coming down the stem"
+      },
+      "N": {
+        "note": "starting bottom-left and going up is a normal way to write N"
+      }
+    },
+    "reviewed": true
+  },
+  "caveat_variable": {
+    "cursive": false,
+    "glyphs": {
+      "f": {
+        "ops": [
+          "reverse:1"
+        ],
+        "note": "crossbar left to right"
+      },
+      "Y": {
+        "ops": [
+          "reverse:1",
+          "order:1,0"
+        ],
+        "note": "left arm first, down to the joint, then the long right stroke"
+      },
+      "Q": {
+        "ops": [
+          "reverse:0",
+          "order:1,0"
+        ],
+        "note": "bowl first, then the tail flicked down and out"
+      },
+      "I": {
+        "ops": [
+          "order:2,0,1"
+        ],
+        "note": "top bar, stem, then bottom bar"
+      },
+      "N": {
+        "note": "starting bottom-left and going up is a normal way to write N"
+      }
+    },
+    "reviewed": true
+  },
+  "indieflower_regular": {
+    "cursive": false,
+    "glyphs": {
+      "N": {
+        "prompt": "Recognize and derender.",
+        "note": "starting bottom-left and going up is a normal way to write N"
+      },
+      "\"": {
+        "note": "this font draws its double quote as two ticks joined at the bottom, so one stroke is faithful"
+      },
+      "'": {
+        "prompt": "Recognize and derender.",
+        "note": "auto: 1 strokes, cover 0.88 vs 1 strokes, cover 0.69 with the text-hint prompt"
+      },
+      "T": {
+        "ops": [
+          "reverse:1",
+          "order:1,0"
+        ],
+        "note": "bar first, left to right, then the stem"
+      },
+      "Q": {
+        "ops": [
+          "reverse:0",
+          "order:1,0"
+        ],
+        "note": "bowl first, then the tail flicked down and out"
+      },
+      "p": {
+        "note": "QUESTION FOR REVIEW: drawn up the stem then around the bowl in one stroke; unusual but possible"
+      },
+      "S": {
+        "note": "starting top-right and heading left is correct for S"
+      }
+    },
+    "reviewed": true
+  },
+  "justanotherhand_regular": {
+    "cursive": false,
+    "glyphs": {
+      "!": {
+        "prompt": "Recognize and derender.",
+        "note": "auto: 2 strokes, cover 0.96 vs 1 strokes, cover 0.91 with the text-hint prompt"
+      },
+      "f": {
+        "ops": [
+          "reverse:0"
+        ],
+        "note": "stem top-down, hook first"
+      },
+      "4": {
+        "ops": [
+          "reverse:0"
+        ],
+        "note": "starts at the bar and ends coming down the stem"
+      },
+      "N": {
+        "note": "starting bottom-left and going up is a normal way to write N"
       }
     },
     "reviewed": true

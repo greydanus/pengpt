@@ -8,7 +8,7 @@ from PIL import Image, ImageDraw
 from pengpt import INK_HEIGHT, load_examples, read_ink, save_ink
 from tools.ink import (detokenize, segment_command, file_hash, levenshtein, on_ink, qc_command, read_jsonl,
                        plain, replace_rows, scale_and_pad, score, split_line, synth_words, write_jsonl)
-from tools.datasets import load_traces, points_to_strokes, standardize
+from tools.datasets import glyph_samples, load_traces, points_to_strokes, standardize
 
 
 def ink_row(spans, h=20, width=400):
@@ -263,3 +263,16 @@ def test_scale_and_pad_maps_a_narrow_word_back_to_its_pixels():
     x, y = (xs.mean() - dx) / ratio, (ys.mean() - dy) / ratio
     assert canvas.size == (224, 224) and abs(x - 29.5) < 1.5 and abs(y - 71.5) < 1.5
     assert ratio < 224 / 100
+
+
+def test_glyph_words_export_at_the_shared_scale():
+    o = [[0.5, -1.0], [0.0, -0.5], [0.5, 0.0], [1.0, -0.5], [0.5, -1.0]]
+    entry = {"font": "f.ttf", "cursive": False, "glyphs": {c: {"strokes": [o], "marks": []} for c in "acemnorsuvwxz"}}
+    words = ["moon", "sun", "cow", "ear", "vase", "swan"]
+    samples = glyph_samples(entry, words, [[1.1 * i for i in range(len(w))] for w in words], "f", "OFL")
+    records = standardize(samples)
+    assert [r["text"] for r in records] == words and all(len(r["strokes"]) == len(w) for r, w in zip(records, words))
+    assert all(r["writer"] == "f" and r["license"] == "OFL" for r in records)
+    from pengpt import check_data
+    pts = [np.c_[np.concatenate(r["strokes"]), np.ones(sum(map(len, r["strokes"])))] for r in records]
+    assert check_data([{"text": r["text"], "points": p} for r, p in zip(records, pts)], 0.02)[1] == []
