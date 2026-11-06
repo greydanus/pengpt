@@ -153,3 +153,32 @@ At the 4-word defaults, 20k steps (10.5 min) scored 0.5943 against 0.5957–0.59
 ## Decode smoothing (Nov 6)
 
 Decoding averages each stroke's grid walk over a few points to hide the 0.02-grid staircase. A 5-point window spans ~0.1 units, close to a full x-height, and visibly rounded corners the real ink has (pointed S tops, angular z, kinks in k). A 3-point window keeps most of that sharpness with slight jaggedness on long straight strokes; it is now the default. This only changes drawing, not training or checkpoints.
+
+## Repeated 4k cycles and the overfitting point (Nov 6)
+
+The 4k schedule (200-step warmup, linear decay to 0 over the last 80%) repeated back to back, resuming each cycle from the last. Scores at cycle ends, where the learning rate has decayed to 0:
+
+| Cycle end | Train loss | Test loss | Score |
+|---|---|---|---|
+| 4k | 1.9653 | 1.8949 | 0.5958 |
+| 8k | 1.9100 | 1.8674 | 0.5885 |
+| **12k** | 1.8833 | **1.8600** | **0.5866** |
+| 16k | 1.8660 | 1.8617 | 0.5871 |
+| 20k | 1.8531 | 1.8664 | 0.5891 |
+| 24k | 1.8424 | 1.8717 | 0.5904 |
+
+Held-out scores bottom out after three cycles (12k steps, ~6.5 min) and rise for three cycles after, while train loss keeps falling: overfitting starts around 12k steps at these defaults. Three cycles beat the single 20k-step run (0.5943) by 0.008. Not yet tested: a single 12k-step decay, to tell whether the restarts or just the length did it.
+
+## Grid resolution (Nov 6)
+
+p95 distance from decoded strokes to the original ink, as % of x-height, with tokens per word (BPE learned per grid):
+
+| Grid | Cells per x-height | PatrickHand traces | BRUSH | bigbank | Tokens/word (traces) |
+|---|---|---|---|---|---|
+| 0.02 | 6.1 | 6.8 | 6.5 | 8.1 | 76 |
+| 0.015 | 8.2 | 5.2 | 4.9 | 4.5 | 89 |
+| 0.0125 | 9.8 | 4.3 | 4.0 | 4.1 | 98 |
+| 0.01 | 12.3 | 3.5 | 3.3 | 4.2 | 107 |
+| 0.0075 | 16.4 | 2.7 | 2.5 | 2.4 | 119 |
+
+Decode smoothing can't recover detail below the grid: unsmoothed decoding already sits at about half a cell. 0.0125 is the candidate for traced fonts: its p95 error (~0.005 units) is about one InkSight pixel. Finer grids mostly encode tracer noise. Word score is per base pen move, so it doesn't compare across grids.
