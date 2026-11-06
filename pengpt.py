@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 
 @dataclass
 class DataConfig:
-    dataset: str = "data/bigbank_3500.json.zip"
+    dataset: str = "data/bigbank_3500.ink.npz"
     max_examples: int = 0
     train_size: int = 500_000
     test_size: int = 3_000
@@ -368,19 +368,69 @@ def _read_items(path):
             yield from json.load(f)
 
 
+INK_UNIT = 1e-3
+INK_META = ("style", "writer", "source", "license")
+
+
+def save_ink(records, path):
+    strokes = [np.rint(np.asarray(s, float) / INK_UNIT).astype(np.int64) for r in records for s in r["strokes"]]
+    points = np.concatenate(strokes)
+    starts = np.cumsum([0] + [len(s) for s in strokes[:-1]])
+    deltas = np.diff(points, axis=0, prepend=points[:1])
+    deltas[starts] = points[starts]
+    assert np.abs(deltas).max() < 2 ** 15, "ink too large for int16 steps; normalize it first"
+    text = [r["text"].encode() for r in records]
+    tables = {k: sorted({str(r.get(k, "")) for r in records}) for k in INK_META}
+    np.savez_compressed(
+        path, deltas=deltas.astype(np.int16), stroke_len=np.array([len(s) for s in strokes], np.uint16),
+        n_strokes=np.array([len(r["strokes"]) for r in records], np.uint16),
+        text=np.frombuffer(b"".join(text), np.uint8), text_len=np.array([len(t) for t in text], np.uint16),
+        tables=np.frombuffer(json.dumps(tables).encode(), np.uint8),
+        **{k: np.array([tables[k].index(str(r.get(k, ""))) for r in records], np.uint16) for k in INK_META})
+
+
+def _decode_ink(path):
+    z = np.load(path)
+    lens = z["stroke_len"].astype(int)
+    starts = np.r_[0, np.cumsum(lens)[:-1]]
+    total = np.cumsum(z["deltas"].astype(np.int64), axis=0)
+    before = np.vstack([np.zeros((1, 2), np.int64), total])[starts]
+    flat = (total - np.repeat(before, lens, axis=0)) * INK_UNIT
+    texts = [t.tobytes().decode() for t in np.split(z["text"], np.cumsum(z["text_len"].astype(int))[:-1])]
+    first = np.r_[0, np.cumsum(z["n_strokes"].astype(int))]
+    return z, flat, lens, texts, first
+
+
+def read_ink(path):
+    z, flat, lens, texts, first = _decode_ink(path)
+    tables = json.loads(z["tables"].tobytes())
+    strokes = np.split(flat, np.cumsum(lens)[:-1])
+    return [{"text": texts[i], "strokes": strokes[first[i]:first[i + 1]],
+             **{k: tables[k][int(z[k][i])] for k in INK_META}} for i in range(len(texts))]
+
+
+def read_ink_points(path):
+    _, flat, lens, texts, first = _decode_ink(path)
+    ends = np.cumsum(lens)
+    rows = np.insert(np.c_[flat, np.ones(len(flat))], ends, np.c_[flat[ends - 1], np.zeros(len(ends))], axis=0)
+    per_word = np.diff(np.r_[0, np.cumsum(lens + 1)][first])
+    return texts, np.split(rows, np.cumsum(per_word)[:-1])
+
+
 def strokes_to_points(strokes):
-    rows = []
-    for stroke in filter(len, strokes):
-        rows += [(x, y, 1.0) for x, y in stroke] + [(*stroke[-1], 0.0)]
-    return np.array(rows, dtype=float).reshape(-1, 3)
+    parts = [np.c_[np.asarray(s, float), np.ones(len(s))] for s in strokes if len(s)]
+    parts = [np.vstack([p, [p[-1, 0], p[-1, 1], 0.0]]) for p in parts]
+    return np.vstack(parts) if parts else np.zeros((0, 3))
 
 
 def load_examples(path, limit=None):
+    if str(path).endswith(".ink.npz"):
+        texts, points = read_ink_points(path)
+        examples = [{"text": t, "points": p} for t, p in zip(texts, points)][:limit]
+        print(f"Loaded {len(examples)} examples from {path}")
+        return examples
     examples = []
     for item in read_items(path, limit):
-        if "strokes" in item:
-            examples.append({"text": item["text"], "points": strokes_to_points(item["strokes"])})
-            continue
         points = np.array(item["points"], dtype=float)
         meta = item.get("metadata", {})
         if "aspectRatio" in meta:

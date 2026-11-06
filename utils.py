@@ -1,14 +1,13 @@
 import json
-import zipfile
 
 import numpy as np
 
-from pengpt import INK_HEIGHT, _stroke_spans
+from pengpt import INK_HEIGHT, _stroke_spans, save_ink
 
 
 PRESETS = {
     "cursive": dict(
-        dataset="data/bigbank_3500.json.zip",
+        dataset="data/bigbank_3500.ink.npz",
         showcase="Sing, O Muse, of Odysseus|The quick brown fox|Ithaca, 1184 BC.",
         out_dir="out/cursive",
     ),
@@ -59,11 +58,6 @@ def points_to_strokes(points):
     return [points[a:b, :2].round(5).tolist() for a, b in _stroke_spans(points[:, 2])]
 
 
-def save_strokes(records, path):
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(path.split("/")[-1].removesuffix(".zip"), json.dumps(records))
-
-
 def export_traces(accepted_path, out_path):
     rows = [json.loads(line) for line in open(accepted_path)]
     heights = {}
@@ -75,8 +69,8 @@ def export_traces(accepted_path, out_path):
     for r in rows:
         k, x0 = scale[r["source"]], r["strokes"][0][0][0]
         strokes = [[[round((x - x0) * k, 5), round((y - r["baseline"]) * k, 5)] for x, y in s] for s in r["strokes"]]
-        records.append({"text": r["text"], "strokes": strokes, "style": r["style"], "source": r["source"],
-                        "license": r["license"], "qc": {key: r["qc"][key] for key in ("coverage", "precision")}})
-    save_strokes(records, out_path)
+        records.append({"text": r["text"], "strokes": strokes, "style": r["style"],
+                        "writer": r.get("writer", r["source"]), "source": r["source"], "license": r["license"]})
+    save_ink(records, out_path)
     print(f"exported {len(records)} words from {len(scale)} sources to {out_path}")
 

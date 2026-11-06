@@ -251,16 +251,22 @@ correctly.
 
 ## Training on your own pen data
 
-The dataset format is a JSON list (optionally zipped) or JSON Lines, one item
-per word:
+Datasets are `.ink.npz` files: one record per word, each a text, a list of
+strokes (pen-down polylines of `[x, y]`), and its style, writer, source and
+license. Build one from Python and train on it directly:
 
-```json
-{"text": "hello", "points": [[0.0, 0.1, 1], [0.01, 0.12, 1], ...]}
+```python
+from pengpt import save_ink
+save_ink([{"text": "hello", "strokes": [[[0.0, 0.0], [0.01, -0.02], ...], ...],
+           "style": "my_hand", "writer": "me", "source": "tablet", "license": "MIT"}],
+         "data/mine.ink.npz")
 ```
 
-`pen` is 1 while the pen is down; a `pen = 0` point is a lift. y grows downward,
-the baseline sits near y = 0, and lowercase letters are roughly 0.1–0.3 units
-tall.
+y grows downward, the baseline sits at y = 0, and lowercase letters are
+roughly 0.1–0.3 units tall. Coordinates are stored in steps of 0.001, so a
+word costs a few hundred bytes; BRUSH's 85,349 words fit in 32 MB and load in
+under two seconds. Older JSON files of `{"text", "points": [[x, y, pen], ...]}`
+still load.
 
 - **Collect your own**: open `collect.html` in a browser, write with a
   mouse/trackpad, export JSON. This is how the bundled `bigbank_3500` dataset

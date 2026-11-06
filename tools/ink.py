@@ -11,6 +11,7 @@ from scipy import ndimage
 
 SIZE = 224
 UP = 4
+INK_LEVEL = 200
 
 
 def read_jsonl(path):
@@ -93,42 +94,105 @@ def split_line(ink_row, tokens, h):
     return words
 
 
+def shear(rows, center, slant, margin):
+    out = np.zeros((rows.shape[0], rows.shape[1] + 2 * margin), rows.dtype)
+    for i, row in enumerate(rows):
+        shift = margin + int(round((i - center) * slant))
+        out[i, shift:shift + rows.shape[1]] = row
+    return out
+
+
+def estimate_slant(ink, bands):
+    def sharpness(t):
+        m = int(np.ceil(abs(t) * ink.shape[0])) + 1
+        return sum((shear(ink[a:b], (b - a) / 2, t, m).sum(0).astype(float) ** 2).sum() for a, b in bands)
+    return max(np.linspace(-1.2, 1.2, 49), key=sharpness)
+
+
 def segment_command(args):
     page = Image.open(args.page)
     norm = flatten(page)
     ink = ink_mask(norm)
     lines = [l.strip() for l in open(args.transcript) if l.strip()]
-    rows_ink = ndimage.uniform_filter1d(ink.sum(1).astype(float), 25)
-    band = rows_ink > 0.15 * rows_ink.max()
-    runs = np.flatnonzero(np.diff(np.r_[0, band.astype(int), 0]))
-    bands = [(a, b) for a, b in zip(runs[::2], runs[1::2]) if b - a > 15]
-    if len(bands) != len(lines):
-        raise SystemExit(f"found {len(bands)} text lines but the transcript has {len(lines)}")
+    from scipy.signal import find_peaks
+    profile = ndimage.uniform_filter1d(ink.sum(1).astype(float), 9)
+    peaks, props = find_peaks(profile, distance=max(5, ink.shape[0] // (2 * len(lines))), prominence=0)
+    if len(peaks) < len(lines):
+        raise SystemExit(f"found {len(peaks)} text lines but the transcript has {len(lines)}")
+    peaks = np.sort(peaks[np.argsort(props["prominences"])[::-1][:len(lines)]])
+    q = max(4, int(0.2 * (np.median(np.diff(peaks)) if len(peaks) > 1 else ink.shape[0])))
+    bands = [(max(0, p - q), min(ink.shape[0], p + q)) for p in peaks]
     os.makedirs(args.out, exist_ok=True)
     stem = os.path.splitext(os.path.basename(args.page))[0]
-    rows, skipped = [], []
+    faint = ink_mask(norm, weak=0.90) & ndimage.binary_dilation(norm < 0.75, iterations=4)
+    slant = estimate_slant(ink, bands)
+    print(f"estimated slant: {np.degrees(np.arctan(slant)):.0f} degrees from vertical")
+    ys_all, xs_all = np.mgrid[0:ink.shape[0], 0:ink.shape[1]]
+    rows, skipped, boxes = [], [], []
     for li, ((a, b), text) in enumerate(zip(bands, lines)):
+        continued = li > 0 and lines[li - 1].endswith(("=", "-"))
         h = b - a
         y0, y1 = max(0, a - h // 2), min(ink.shape[0], b + h // 2)
         tokens = text.split()
-        words = split_line(ink[a:b], tokens, h)
+        center = (a + b) / 2
+        alone = faint.copy()
+        for a2, b2 in bands:
+            if (a2, b2) != (a, b):
+                alone[a2:b2] = False
+        labels, _ = ndimage.label(alone, structure=np.ones((3, 3)))
+        margin = int(np.ceil(abs(slant) * ink.shape[0])) + 1
+        words = split_line(shear(ink[a:b], center - a, slant, margin), tokens, h)
         if words is None:
             skipped.append(text)
             continue
         for wi, ((s, e), token) in enumerate(zip(words, tokens)):
-            if token.endswith(("=", "-")) or not token.strip(".,;:!?\"'"):
+            if token.endswith(("=", "-")) or (continued and wi == 0) or not token.strip(".,;:!?\"'"):
                 continue
             pad = h // 4
-            x0, x1 = max(0, s - pad), min(ink.shape[1], e + pad)
-            n = upsample(norm[y0:y1, x0:x1])
+            sheared_x = xs_all + np.rint((ys_all - center) * slant).astype(int) + margin
+            core = labels[a + h // 4:b - h // 4] * ((sheared_x[a + h // 4:b - h // 4] >= s) & (sheared_x[a + h // 4:b - h // 4] < e))
+            mine = np.unique(core[core > 0])
+            left = (words[wi - 1][1] + s) // 2 if wi else s - pad
+            right = (e + words[wi + 1][0]) // 2 if wi + 1 < len(words) else e + pad
+            keep = np.isin(labels, mine) & (sheared_x >= left) & (sheared_x < right)
+            if not keep.any():
+                continue
+            ys, xs = np.nonzero(keep)
+            y0, y1 = max(0, ys.min() - pad), min(ink.shape[0], ys.max() + pad)
+            x0, x1 = max(0, xs.min() - pad), min(ink.shape[1], xs.max() + pad)
+            near = ndimage.binary_dilation(keep, iterations=2)[y0:y1, x0:x1]
+            word = np.where(near, norm[y0:y1, x0:x1], 1.0)
+            boxes.append((x0, y0, x1, y1, token))
+            n = upsample(word)
             path = f"{args.out}/{stem}_{li:02d}_{wi:02d}.png"
             tone(n, ink_mask(n) | (n < 0.92)).save(path)
-            rows.append({"image": path, "text": token, "baseline": (b - y0) * UP, "style": args.style,
+            rows.append({"image": path, "text": token, "baseline": int((b - y0) * UP), "style": args.style,
                          "source": os.path.basename(args.page), "license": args.license})
     replace_rows(f"{args.out}/manifest.jsonl", rows, os.path.basename(args.page))
     print(f"{stem}: {len(rows)} words from {len(lines) - len(skipped)}/{len(lines)} lines")
+    if args.overview:
+        overview(page, boxes, bands, lines, skipped, args.overview)
     for text in skipped:
         print(f"  skipped (could not split confidently): {text}")
+
+
+def overview(page, boxes, bands, lines, skipped, path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    w, h = page.size
+    fig, ax = plt.subplots(figsize=(12, 12 * h / w))
+    ax.imshow(page.convert("L"), cmap="gray")
+    for x0, y0, x1, y1, token in boxes:
+        ax.add_patch(plt.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, color="tab:blue", lw=1))
+        ax.text(x0, y0, token, color="tab:blue", fontsize=7, va="bottom")
+    for (a, b), text in zip(bands, lines):
+        if text in skipped:
+            ax.text(2, (a + b) / 2, "SKIPPED LINE", fontsize=7, va="center",
+                    bbox=dict(facecolor="white", edgecolor="black", lw=0.5))
+    ax.axis("off")
+    fig.savefig(path, dpi=110, bbox_inches="tight")
+    print(f"overview: {path}")
 
 
 def scale_and_pad(img):
@@ -161,7 +225,7 @@ def detokenize(text):
 
 
 def on_ink(strokes, img, radius=3):
-    ink = ndimage.binary_dilation(np.asarray(img.convert("L")) < 128, iterations=radius)
+    ink = ndimage.binary_dilation(np.asarray(img.convert("L")) < INK_LEVEL, iterations=radius)
     h, w = ink.shape
     touches = lambda s: any(ink[min(max(int(round(y)), 0), h - 1), min(max(int(round(x)), 0), w - 1)] for x, y in s)
     return [s for s in strokes if touches(s)]
@@ -206,9 +270,9 @@ def levenshtein(a, b):
 
 def score(item, cand):
     gray = np.asarray(Image.open(item["image"]).convert("L"))
-    ink = gray < 128
+    ink = gray < INK_LEVEL
     if not ink.any() or not cand["strokes"]:
-        return {"coverage": 0.0, "precision": 0.0, "points": 0}
+        return {"coverage": 0.0, "precision": 0.0, "length_ratio": 0.0, "points": 0}
     width = max(2.0, 2 * np.median(ndimage.distance_transform_edt(ink)[ink]))
     canvas = Image.new("L", (gray.shape[1], gray.shape[0]), 0)
     draw = ImageDraw.Draw(canvas)
@@ -228,6 +292,7 @@ def score(item, cand):
     pts = np.clip(np.rint(np.asarray(pts)).astype(int), 0, [gray.shape[1] - 1, gray.shape[0] - 1])
     return {"coverage": float((ink & path).sum() / ink.sum()),
             "precision": float(near[pts[:, 1], pts[:, 0]].mean()),
+            "length_ratio": float(len(pts) * width / ink.sum()),
             "points": int(len(pts))}
 
 
@@ -247,6 +312,7 @@ def qc_command(args):
             q["read_error"] = levenshtein(c["read"].lower(), label) / len(label) if c["read"] else None
             q["prompt"] = c["prompt"]
             q["passed"] = (q["coverage"] >= args.min_coverage and q["precision"] >= args.min_precision
+                           and q["length_ratio"] <= args.max_length_ratio
                            and (q["read_error"] is None or q["read_error"] <= args.max_read_error))
             key = (q["passed"], q["coverage"] * q["precision"])
             if best is None or key > best[0]:
@@ -282,6 +348,7 @@ def review_sheet(accepted, rejected, path, per_page=24):
             if len(s):
                 b.plot(s[:, 0], s[:, 1], color="black", lw=1.2)
         detail = (f"cov {q.get('coverage', 0):.2f}  prec {q.get('precision', 0):.2f}  "
+                  f"len {q.get('length_ratio', 0):.2f}  "
                   f"read {q.get('read', '')!r}" if "coverage" in q else q.get("reason", ""))
         b.set_title(detail, loc="left", fontsize=7, pad=2)
         for ax in (a, b):
@@ -306,6 +373,7 @@ def main():
     p = sub.add_parser("segment", parents=[meta], help="cut a page scan into labeled, cleaned word images")
     p.add_argument("--page", required=True)
     p.add_argument("--transcript", required=True, help="one line of text per written line")
+    p.add_argument("--overview", default="", help="write the page with every crop box drawn on it")
     p.add_argument("--out", required=True)
     p = sub.add_parser("trace", help="trace word images with InkSight; resumable")
     p.add_argument("--manifest", required=True)
@@ -320,6 +388,7 @@ def main():
     p.add_argument("--min_coverage", type=float, default=0.88)
     p.add_argument("--min_precision", type=float, default=0.90)
     p.add_argument("--max_read_error", type=float, default=0.34)
+    p.add_argument("--max_length_ratio", type=float, default=1.3)
     args = parser.parse_args()
     {"render": render_command, "segment": segment_command, "trace": trace_command,
      "qc": qc_command}[args.command](args)
