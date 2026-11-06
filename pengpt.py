@@ -382,7 +382,7 @@ def save_ink(records, path):
     text = [r["text"].encode() for r in records]
     tables = {k: sorted({str(r.get(k, "")) for r in records}) for k in INK_META}
     np.savez_compressed(
-        path, deltas=deltas.astype(np.int16), stroke_len=np.array([len(s) for s in strokes], np.uint16),
+        path, unit=np.array(INK_UNIT), deltas=deltas.astype(np.int16), stroke_len=np.array([len(s) for s in strokes], np.uint16),
         n_strokes=np.array([len(r["strokes"]) for r in records], np.uint16),
         text=np.frombuffer(b"".join(text), np.uint8), text_len=np.array([len(t) for t in text], np.uint16),
         tables=np.frombuffer(json.dumps(tables).encode(), np.uint8),
@@ -395,7 +395,7 @@ def _decode_ink(path):
     starts = np.r_[0, np.cumsum(lens)[:-1]]
     total = np.cumsum(z["deltas"].astype(np.int64), axis=0)
     before = np.vstack([np.zeros((1, 2), np.int64), total])[starts]
-    flat = (total - np.repeat(before, lens, axis=0)) * INK_UNIT
+    flat = (total - np.repeat(before, lens, axis=0)) * (float(z["unit"]) if "unit" in z.files else INK_UNIT)
     texts = [t.tobytes().decode() for t in np.split(z["text"], np.cumsum(z["text_len"].astype(int))[:-1])]
     first = np.r_[0, np.cumsum(z["n_strokes"].astype(int))]
     return z, flat, lens, texts, first
