@@ -143,12 +143,10 @@ one scale per recording frame, plus a sheet of samples to eyeball. Sources:
 - `brush`, `uji`, `mathwriting`: public datasets.
 - `traces`: `accepted.jsonl` from `tools/ink.py`, which turns images into
   strokes. `words` makes bigbank-style labels, `render` (from a font) or
-  `segment` (from a page scan) makes word images, `trace` traces them with
-  InkSight, and `qc --out data/raw/traces/accepted.jsonl` keeps traces that
-  match the ink (`pip install -e ".[ink]"`). `trace` runs `tools/inksight.py`,
-  a PyTorch port of InkSight-Small-p with a cached decoder, about 100x faster
+  `segment` (from a page scan) makes word images (`pip install -e ".[ink]"`).
+  Tracing uses `tools/inksight.py`, a PyTorch port of InkSight-Small-p with a cached decoder, about 100x faster
   than the original on a GPU (43 ms/word on an RTX 4090); `export` (needs TensorFlow, once) writes its weights.
-  `tools/pod.sh` runs all of this on a RunPod GPU, and `peek` draws traces
+  `tools/pod.sh` runs harvests on a RunPod GPU, and `peek` draws traces
   over their images to check quality.
   For real handwriting, `python -m tools.harvest --manifest m.jsonl --out dir`
   does it in one streaming, resumable pass: raw, cleaned and monoline image

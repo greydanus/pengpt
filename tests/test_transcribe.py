@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 
-from tools.transcribe import Transcriber, screen
+from tools.transcribe import Transcriber, label
 
 
 class FakeClient:
@@ -34,10 +34,8 @@ def test_transcriber_stops_at_its_cost_cap():
         tr([Image.new("RGB", (60, 30))])
 
 
-def test_screen_drops_the_worst_sources_then_illegible_words():
-    rows = [{"image": f"{i}.png", "writer": w} for i, w in enumerate(["good"] * 6 + ["bad"] * 2 + ["mid"] * 2)]
-    reads = [("x", 9)] * 5 + [("y", 2)] + [("z", 3)] * 2 + [("q", 6)] * 2
-    kept, dropped, score = screen(rows, reads, drop=0.2, min_legibility=4)
-    assert score["bad"] == 3 and {r["writer"] for r in kept} == {"good", "mid"}
-    assert sorted(r["dropped"].split()[0] for r in dropped) == ["legibility", "source", "source"]
-    assert all(r["text"] for r in kept)
+def test_label_keeps_human_labels_and_drops_illegible_words():
+    rows = [{"image": "a.png", "text": "cat"}, {"image": "b.png"}, {"image": "c.png"}]
+    kept, dropped = label(rows, [("cot", 8), ("dog", 7), ("x", 2)], min_legibility=4)
+    assert [(r["text"], r["read"]) for r in kept] == [("cat", "cot"), ("dog", "dog")]
+    assert dropped[0]["dropped"] == "legibility 2"

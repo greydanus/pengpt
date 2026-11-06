@@ -9,13 +9,16 @@ import numpy as np
 from PIL import Image
 from scipy import ndimage
 
-from tools.transcribe import source_of
 from tools.ink import file_hash, flatten, ink_context, ink_mask, join_strokes, judge, read_jsonl, write_jsonl
 
 TEXT, PLAIN = "Derender the ink: {text}", "Recognize and derender."
 ROUNDS = [[("mono", PLAIN)], [("raw", PLAIN), ("clean", TEXT), ("mono", TEXT)]]
 MAX_SIDE, MAX_HEIGHT = 1024, 320
-WEAK, WHITE = float(os.environ.get("HARVEST_WEAK", 0.8)), float(os.environ.get("HARVEST_WHITE", 0.95))
+WEAK, WHITE = 0.8, 0.95
+
+
+def source_of(row, key=None):
+    return str(row.get(key) if key else row.get("writer") or row.get("source") or row.get("set") or "")
 
 
 def shrink(img):

@@ -6,7 +6,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from pengpt import INK_HEIGHT, load_examples, read_ink, save_ink
-from tools.ink import (detokenize, segment_command, file_hash, levenshtein, on_ink, qc_command, read_jsonl,
+from tools.ink import (detokenize, segment_command, file_hash, levenshtein, on_ink, read_jsonl,
                        plain, replace_rows, scale_and_pad, score, split_line, synth_words, write_jsonl)
 from tools.datasets import glyph_samples, load_traces, points_to_strokes, standardize
 
@@ -112,25 +112,6 @@ def test_replace_rows_is_idempotent(tmp_path):
     replace_rows(path, [{"image": "b1.png", "source": "b"}], "b")
     replace_rows(path, page_a, "a")
     assert sorted(r["image"] for r in read_jsonl(path)) == ["a1.png", "a2.png", "b1.png"]
-
-
-def test_qc_ignores_traces_of_a_changed_image(tmp_path):
-    img = Image.new("RGB", (200, 80), "white")
-    path = [(20, 60), (60, 20), (100, 60), (140, 20), (180, 60)]
-    ImageDraw.Draw(img).line(path, fill="black", width=4)
-    image = str(tmp_path / "w.png")
-    img.save(image)
-    manifest, traces, out = (str(tmp_path / f) for f in ("m.jsonl", "t.jsonl", "acc.jsonl"))
-    write_jsonl(manifest, [{"image": image, "text": "wave", "source": "s"}])
-    write_jsonl(traces, [{"image": image, "hash": file_hash(image), "prompt": "p", "strokes": [path], "read": ""}])
-    args = Namespace(manifest=manifest, traces=traces, out=out, sheet="",
-                     min_coverage=0.85, min_mark=0.5, min_precision=0.9, max_retrace=0.35, max_mark_length=1.95, max_read_error=0.34, max_length_ratio=1.6)
-    qc_command(args)
-    assert len(read_jsonl(out)) == 1
-    ImageDraw.Draw(img).line([(10, 10), (190, 10)], fill="black", width=4)
-    img.save(image)
-    qc_command(args)
-    assert read_jsonl(out) == []
 
 
 def test_ink_npz_roundtrip_and_limit(tmp_path):

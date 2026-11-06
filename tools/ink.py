@@ -5,7 +5,6 @@ import os
 import random
 import re
 import string
-import time
 import unicodedata
 
 import numpy as np
@@ -16,7 +15,7 @@ from scipy.spatial import cKDTree
 SIZE = 224
 UP = 4
 INK_LEVEL = 200
-MIN_ASPECT = float(os.environ.get("INK_MIN_ASPECT", 2.5))
+MIN_ASPECT = 2.5
 
 
 def read_jsonl(path):
@@ -323,47 +322,6 @@ def export_command(args):
     print(f"exported {len(ops)} InkSight weights and its tokenizer to {args.out}")
 
 
-def tf_tracer():
-    import tensorflow as tf
-    import tensorflow_text
-    from huggingface_hub import from_pretrained_keras
-    serve = from_pretrained_keras("Derendering/InkSight-Small-p").signatures["serving_default"]
-
-    def trace(images, texts, prompt):
-        padded = [scale_and_pad(img) for img in images]
-        encoded = tf.stack([tf.reshape(tf.io.encode_jpeg(np.asarray(c)), (1,)) for c, _, _, _ in padded])
-        out = serve(**{"input_text": tf.constant([prompt.replace("{text}", t) for t in texts]), "image/encoded": encoded})
-        rows = []
-        for o, (_, ratio, dx, dy) in zip(out["output_0"].numpy(), padded):
-            raw = o[0].decode()
-            rows.append(([[[(x - dx) / ratio, (y - dy) / ratio] for x, y in s] for s in detokenize(raw)],
-                         re.sub(r"<[^>]+>", "", raw).strip()))
-        return rows
-    return trace
-
-
-def torch_tracer(path):
-    from tools.inksight import InkSight
-    model = InkSight(path)
-    return lambda images, texts, prompt: model.trace(images, texts, prompt)
-
-
-def trace_command(args):
-    trace = torch_tracer(args.inksight) if args.engine == "torch" else tf_tracer()
-    items = list({it["hash"]: it for it in ({**it, "hash": file_hash(it["image"])} for it in read_jsonl(args.manifest))}.values())
-    done = {(r.get("hash"), r["prompt"]) for r in read_jsonl(args.out)}
-    t0, n = time.time(), 0
-    for prompt in args.prompts:
-        todo = sorted((it for it in items if (it["hash"], prompt) not in done), key=lambda it: len(it["text"]))
-        for i in range(0, len(todo), args.batch):
-            chunk = todo[i:i + args.batch]
-            out = trace([Image.open(it["image"]).convert("RGB") for it in chunk], [it["text"] for it in chunk], prompt)
-            write_jsonl(args.out, [{"image": it["image"], "hash": it["hash"], "prompt": prompt, "strokes": strokes,
-                                    "read": read, "engine": args.engine} for it, (strokes, read) in zip(chunk, out)], "a")
-            n += len(chunk)
-            print(f"[{prompt}] {i + len(chunk)}/{len(todo)} | {(time.time() - t0) / n:.2f} s/word", flush=True)
-
-
 def levenshtein(a, b):
     row = list(range(len(b) + 1))
     for i, ca in enumerate(a, 1):
@@ -467,41 +425,12 @@ def judge(item, cand, args=RULES, ctx=None):
     return c, q
 
 
-def qc_command(args):
-    items = {it["image"]: it for it in read_jsonl(args.manifest)}
-    cands = {}
-    for c in read_jsonl(args.traces):
-        cands.setdefault(c.get("hash"), []).append(c)
-    accepted, rejected = [], []
-    for image, item in items.items():
-        best = None
-        for c in cands.get(file_hash(image), []):
-            c, q = judge(item, c, args)
-            key = (q["passed"], q["coverage"] * q["precision"])
-            if best is None or key > best[0]:
-                best = (key, q, c)
-        if best is None:
-            rejected.append({**item, "qc": {"reason": "no trace"}})
-            continue
-        _, q, c = best
-        row = {**item, "strokes": c["strokes"], "qc": q}
-        (accepted if q["passed"] else rejected).append(row)
-    write_jsonl(args.out, accepted)
-    write_jsonl(os.path.splitext(args.out)[0] + "_rejected.jsonl", rejected)
-    write_jsonl(os.path.splitext(args.out)[0] + "_retry.jsonl",
-                [{k: r[k] for k in ("image", "text", "baseline")} for r in rejected if "reason" not in r["qc"]])
-    print(f"accepted {len(accepted)} / {len(items)} ({100 * len(accepted) / max(1, len(items)):.0f}%), "
-          f"rejected {len(rejected)}")
-    if args.sheet:
-        review_sheet(accepted, rejected, args.sheet)
-
-
 def peek_command(args):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     items = {file_hash(it["image"]): it for it in read_jsonl(args.manifest)}
-    rows = [r for r in read_jsonl(args.traces) if r.get("hash") in items and r.get("prompt", "").startswith(args.prompt)]
+    rows = [r for r in read_jsonl(args.traces) if r.get("hash") in items]
     if args.worst:
         sign = 1 if args.worst in ("coverage", "precision", "min_mark") else -1
         rows = sorted(rows, key=lambda r: sign * judge(items[r["hash"]], r, args)[1][args.worst])[:args.n]
@@ -536,36 +465,9 @@ def peek_command(args):
     print(f"peek: {len(rows)} random traces -> {args.out}")
 
 
-def review_sheet(accepted, rejected, path, per_page=24):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    rows = [("ACCEPTED", r) for r in accepted[:per_page]] + [("REJECTED", r) for r in rejected[:per_page]]
-    fig, axes = plt.subplots(len(rows), 2, figsize=(8, 1.1 * len(rows) + 0.5), squeeze=False)
-    for (verdict, r), (a, b) in zip(rows, axes):
-        img = Image.open(r["image"])
-        a.imshow(img)
-        q = r["qc"]
-        a.set_title(f"{verdict}  {r['text']!r}", loc="left", fontsize=8, pad=2)
-        b.imshow(img, alpha=0.2)
-        for s in r.get("strokes", []):
-            s = np.asarray(s)
-            if len(s):
-                b.plot(s[:, 0], s[:, 1], color="black", lw=1.2)
-        detail = (f"cov {q.get('coverage', 0):.2f}  mark {q.get('min_mark', 0):.2f}  prec {q.get('precision', 0):.2f}  "
-                  f"len {q.get('length_ratio', 0):.2f}  "
-                  f"read {q.get('read', '')!r}" if "coverage" in q else q.get("reason", ""))
-        b.set_title(detail, loc="left", fontsize=7, pad=2)
-        for ax in (a, b):
-            ax.axis("off")
-    fig.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01, hspace=0.6, wspace=0.05)
-    fig.savefig(path, dpi=90, bbox_inches="tight")
-    print(f"review sheet: {path}")
-
-
 def main():
-    parser = argparse.ArgumentParser(description="handwriting images to pen strokes: render or segment, "
-                                                 "trace with InkSight, quality-check")
+    parser = argparse.ArgumentParser(description="word images and their pen strokes: make word lists, render or segment images, "
+                                                 "export InkSight weights, review traces (tracing itself is tools/harvest.py)")
     sub = parser.add_subparsers(dest="command", required=True)
     meta = argparse.ArgumentParser(add_help=False)
     meta.add_argument("--style", required=True)
@@ -586,30 +488,19 @@ def main():
     p.add_argument("--out", required=True)
     p = sub.add_parser("export", help="InkSight weights and tokenizer for the torch engine (needs TensorFlow)")
     p.add_argument("--out", default="inksight")
-    p = sub.add_parser("trace", help="trace word images with InkSight; resumable")
-    p.add_argument("--manifest", required=True)
-    p.add_argument("--out", required=True)
-    p.add_argument("--batch", type=int, default=64)
-    p.add_argument("--prompts", nargs="+", default=["Derender the ink: {text}"])
-    p.add_argument("--engine", default="torch", choices=["torch", "tf"])
-    p.add_argument("--inksight", default="inksight", help="torch engine: dir written by export")
     rules = argparse.ArgumentParser(add_help=False)
     rules.add_argument("--manifest", required=True)
     rules.add_argument("--traces", required=True)
     for k, v in vars(RULES).items():
         rules.add_argument(f"--{k}", type=float, default=v)
-    p = sub.add_parser("qc", parents=[rules], help="score traces against the image ink; keep the best passing one")
-    p.add_argument("--out", required=True)
-    p.add_argument("--sheet", default="")
     p = sub.add_parser("peek", parents=[rules], help="random traces drawn over their images, with QC verdicts")
     p.add_argument("--n", type=int, default=12)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--worst", default="", help="show the n worst by this QC metric instead of random traces")
-    p.add_argument("--prompt", default="", help="only traces whose prompt starts with this")
     p.add_argument("--out", default="peek.png")
     args = parser.parse_args()
-    {"words": words_command, "render": render_command, "export": export_command, "segment": segment_command, "trace": trace_command,
-     "qc": qc_command, "peek": peek_command}[args.command](args)
+    {"words": words_command, "render": render_command, "export": export_command, "segment": segment_command,
+     "peek": peek_command}[args.command](args)
 
 
 if __name__ == "__main__":

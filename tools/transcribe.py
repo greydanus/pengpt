@@ -4,7 +4,6 @@ import io
 import json
 import os
 import threading
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 from PIL import Image, ImageDraw, ImageFont
@@ -81,39 +80,21 @@ class Transcriber:
             return [cell for group in ex.map(self.read, groups) for cell in group]
 
 
-def source_of(row, key=None):
-    return str(row.get(key) if key else row.get("writer") or row.get("source") or row.get("set") or "")
-
-
-def screen(rows, reads, drop=0.2, min_legibility=4, key=None):
-    by = defaultdict(list)
+def label(rows, reads, min_legibility=4):
+    kept, dropped = [], []
     for r, (text, leg) in zip(rows, reads):
-        by[source_of(r, key)].append(leg)
-    score = {s: sum(v) / len(v) for s, v in by.items()}
-    cut, dropped = set(), 0
-    for s in sorted(score, key=score.get):
-        if dropped + len(by[s]) > drop * len(rows) + 0.5 * len(by[s]):
-            break
-        cut.add(s)
-        dropped += len(by[s])
-    kept, out = [], []
-    for r, (text, leg) in zip(rows, reads):
-        s = source_of(r, key)
-        row = {**r, "text": r.get("text") or text, "read": text, "legibility": leg, "source_score": round(score[s], 2)}
-        reason = (f"source {s!r} scored {score[s]:.1f}" if s in cut else f"legibility {leg}" if leg < min_legibility
-                  else "no transcription" if not row["text"] else None)
-        (out if reason else kept).append({**row, "dropped": reason} if reason else row)
-    return kept, out, score
+        row = {**r, "text": r.get("text") or text, "read": text, "legibility": leg}
+        reason = f"legibility {leg}" if leg < min_legibility else None if row["text"] else "no transcription"
+        (dropped if reason else kept).append({**row, "dropped": reason} if reason else row)
+    return kept, dropped
 
 
 def main():
-    p = argparse.ArgumentParser(description="read and screen handwriting crops before tracing: Sonnet transcribes each word and rates "
-                                            "its legibility; the worst sources (by mean legibility) and illegible words are dropped")
+    p = argparse.ArgumentParser(description="label handwriting crops before tracing: Sonnet transcribes each word from the raw crop "
+                                            "and rates its legibility; human labels are kept, illegible words and tiny crops are dropped")
     p.add_argument("--manifest", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--drop", type=float, default=0.2, help="drop whole sources, worst first, until about this share of words is gone")
-    p.add_argument("--min_legibility", type=int, default=4, help="also drop single words rated below this (1-10)")
-    p.add_argument("--source_key", default=None, help="row field naming a word's source; default writer, then source, then set")
+    p.add_argument("--min_legibility", type=int, default=4, help="drop words rated below this (1-10)")
     p.add_argument("--max_cost", type=float, default=5.0)
     p.add_argument("--model", default=MODEL)
     args = p.parse_args()
@@ -122,13 +103,10 @@ def main():
         (rows if Image.open(r["image"]).height >= MIN_HEIGHT else small).append(r)
     tr = Transcriber(args.model, args.max_cost)
     reads = tr([Image.open(r["image"]) for r in rows])
-    kept, dropped, score = screen(rows, reads, args.drop, args.min_legibility, args.source_key)
+    kept, dropped = label(rows, reads, args.min_legibility)
     dropped += [{**r, "dropped": f"smaller than {MIN_HEIGHT} px"} for r in small]
     write_jsonl(args.out, kept)
     write_jsonl(os.path.splitext(args.out)[0] + "_dropped.jsonl", dropped)
-    for s in sorted(score, key=score.get):
-        n = sum(source_of(r, args.source_key) == s for r in rows)
-        print(f"  {score[s]:4.1f}  {n:4d} words  {s}")
     print(f"kept {len(kept)} of {len(rows) + len(small)} words ({len(dropped)} dropped) for ${tr.spent:.2f} -> {args.out}")
 
 

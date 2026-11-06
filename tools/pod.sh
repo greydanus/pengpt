@@ -3,101 +3,60 @@ set -e -o pipefail
 : ${HOST:?set HOST=root@ip} ${PORT:?set PORT}
 O="-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 ${KEY:+-i $KEY -o IdentitiesOnly=yes}"
 S=${S:-ssh -p $PORT $O $HOST}
-DIR=${DIR:-data/raw/patrickhand}
 R=${R:-/root/pengpt}
-W=run/$(basename "$DIR")
-PY=${PY:-python3}
-TFPY=/root/tf/bin/python
-PROMPT=${PROMPT:-Derender the ink: {text}}
-MANIFEST=${MANIFEST:-$DIR/images/manifest.jsonl}
-ENV='q=$(cat /sys/fs/cgroup/cpu.max 2> /dev/null | awk "\$1 != \"max\" {print int(\$1 / \$2)}"); export TF_NUM_INTRAOP_THREADS=${q:-8} TF_NUM_INTEROP_THREADS=2'
+MANIFEST=${MANIFEST:-}
+NAME=${NAME:-$(basename "${MANIFEST%.jsonl}")}
+OUT=${OUT:-data/raw/harvest/$NAME}
 cmd=$1; shift || true
+need() { : ${MANIFEST:?set MANIFEST=path/to/manifest.jsonl}; }
 case $cmd in
 setup)
-  scp -q -P $PORT $O tools/ink.py tools/inksight.py $HOST:/root/
+  $S "mkdir -p $R/tools" && scp -q -P $PORT $O tools/*.py $HOST:$R/tools/
   $S bash -s <<EOF
 set -e
-mkdir -p $R/tools && mv /root/ink.py /root/inksight.py $R/tools/
 pip install -q --break-system-packages sentencepiece pillow scipy matplotlib scikit-image
-python3 -m venv /root/tf 2> /dev/null || { apt-get update -qq && apt-get install -y -qq python3-venv && python3 -m venv /root/tf; }
-/root/tf/bin/pip install -q 'tensorflow[and-cuda]==2.20.0' tensorflow-text==2.20.1 tf-keras==2.20.1 'huggingface_hub<1' pillow scipy
-cd $R && [ -f inksight/weights.npz ] || CUDA_VISIBLE_DEVICES= $TFPY -m tools.ink export --out inksight
+cd $R
+if [ ! -f inksight/weights.npz ]; then
+  python3 -m venv /root/tf 2> /dev/null || { apt-get update -qq && apt-get install -y -qq python3-venv && python3 -m venv /root/tf; }
+  /root/tf/bin/pip install -q 'tensorflow[and-cuda]==2.20.0' tensorflow-text==2.20.1 tf-keras==2.20.1 'huggingface_hub<1' pillow scipy
+  CUDA_VISIBLE_DEVICES= /root/tf/bin/python -m tools.ink export --out inksight
+fi
 python3 -c "import torch; print(torch.cuda.device_count(), 'GPUs, torch', torch.__version__)"
 echo SETUP OK
 EOF
   ;;
 push)
-  COPYFILE_DISABLE=1 tar czf /tmp/pengpt_push.tgz --no-xattrs tools/ink.py tools/inksight.py "$DIR/images"
-  scp -P $PORT $O /tmp/pengpt_push.tgz $HOST:/root/pengpt_push.tgz
-  $S "mkdir -p $R/$W && tar xzf /root/pengpt_push.tgz -C $R && echo pushed \$(wc -l < $R/$DIR/images/manifest.jsonl) words" ;;
-bench)
+  need
+  python3 -c "import json, sys; print('\n'.join(json.loads(l)['image'] for l in open(sys.argv[1])))" "$MANIFEST" > /tmp/pengpt_push.txt
+  echo "$MANIFEST" >> /tmp/pengpt_push.txt
+  ls tools/*.py >> /tmp/pengpt_push.txt
+  COPYFILE_DISABLE=1 tar czf /tmp/pengpt_push.tgz --no-xattrs -T /tmp/pengpt_push.txt
+  scp -q -P $PORT $O /tmp/pengpt_push.tgz $HOST:/root/pengpt_push.tgz
+  $S "mkdir -p $R && tar xzf /root/pengpt_push.tgz -C $R && echo pushed \$(wc -l < $R/$MANIFEST) rows" ;;
+harvest)
+  need
   $S bash -s <<EOF
-$ENV
-cd $R && mkdir -p $W && head -n ${WORDS:-256} $MANIFEST > $W/bench.jsonl
-for b in ${BATCHES:-8 32 128}; do
-  rm -f $W/bench_out.jsonl
-  echo "batch \$b: \$(CUDA_VISIBLE_DEVICES=0 $PY -u -m tools.ink trace --manifest $W/bench.jsonl --out $W/bench_out.jsonl --batch \$b 2>&1 | tail -n 1)"
-done
+cd $R && mkdir -p run/$NAME
+if [ -f run/$NAME/pid ] && kill -0 \$(cat run/$NAME/pid) 2> /dev/null; then echo "already running"; exit 0; fi
+setsid nohup python3 -u -m tools.harvest --manifest $MANIFEST --out run/$NAME $* > run/$NAME/log 2>&1 < /dev/null &
+echo \$! > run/$NAME/pid
+echo "harvest $NAME started"
 EOF
   ;;
-trace)
-  $S bash -s <<EOF
-$ENV
-cd $R && mkdir -p $W
-N=\$(( \$(nvidia-smi -L | wc -l) ))
-for g in \$(seq 0 \$((N - 1))); do
-  if [ -f run/gpu\$g.pid ] && kill -0 \$(cat run/gpu\$g.pid) 2> /dev/null; then echo "GPU \$g busy: \$(cat run/gpu\$g.font)"; continue; fi
-  awk -v n=\$N -v g=\$g 'NR % n == g' $MANIFEST > $W/manifest_\$g.jsonl
-  CUDA_VISIBLE_DEVICES=\$g setsid nohup bash -c "$PY -u -m tools.ink trace --manifest $W/manifest_\$g.jsonl --out $W/traces_\$g.jsonl --prompts '$PROMPT' --batch ${BATCH:-256}; echo EXIT \\\$?" > $W/trace_\$g.log 2>&1 < /dev/null &
-  echo \$! > run/gpu\$g.pid
-  echo $W > run/gpu\$g.font
-  echo "GPU \$g: \$(wc -l < $W/manifest_\$g.jsonl) words, prompt '$PROMPT'"
-done
-EOF
-  ;;
-retry)
-  $0 qc
-  MANIFEST=$W/accepted_retry.jsonl PROMPT=${PROMPT_RETRY:-"Recognize and derender."} $0 trace ;;
 status)
-  $S bash -s <<EOF
-cd $R
-for f in $W/trace_*.log; do echo "\$f (\$(( \$(date +%s) - \$(stat -c %Y \$f) ))s since last line): \$(tail -n 1 \$f)"; done
-echo "\$(cat $W/traces_*.jsonl 2> /dev/null | wc -l) traces for \$(wc -l < $DIR/images/manifest.jsonl) words"
-nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader 2> /dev/null || true
-EOF
-  ;;
+  $S "cd $R && tail -n 3 run/$NAME/log; nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader" ;;
 pull)
-  $S "cat $R/$W/*_out.jsonl $R/$W/traces_*.jsonl 2> /dev/null; true" > "$DIR/traces.jsonl"
-  echo "pulled $(wc -l < "$DIR/traces.jsonl") traces to $DIR/traces.jsonl" ;;
-sync)
-  scp -q -P $PORT $O tools/ink.py tools/inksight.py $HOST:$R/tools/
-  $S "cd $R && cat $W/*_out.jsonl $W/traces_*.jsonl 2> /dev/null > $W/all.jsonl; true" ;;
+  mkdir -p "$OUT"
+  for f in accepted.jsonl rejected.jsonl sources.json; do scp -q -P $PORT $O "$HOST:$R/run/$NAME/$f" "$OUT/" 2> /dev/null || true; done
+  echo "pulled $(wc -l < "$OUT/accepted.jsonl") accepted words to $OUT" ;;
 peek)
-  $0 sync
-  $S "cd $R && $PY -m tools.ink peek --manifest $DIR/images/manifest.jsonl --traces $W/all.jsonl \
-      --n ${N:-12} ${SEED:+--seed $SEED} ${WORST:+--worst $WORST} ${ONLY:+--prompt '$ONLY'} --out $W/peek.png"
-  scp -q -P $PORT $O $HOST:$R/$W/peek.png "$DIR/peek.png" && echo "sheet: $DIR/peek.png" ;;
-done)
-  $S "cd $R && n=\$(ls $W/trace_*.log | wc -l) && [ \$n -gt 0 ] && [ \$n -eq \$(grep -l '^EXIT' $W/trace_*.log | wc -l) ]" ;;
-watch)
-  while true; do
-    $0 status || true
-    $0 pull || true
-    if $0 done; then
-      echo "all shards finished"
-      [ "$STOP" = 1 ] && $0 stop
-      break
-    fi
-    sleep ${EVERY:-600}
-  done ;;
-qc)
-  $0 sync
-  $S "cd $R && $PY -m tools.ink qc --manifest $DIR/images/manifest.jsonl --traces $W/all.jsonl --out $W/accepted.jsonl"
-  scp -q -P $PORT $O "$HOST:$R/$W/accepted*.jsonl" "$DIR/" ;;
+  need
+  $S "cd $R && python3 -m tools.ink peek --manifest $MANIFEST --traces run/$NAME/accepted.jsonl --n ${N:-12} ${SEED:+--seed $SEED} --out run/$NAME/peek.png"
+  mkdir -p "$OUT" && scp -q -P $PORT $O "$HOST:$R/run/$NAME/peek.png" "$OUT/peek.png" && echo "sheet: $OUT/peek.png" ;;
 kill)
-  $S "cd $R && for f in run/gpu*.pid; do p=\$(cat \$f); kill -TERM -- -\$p 2> /dev/null || { pkill -TERM -P \$p; kill \$p; } 2> /dev/null || true; rm -f \$f; done; echo killed" ;;
+  $S "p=\$(cat $R/run/$NAME/pid) && kill -TERM -- -\$p 2> /dev/null || kill \$p; echo killed $NAME" ;;
 stop)
   $S "source /etc/rp_environment && runpodctl stop pod \$RUNPOD_POD_ID" ;;
 *)
-  echo "usage: HOST=root@ip PORT=port [KEY=~/.ssh/key] [DIR=data/raw/<font>] tools/pod.sh setup|push|bench|trace|retry|status|pull|sync|peek|qc|done|watch|kill|stop" ;;
+  echo "usage: HOST=root@ip PORT=port [KEY=~/.ssh/key] MANIFEST=m.jsonl tools/pod.sh setup|push|harvest|status|pull|peek|kill|stop" ;;
 esac
