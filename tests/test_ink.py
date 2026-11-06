@@ -7,7 +7,7 @@ from PIL import Image, ImageDraw
 
 from pengpt import INK_HEIGHT, load_examples, read_ink, save_ink
 from tools.ink import (detokenize, segment_command, file_hash, levenshtein, on_ink, qc_command, read_jsonl,
-                       replace_rows, score, split_line, synth_words, write_jsonl)
+                       plain, replace_rows, score, split_line, synth_words, write_jsonl)
 from tools.datasets import load_traces, points_to_strokes, standardize
 
 
@@ -124,7 +124,7 @@ def test_qc_ignores_traces_of_a_changed_image(tmp_path):
     write_jsonl(manifest, [{"image": image, "text": "wave", "source": "s"}])
     write_jsonl(traces, [{"image": image, "hash": file_hash(image), "prompt": "p", "strokes": [path], "read": ""}])
     args = Namespace(manifest=manifest, traces=traces, out=out, sheet="",
-                     min_coverage=0.85, min_mark=0.5, min_precision=0.9, max_read_error=0.34, max_length_ratio=1.6)
+                     min_coverage=0.85, min_mark=0.5, min_precision=0.9, max_retrace=0.35, max_mark_length=1.95, max_read_error=0.34, max_length_ratio=1.6)
     qc_command(args)
     assert len(read_jsonl(out)) == 1
     ImageDraw.Draw(img).line([(10, 10), (190, 10)], fill="black", width=4)
@@ -212,3 +212,38 @@ def test_score_catches_a_skipped_period(tmp_path):
     full, skipped = score(item, {"strokes": [word, [(209, 59)]]}), score(item, {"strokes": [word]})
     assert full["min_mark"] > 0.5 and skipped["min_mark"] == 0.0
     assert skipped["coverage"] > 0.85
+
+
+def loop(cx, cy, rx, ry, turns=1.0, n=120):
+    t = np.linspace(0, 2 * np.pi * turns, int(n * turns))
+    return [(cx + rx * np.sin(a), cy - ry * np.cos(a)) for a in t]
+
+
+def test_retrace_flags_a_doubled_loop_but_not_a_crossing(tmp_path):
+    img = Image.new("RGB", (120, 160), "white")
+    ImageDraw.Draw(img).line(loop(60, 80, 25, 50), fill="black", width=5)
+    img.save(tmp_path / "o.png")
+    eight = Image.new("RGB", (120, 160), "white")
+    path = [(60 + 22 * np.sin(2 * a), 80 - 55 * np.cos(a)) for a in np.linspace(0, 2 * np.pi, 240)]
+    ImageDraw.Draw(eight).line(path, fill="black", width=5)
+    eight.save(tmp_path / "8.png")
+    once = score({"image": str(tmp_path / "o.png")}, {"strokes": [loop(60, 80, 25, 50)]})
+    twice = score({"image": str(tmp_path / "o.png")}, {"strokes": [loop(60, 80, 25, 50, turns=1.9)]})
+    crossing = score({"image": str(tmp_path / "8.png")}, {"strokes": [path]})
+    assert once["retrace"] < 0.1 and crossing["retrace"] < 0.2 and twice["retrace"] > 0.4
+
+
+def test_mark_length_flags_one_letter_drawn_twice_beside_itself(tmp_path):
+    img = Image.new("RGB", (400, 120), "white")
+    letters = [[(x, 20), (x, 100)] for x in range(40, 400, 50)]
+    for s in letters:
+        ImageDraw.Draw(img).line(s, fill="black", width=5)
+    img.save(tmp_path / "w.png")
+    beside = letters + [[(42, 20), (42, 100)]]
+    q = score({"image": str(tmp_path / "w.png")}, {"strokes": beside})
+    assert q["length_ratio"] < 1.6 and q["max_mark_length"] > 1.95
+
+
+def test_plain_treats_same_glyph_readings_as_equal():
+    assert plain("0..") == plain("O..") and plain("Café") == plain("cafe")
+    assert plain("cat") != plain("cot")

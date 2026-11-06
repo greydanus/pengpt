@@ -136,7 +136,7 @@ one scale per recording frame, plus a sheet of samples to eyeball. Sources:
   strokes. `render` (from a font) or `segment` (from a page scan) makes word
   images, `trace` traces them with InkSight, and `qc --out
   data/raw/traces/accepted.jsonl` keeps traces that match the ink
-  (`pip install -e ".[ink]"`; `trace` also needs TensorFlow).
+  (`pip install -e ".[ink]"`; `trace` also needs TensorFlow). `tools/pod.sh` runs `trace` on a RunPod GPU.
 
 ## Repo map
 

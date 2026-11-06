@@ -2,13 +2,16 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import re
 import string
 import time
+import unicodedata
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from scipy import ndimage
+from scipy.spatial import cKDTree
 
 SIZE = 224
 UP = 4
@@ -293,7 +296,7 @@ def trace_command(args):
     import tensorflow_text
     from huggingface_hub import from_pretrained_keras
     serve = from_pretrained_keras("Derendering/InkSight-Small-p").signatures["serving_default"]
-    items = [{**it, "hash": file_hash(it["image"])} for it in read_jsonl(args.manifest)]
+    items = list({it["hash"]: it for it in ({**it, "hash": file_hash(it["image"])} for it in read_jsonl(args.manifest))}.values())
     done = {(r.get("hash"), r["prompt"]) for r in read_jsonl(args.out)}
     t0, n = time.time(), 0
     for prompt in args.prompts:
@@ -345,7 +348,7 @@ def score(item, cand):
     ink = gray < INK_LEVEL
     pts = resample_path(cand["strokes"])
     if not ink.any() or not len(pts):
-        return {"coverage": 0.0, "precision": 0.0, "length_ratio": 0.0, "min_mark": 0.0, "points": 0}
+        return {"coverage": 0.0, "precision": 0.0, "length_ratio": 0.0, "min_mark": 0.0, "max_mark_length": 0.0, "retrace": 0.0, "points": 0}
     half = max(1.0, 2 * np.median(ndimage.distance_transform_edt(ink)[ink]) - 1)
     canvas = np.zeros(ink.shape, bool)
     ij = np.clip(np.rint(pts).astype(int), 0, [ink.shape[1] - 1, ink.shape[0] - 1])
@@ -354,12 +357,43 @@ def score(item, cand):
     near = ndimage.distance_transform_edt(~ink) <= half / 2 + 2
     labels, k = ndimage.label(ink, structure=np.ones((3, 3)))
     ids = np.arange(1, k + 1)
-    marks = ndimage.mean(path, labels, ids)[ndimage.sum(ink, labels, ids) >= half ** 2]
+    area = ndimage.sum(ink, labels, ids)
+    marks = ndimage.mean(path, labels, ids)[area >= half ** 2]
+    gap, (ni, nj) = ndimage.distance_transform_edt(~ink, return_indices=True)
+    on = gap[ij[:, 1], ij[:, 0]] <= half / 2 + 2
+    owner = labels[ni[ij[on, 1], ij[on, 0]], nj[ij[on, 1], ij[on, 0]]]
+    drawn = np.bincount(owner, minlength=k + 1)[1:] * 2 * half / np.maximum(area, 1)
+    pairs = cKDTree(pts).query_pairs(half, output_type="ndarray")
+    again = np.zeros(len(pts), bool)
+    again[pairs[pairs[:, 1] - pairs[:, 0] > 6 * half, 1]] = True
+    big = (area >= 8 * half ** 2) & (np.bincount(owner, minlength=k + 1)[1:] > 0)
+    retrace = np.bincount(owner, again[on], minlength=k + 1)[1:] / np.maximum(np.bincount(owner, minlength=k + 1)[1:], 1)
     return {"coverage": float((ink & path).sum() / ink.sum()),
             "min_mark": float(marks.min()) if len(marks) else 1.0,
+            "max_mark_length": float(drawn[area >= 8 * half ** 2].max()) if (area >= 8 * half ** 2).any() else 0.0,
+            "retrace": float(retrace[big].max()) if big.any() else 0.0,
             "precision": float(near[ij[:, 1], ij[:, 0]].mean()),
             "length_ratio": float(len(pts) * 2 * half / ink.sum()),
             "points": int(len(pts))}
+
+
+def plain(text):
+    text = "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
+    return text.lower().replace("0", "o")
+
+
+def judge(item, cand, args):
+    c = {**cand, "strokes": on_ink(cand["strokes"], Image.open(item["image"]))}
+    q = score(item, c)
+    label = plain(item["text"])
+    q["read"] = c["read"]
+    q["read_error"] = levenshtein(plain(c["read"]), label) / len(label) if c["read"] else None
+    q["prompt"] = c["prompt"]
+    q["passed"] = (q["coverage"] >= args.min_coverage and q["precision"] >= args.min_precision
+                   and q["min_mark"] >= args.min_mark and q["length_ratio"] <= args.max_length_ratio
+                   and q["retrace"] <= args.max_retrace and q["max_mark_length"] <= args.max_mark_length
+                   and (q["read_error"] is None or q["read_error"] <= args.max_read_error))
+    return c, q
 
 
 def qc_command(args):
@@ -371,16 +405,7 @@ def qc_command(args):
     for image, item in items.items():
         best = None
         for c in cands.get(file_hash(image), []):
-            c = {**c, "strokes": on_ink(c["strokes"], Image.open(image))}
-            q = score(item, c)
-            label = item["text"].lower()
-            q["read"] = c["read"]
-            q["read_error"] = levenshtein(c["read"].lower(), label) / len(label) if c["read"] else None
-            q["prompt"] = c["prompt"]
-            q["passed"] = (q["coverage"] >= args.min_coverage and q["precision"] >= args.min_precision
-                           and q["min_mark"] >= args.min_mark
-                           and q["length_ratio"] <= args.max_length_ratio
-                           and (q["read_error"] is None or q["read_error"] <= args.max_read_error))
+            c, q = judge(item, c, args)
             key = (q["passed"], q["coverage"] * q["precision"])
             if best is None or key > best[0]:
                 best = (key, q, c)
@@ -396,6 +421,44 @@ def qc_command(args):
           f"rejected {len(rejected)}")
     if args.sheet:
         review_sheet(accepted, rejected, args.sheet)
+
+
+def peek_command(args):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    items = {file_hash(it["image"]): it for it in read_jsonl(args.manifest)}
+    rows = [r for r in read_jsonl(args.traces) if r.get("hash") in items]
+    if args.worst:
+        sign = 1 if args.worst in ("coverage", "precision", "min_mark") else -1
+        rows = sorted(rows, key=lambda r: sign * judge(items[r["hash"]], r, args)[1][args.worst])[:args.n]
+    else:
+        rows = random.Random(args.seed).sample(rows, min(args.n, len(rows)))
+    fig, axes = plt.subplots(len(rows), 2, figsize=(11, 1.5 * len(rows) + 0.3), squeeze=False,
+                             gridspec_kw={"width_ratios": [1, 1]})
+    for r, (a, b) in zip(rows, axes):
+        item = items[r["hash"]]
+        c, q = judge(item, r, args)
+        kept = c["strokes"]
+        a.imshow(Image.open(item["image"]).convert("L"), cmap="gray", alpha=0.3)
+        for s in (s for s in r["strokes"] if s not in kept):
+            s = np.asarray(s)
+            a.plot(s[:, 0], s[:, 1], "r--", lw=1)
+        for s, color in zip(kept, plt.cm.viridis(np.linspace(0, 0.9, max(1, len(kept))))):
+            s = np.asarray(s)
+            a.plot(s[:, 0], s[:, 1], color=color, lw=1.6)
+            a.plot(s[0, 0], s[0, 1], "o", color=color, ms=3.5)
+            b.plot(s[:, 0], -s[:, 1], color="k", lw=1.6, solid_capstyle="round")
+        b.set_aspect("equal")
+        for ax in (a, b):
+            ax.axis("off")
+        a.set_title(f"{'PASS' if q['passed'] else 'FAIL'}  {item['text']!r}  read {r['read']!r}", loc="left", fontsize=9,
+                    color="darkgreen" if q["passed"] else "firebrick")
+        b.set_title(f"{len(kept)} strokes  cov {q['coverage']:.2f}  mark {q['min_mark']:.2f}  prec {q['precision']:.2f}  "
+                    f"len {q['length_ratio']:.2f}  retrace {q['retrace']:.2f}  score {r.get('score', float('nan')):.2f}", loc="left", fontsize=8)
+    fig.subplots_adjust(left=0.01, right=0.99, top=0.98, bottom=0.01, hspace=0.5, wspace=0.05)
+    fig.savefig(args.out, dpi=110, bbox_inches="tight")
+    print(f"peek: {len(rows)} random traces -> {args.out}")
 
 
 def review_sheet(accepted, rejected, path, per_page=24):
@@ -451,19 +514,27 @@ def main():
     p.add_argument("--out", required=True)
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--prompts", nargs="+", default=["Recognize and derender."])
-    p = sub.add_parser("qc", help="score traces against the image ink; keep the best passing one")
-    p.add_argument("--manifest", required=True)
-    p.add_argument("--traces", required=True)
+    rules = argparse.ArgumentParser(add_help=False)
+    rules.add_argument("--manifest", required=True)
+    rules.add_argument("--traces", required=True)
+    rules.add_argument("--min_coverage", type=float, default=0.85)
+    rules.add_argument("--min_mark", type=float, default=0.5, help="every separate ink mark (i-dot, period) this covered")
+    rules.add_argument("--min_precision", type=float, default=0.90)
+    rules.add_argument("--max_read_error", type=float, default=0.34)
+    rules.add_argument("--max_length_ratio", type=float, default=1.6)
+    rules.add_argument("--max_retrace", type=float, default=0.35, help="share of a mark's trace that runs over its own path")
+    rules.add_argument("--max_mark_length", type=float, default=1.95, help="trace length over ink length, per mark")
+    p = sub.add_parser("qc", parents=[rules], help="score traces against the image ink; keep the best passing one")
     p.add_argument("--out", required=True)
     p.add_argument("--sheet", default="")
-    p.add_argument("--min_coverage", type=float, default=0.85)
-    p.add_argument("--min_mark", type=float, default=0.5, help="every separate ink mark (i-dot, period) this covered")
-    p.add_argument("--min_precision", type=float, default=0.90)
-    p.add_argument("--max_read_error", type=float, default=0.34)
-    p.add_argument("--max_length_ratio", type=float, default=1.6)
+    p = sub.add_parser("peek", parents=[rules], help="random traces drawn over their images, with QC verdicts")
+    p.add_argument("--n", type=int, default=12)
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--worst", default="", help="show the n worst by this QC metric instead of random traces")
+    p.add_argument("--out", default="peek.png")
     args = parser.parse_args()
     {"words": words_command, "render": render_command, "segment": segment_command, "trace": trace_command,
-     "qc": qc_command}[args.command](args)
+     "qc": qc_command, "peek": peek_command}[args.command](args)
 
 
 if __name__ == "__main__":
