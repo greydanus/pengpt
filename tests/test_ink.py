@@ -1,4 +1,5 @@
 import json
+import string
 from argparse import Namespace
 
 import numpy as np
@@ -6,7 +7,7 @@ from PIL import Image, ImageDraw
 
 from pengpt import INK_HEIGHT, load_examples, read_ink, save_ink
 from tools.ink import (detokenize, segment_command, file_hash, levenshtein, on_ink, qc_command, read_jsonl,
-                       replace_rows, score, split_line, write_jsonl)
+                       replace_rows, score, split_line, synth_words, write_jsonl)
 from tools.datasets import load_traces, points_to_strokes, standardize
 
 
@@ -123,7 +124,7 @@ def test_qc_ignores_traces_of_a_changed_image(tmp_path):
     write_jsonl(manifest, [{"image": image, "text": "wave", "source": "s"}])
     write_jsonl(traces, [{"image": image, "hash": file_hash(image), "prompt": "p", "strokes": [path], "read": ""}])
     args = Namespace(manifest=manifest, traces=traces, out=out, sheet="",
-                     min_coverage=0.85, min_precision=0.9, max_read_error=0.34, max_length_ratio=1.6)
+                     min_coverage=0.85, min_mark=0.5, min_precision=0.9, max_read_error=0.34, max_length_ratio=1.6)
     qc_command(args)
     assert len(read_jsonl(out)) == 1
     ImageDraw.Draw(img).line([(10, 10), (190, 10)], fill="black", width=4)
@@ -187,3 +188,27 @@ def test_collect_export_converts_to_shared_scale(tmp_path, monkeypatch):
     assert [w["writer"] for w in words] == ["me"] * 6 and words[0]["points"][0, 0] == 0
     from pengpt import check_data
     assert check_data(words, 0.02)[1] == []
+
+
+def test_synth_words_match_the_bigbank_mix():
+    words = synth_words(20000, seed=1)
+    assert words == synth_words(20000, seed=1) and words != synth_words(20000, seed=2)
+    share = lambda f: np.mean([bool(f(w)) for w in words])
+    core = lambda w: w.strip("\"'(),.?!")
+    assert 0.23 < share(lambda w: core(w).replace(".", "").replace("'", "").isdigit()) < 0.27
+    assert 0.17 < share(lambda w: core(w).isalpha() and core(w).isupper()) < 0.21
+    assert 0.12 < share(lambda w: w[-1] in ",.?!") < 0.2
+    assert 0.08 < share(lambda w: "(" in w or ")" in w) < 0.12
+    assert set("".join(words)) <= set(string.ascii_letters + string.digits + "\"'(),.?!")
+
+
+def test_score_catches_a_skipped_period(tmp_path):
+    img = Image.new("RGB", (240, 80), "white")
+    word = [(20, 60), (60, 20), (100, 60), (140, 20), (180, 60)]
+    ImageDraw.Draw(img).line(word, fill="black", width=4)
+    ImageDraw.Draw(img).ellipse([(206, 56), (211, 61)], fill="black")
+    img.save(tmp_path / "w.png")
+    item = {"image": str(tmp_path / "w.png")}
+    full, skipped = score(item, {"strokes": [word, [(209, 59)]]}), score(item, {"strokes": [word]})
+    assert full["min_mark"] > 0.5 and skipped["min_mark"] == 0.0
+    assert skipped["coverage"] > 0.85

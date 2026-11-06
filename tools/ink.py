@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import re
+import string
 import time
 
 import numpy as np
@@ -50,6 +51,53 @@ def upsample(norm):
     h, w = norm.shape
     big = Image.fromarray((norm * 65535).astype(np.uint16)).resize((w * UP, h * UP), Image.BICUBIC)
     return np.asarray(big).astype(float) / 65535
+
+
+LETTER_WEIGHTS = np.maximum([6, 1.5, 2.8, 4.3, 6, 2.2, 2, 6.1, 6, 4, 0.77, 4, 2.4, 6, 6, 1.9, 0.095, 6, 6.3, 6, 2.8,
+                             0.98, 2.4, 4, 2, 0.074], 4)
+
+
+def synth_words(n, seed=0):
+    rng = np.random.default_rng(seed)
+    lengths = np.arange(3, 11)
+    p = np.maximum(1 - 0.85 * (lengths - 3) / 7, 0)
+    p[0] *= 0.5
+    p[1] /= 0.8
+    p /= p.sum()
+    letters = LETTER_WEIGHTS / LETTER_WEIGHTS.sum()
+    words = []
+    for _ in range(n):
+        if rng.random() < 0.25:
+            word = "".join(rng.choice(list(string.digits), rng.integers(1, 6)))
+            if rng.random() < 0.3:
+                i = rng.integers(0, len(word) + 1)
+                word = word[:i] + "." + word[i:]
+        else:
+            word = "".join(rng.choice(list(string.ascii_lowercase), rng.choice(lengths, p=p), p=letters))
+            word = word.upper() if rng.random() < 0.25 else word.capitalize() if rng.random() < 0.25 else word
+        if rng.random() < 0.1:
+            quote = rng.choice(['"', "'"])
+            if quote == "'" and rng.random() < 0.5 and len(word) > 1:
+                i = rng.integers(1, len(word))
+                word = word[:i] + "'" + word[i:]
+            else:
+                word = quote + word if rng.random() < 0.5 else word + quote
+        if rng.random() < 0.1:
+            word = "(" + word if rng.random() < 0.5 else word + ")"
+        if rng.random() < 0.8:
+            for mark in ",.?!":
+                if rng.random() < 0.05:
+                    word += mark
+                    break
+        words.append(word)
+    return words
+
+
+def words_command(args):
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    words = synth_words(args.n, args.seed)
+    open(args.out, "w").write("\n".join(words) + "\n")
+    print(f"wrote {len(words)} words to {args.out}: {' '.join(words[:12])} ...")
 
 
 def render_command(args):
@@ -249,20 +297,21 @@ def trace_command(args):
     done = {(r.get("hash"), r["prompt"]) for r in read_jsonl(args.out)}
     t0, n = time.time(), 0
     for prompt in args.prompts:
-        todo = [it for it in items if (it["hash"], prompt) not in done]
+        todo = sorted((it for it in items if (it["hash"], prompt) not in done), key=lambda it: len(it["text"]))
         for i in range(0, len(todo), args.batch):
             chunk = todo[i:i + args.batch]
             images = [Image.open(it["image"]).convert("RGB") for it in chunk]
             padded = [scale_and_pad(img) for img in images]
             encoded = tf.stack([tf.reshape(tf.io.encode_jpeg(np.asarray(c)), (1,)) for c, _, _, _ in padded])
             texts = tf.constant([prompt.format(text=it["text"]) for it in chunk])
-            out = serve(**{"input_text": texts, "image/encoded": encoded})["output_0"].numpy()
+            out = serve(**{"input_text": texts, "image/encoded": encoded})
             rows = []
-            for it, img, o, (_, ratio, dx, dy) in zip(chunk, images, out, padded):
+            for it, img, o, conf, (_, ratio, dx, dy) in zip(chunk, images, out["output_0"].numpy(),
+                                                            out["output_1"].numpy(), padded):
                 raw = o[0].decode()
                 strokes = [[[(x - dx) / ratio, (y - dy) / ratio] for x, y in s] for s in detokenize(raw)]
                 rows.append({"image": it["image"], "hash": it["hash"], "prompt": prompt, "strokes": strokes,
-                             "read": re.sub(r"<[^>]+>", "", raw).strip()})
+                             "read": re.sub(r"<[^>]+>", "", raw).strip(), "score": float(conf[0])})
             write_jsonl(args.out, rows, "a")
             n += len(chunk)
             print(f"[{prompt}] {i + len(chunk)}/{len(todo)} | {(time.time() - t0) / n:.1f} s/word", flush=True)
@@ -296,14 +345,18 @@ def score(item, cand):
     ink = gray < INK_LEVEL
     pts = resample_path(cand["strokes"])
     if not ink.any() or not len(pts):
-        return {"coverage": 0.0, "precision": 0.0, "length_ratio": 0.0, "points": 0}
+        return {"coverage": 0.0, "precision": 0.0, "length_ratio": 0.0, "min_mark": 0.0, "points": 0}
     half = max(1.0, 2 * np.median(ndimage.distance_transform_edt(ink)[ink]) - 1)
     canvas = np.zeros(ink.shape, bool)
     ij = np.clip(np.rint(pts).astype(int), 0, [ink.shape[1] - 1, ink.shape[0] - 1])
     canvas[ij[:, 1], ij[:, 0]] = True
     path = ndimage.distance_transform_edt(~canvas) <= half + 1
     near = ndimage.distance_transform_edt(~ink) <= half / 2 + 2
+    labels, k = ndimage.label(ink, structure=np.ones((3, 3)))
+    ids = np.arange(1, k + 1)
+    marks = ndimage.mean(path, labels, ids)[ndimage.sum(ink, labels, ids) >= half ** 2]
     return {"coverage": float((ink & path).sum() / ink.sum()),
+            "min_mark": float(marks.min()) if len(marks) else 1.0,
             "precision": float(near[ij[:, 1], ij[:, 0]].mean()),
             "length_ratio": float(len(pts) * 2 * half / ink.sum()),
             "points": int(len(pts))}
@@ -325,6 +378,7 @@ def qc_command(args):
             q["read_error"] = levenshtein(c["read"].lower(), label) / len(label) if c["read"] else None
             q["prompt"] = c["prompt"]
             q["passed"] = (q["coverage"] >= args.min_coverage and q["precision"] >= args.min_precision
+                           and q["min_mark"] >= args.min_mark
                            and q["length_ratio"] <= args.max_length_ratio
                            and (q["read_error"] is None or q["read_error"] <= args.max_read_error))
             key = (q["passed"], q["coverage"] * q["precision"])
@@ -360,7 +414,7 @@ def review_sheet(accepted, rejected, path, per_page=24):
             s = np.asarray(s)
             if len(s):
                 b.plot(s[:, 0], s[:, 1], color="black", lw=1.2)
-        detail = (f"cov {q.get('coverage', 0):.2f}  prec {q.get('precision', 0):.2f}  "
+        detail = (f"cov {q.get('coverage', 0):.2f}  mark {q.get('min_mark', 0):.2f}  prec {q.get('precision', 0):.2f}  "
                   f"len {q.get('length_ratio', 0):.2f}  "
                   f"read {q.get('read', '')!r}" if "coverage" in q else q.get("reason", ""))
         b.set_title(detail, loc="left", fontsize=7, pad=2)
@@ -378,6 +432,10 @@ def main():
     meta = argparse.ArgumentParser(add_help=False)
     meta.add_argument("--style", required=True)
     meta.add_argument("--license", required=True)
+    p = sub.add_parser("words", help="random words with the bigbank mix of capitals, digits and punctuation")
+    p.add_argument("--n", type=int, default=3500)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--out", required=True)
     p = sub.add_parser("render", parents=[meta], help="render a word list in a font")
     p.add_argument("--font", required=True)
     p.add_argument("--words", required=True)
@@ -392,18 +450,19 @@ def main():
     p.add_argument("--manifest", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--batch", type=int, default=8)
-    p.add_argument("--prompts", nargs="+", default=["Recognize and derender.", "Derender the ink: {text}"])
+    p.add_argument("--prompts", nargs="+", default=["Recognize and derender."])
     p = sub.add_parser("qc", help="score traces against the image ink; keep the best passing one")
     p.add_argument("--manifest", required=True)
     p.add_argument("--traces", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--sheet", default="")
     p.add_argument("--min_coverage", type=float, default=0.85)
+    p.add_argument("--min_mark", type=float, default=0.5, help="every separate ink mark (i-dot, period) this covered")
     p.add_argument("--min_precision", type=float, default=0.90)
     p.add_argument("--max_read_error", type=float, default=0.34)
     p.add_argument("--max_length_ratio", type=float, default=1.6)
     args = parser.parse_args()
-    {"render": render_command, "segment": segment_command, "trace": trace_command,
+    {"words": words_command, "render": render_command, "segment": segment_command, "trace": trace_command,
      "qc": qc_command}[args.command](args)
 
 
