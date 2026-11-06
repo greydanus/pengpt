@@ -62,3 +62,6 @@ def test_dots_snap_to_the_ink_and_missing_dots_are_added():
     assert len(out) == 3 and np.allclose(out[0], stem)
     assert np.allclose(out[1].mean(0), [60, 20], atol=1) and np.allclose(np.hypot(*(out[1] - [60, 20]).T), 5)
     assert np.allclose(out[2][0], [90, 91])
+    v = np.array([[0.0, -1.0], [0.5, 0.0], [1.0, -1.0]])
+    out = apply_ops([v], ["split:0,1", "reverse:0"])
+    assert np.allclose(out[0], v[1::-1]) and np.allclose(out[1], v[1:])
