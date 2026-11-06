@@ -7,7 +7,7 @@ from PIL import Image, ImageDraw
 
 from pengpt import INK_HEIGHT, load_examples, read_ink, save_ink
 from tools.ink import (detokenize, segment_command, file_hash, levenshtein, on_ink, qc_command, read_jsonl,
-                       plain, replace_rows, score, split_line, synth_words, write_jsonl)
+                       plain, replace_rows, scale_and_pad, score, split_line, synth_words, write_jsonl)
 from tools.datasets import load_traces, points_to_strokes, standardize
 
 
@@ -247,3 +247,17 @@ def test_mark_length_flags_one_letter_drawn_twice_beside_itself(tmp_path):
 def test_plain_treats_same_glyph_readings_as_equal():
     assert plain("0..") == plain("O..") and plain("Café") == plain("cafe")
     assert plain("cat") != plain("cot")
+
+
+def test_scale_and_pad_maps_a_narrow_word_back_to_its_pixels():
+    img = Image.new("RGB", (40, 100), "white")
+    ImageDraw.Draw(img).rectangle([(28, 70), (31, 73)], fill="black")
+    canvas, ratio, dx, dy = scale_and_pad(img)
+    gray = np.asarray(canvas.convert("L")).astype(float)
+    wy, wx = np.nonzero(gray > 200)
+    inside = np.zeros(gray.shape, bool)
+    inside[wy.min():wy.max() + 1, wx.min():wx.max() + 1] = True
+    ys, xs = np.nonzero((gray < 100) & inside)
+    x, y = (xs.mean() - dx) / ratio, (ys.mean() - dy) / ratio
+    assert canvas.size == (224, 224) and abs(x - 29.5) < 1.5 and abs(y - 71.5) < 1.5
+    assert ratio < 224 / 100

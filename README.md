@@ -133,17 +133,21 @@ one scale per recording frame, plus a sheet of samples to eyeball. Sources:
   (this is how `bigbank_3500` was made: 3,500 words from one writer).
 - `brush`, `uji`, `mathwriting`: public datasets.
 - `traces`: `accepted.jsonl` from `tools/ink.py`, which turns images into
-  strokes. `render` (from a font) or `segment` (from a page scan) makes word
-  images, `trace` traces them with InkSight, and `qc --out
-  data/raw/traces/accepted.jsonl` keeps traces that match the ink
-  (`pip install -e ".[ink]"`; `trace` also needs TensorFlow). `tools/pod.sh` runs `trace` on a RunPod GPU.
+  strokes. `words` makes bigbank-style labels, `render` (from a font) or
+  `segment` (from a page scan) makes word images, `trace` traces them with
+  InkSight, and `qc --out data/raw/traces/accepted.jsonl` keeps traces that
+  match the ink (`pip install -e ".[ink]"`). `trace` runs `tools/inksight.py`,
+  a PyTorch port of InkSight-Small-p with a cached decoder, about 30x faster
+  than the original; `export` (needs TensorFlow, once) writes its weights.
+  `tools/pod.sh` runs all of this on a RunPod GPU, and `peek` draws traces
+  over their images to check quality.
 
 ## Repo map
 
 ```
 pengpt.py     tokenizer, data, model, training, sampling; train/sample/rank/check commands
 utils.py      training presets
-tools/        datasets.py (public corpora), ink.py (image tracing)
+tools/        datasets.py (public corpora), ink.py (image tracing), inksight.py (InkSight in PyTorch), pod.sh (RunPod)
 collect.html  data collection page
 tests/        pytest suite
 EXPERIMENTS.md  measured results behind the defaults

@@ -23,3 +23,6 @@ data/*.jsonl.gz
 
 # Source downloads: many GB, all re-fetchable.
 data/raw/
+
+# InkSight weights for the torch engine, written by `python -m tools.ink export`.
+inksight/

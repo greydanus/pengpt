@@ -16,6 +16,7 @@ from scipy.spatial import cKDTree
 SIZE = 224
 UP = 4
 INK_LEVEL = 200
+MIN_ASPECT = float(os.environ.get("INK_MIN_ASPECT", 2.5))
 
 
 def read_jsonl(path):
@@ -103,8 +104,20 @@ def words_command(args):
     print(f"wrote {len(words)} words to {args.out}: {' '.join(words[:12])} ...")
 
 
+def ink_baseline(font):
+    bottoms = []
+    for c in "acemnorsuvwxz":
+        img = Image.new("L", (4 * font.size, 4 * font.size), 255)
+        ImageDraw.Draw(img).text((font.size, 3 * font.size), c, font=font, fill=0, anchor="ls")
+        rows = np.nonzero(np.asarray(img) < INK_LEVEL)[0]
+        if len(rows):
+            bottoms.append(rows.max() - 3 * font.size)
+    return int(round(np.median(bottoms)))
+
+
 def render_command(args):
     font = ImageFont.truetype(args.font, args.size)
+    shift = ink_baseline(font)
     os.makedirs(args.out, exist_ok=True)
     rows = []
     for i, text in enumerate(w.strip() for w in open(args.words) if w.strip()):
@@ -113,7 +126,7 @@ def render_command(args):
         ImageDraw.Draw(img).text((8 - left, 8 - top), text, font=font, fill="black", anchor="ls")
         path = f"{args.out}/{os.path.splitext(os.path.basename(args.font))[0]}_{i:05d}.png"
         img.save(path)
-        rows.append({"image": path, "text": text, "baseline": 8 - top, "style": args.style, "writer": args.style,
+        rows.append({"image": path, "text": text, "baseline": 8 - top + shift, "style": args.style, "writer": args.style,
                      "source": os.path.basename(args.font), "license": args.license})
     replace_rows(f"{args.out}/manifest.jsonl", rows, os.path.basename(args.font))
     print(f"rendered {len(rows)} words to {args.out}/manifest.jsonl")
@@ -255,13 +268,18 @@ def overview(page, boxes, bands, lines, skipped, path):
     print(f"overview: {path}")
 
 
-def scale_and_pad(img):
+def scale_and_pad(img, min_aspect=MIN_ASPECT):
+    pad = max(0, int(min_aspect * img.height) - img.width) // 2
+    if pad:
+        wide = Image.new("RGB", (img.width + 2 * pad, img.height), "white")
+        wide.paste(img, (pad, 0))
+        img = wide
     ratio = min(SIZE / img.width, SIZE / img.height)
     small = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
     canvas = Image.new("RGB", (SIZE, SIZE), "black")
     dx, dy = (SIZE - small.width) // 2, (SIZE - small.height) // 2
     canvas.paste(small, (dx, dy))
-    return canvas, ratio, dx, dy
+    return canvas, ratio, dx + pad * ratio, dy
 
 
 def detokenize(text):
@@ -291,11 +309,49 @@ def on_ink(strokes, img, radius=3):
     return [s for s in strokes if touches(s)]
 
 
-def trace_command(args):
+def export_command(args):
+    import tensorflow as tf
+    import tensorflow_text
+    from huggingface_hub import snapshot_download
+    tf.compat.v1.disable_eager_execution()
+    sess = tf.compat.v1.Session()
+    meta = tf.compat.v1.saved_model.loader.load(sess, ["serve"], snapshot_download("Derendering/InkSight-Small-p"))
+    ops = [op for op in sess.graph.get_operations() if op.type == "VarHandleOp"]
+    vals = sess.run([tf.raw_ops.ReadVariableOp(resource=op.outputs[0], dtype=op.get_attr("dtype")) for op in ops])
+    os.makedirs(args.out, exist_ok=True)
+    np.savez(f"{args.out}/weights.npz", **{op.get_attr("shared_name").decode(): v.astype(np.float32) for op, v in zip(ops, vals)})
+    spm = next(n.attr["model"].s for f in meta.graph_def.library.function for n in f.node_def if n.op == "SentencepieceOp")
+    open(f"{args.out}/spm.model", "wb").write(spm)
+    print(f"exported {len(ops)} InkSight weights and its tokenizer to {args.out}")
+
+
+def tf_tracer():
     import tensorflow as tf
     import tensorflow_text
     from huggingface_hub import from_pretrained_keras
     serve = from_pretrained_keras("Derendering/InkSight-Small-p").signatures["serving_default"]
+
+    def trace(images, texts, prompt):
+        padded = [scale_and_pad(img) for img in images]
+        encoded = tf.stack([tf.reshape(tf.io.encode_jpeg(np.asarray(c)), (1,)) for c, _, _, _ in padded])
+        out = serve(**{"input_text": tf.constant([prompt.replace("{text}", t) for t in texts]), "image/encoded": encoded})
+        rows = []
+        for o, (_, ratio, dx, dy) in zip(out["output_0"].numpy(), padded):
+            raw = o[0].decode()
+            rows.append(([[[(x - dx) / ratio, (y - dy) / ratio] for x, y in s] for s in detokenize(raw)],
+                         re.sub(r"<[^>]+>", "", raw).strip()))
+        return rows
+    return trace
+
+
+def torch_tracer(path):
+    from tools.inksight import InkSight
+    model = InkSight(path)
+    return lambda images, texts, prompt: model.trace(images, texts, prompt)
+
+
+def trace_command(args):
+    trace = torch_tracer(args.inksight) if args.engine == "torch" else tf_tracer()
     items = list({it["hash"]: it for it in ({**it, "hash": file_hash(it["image"])} for it in read_jsonl(args.manifest))}.values())
     done = {(r.get("hash"), r["prompt"]) for r in read_jsonl(args.out)}
     t0, n = time.time(), 0
@@ -303,21 +359,11 @@ def trace_command(args):
         todo = sorted((it for it in items if (it["hash"], prompt) not in done), key=lambda it: len(it["text"]))
         for i in range(0, len(todo), args.batch):
             chunk = todo[i:i + args.batch]
-            images = [Image.open(it["image"]).convert("RGB") for it in chunk]
-            padded = [scale_and_pad(img) for img in images]
-            encoded = tf.stack([tf.reshape(tf.io.encode_jpeg(np.asarray(c)), (1,)) for c, _, _, _ in padded])
-            texts = tf.constant([prompt.format(text=it["text"]) for it in chunk])
-            out = serve(**{"input_text": texts, "image/encoded": encoded})
-            rows = []
-            for it, img, o, conf, (_, ratio, dx, dy) in zip(chunk, images, out["output_0"].numpy(),
-                                                            out["output_1"].numpy(), padded):
-                raw = o[0].decode()
-                strokes = [[[(x - dx) / ratio, (y - dy) / ratio] for x, y in s] for s in detokenize(raw)]
-                rows.append({"image": it["image"], "hash": it["hash"], "prompt": prompt, "strokes": strokes,
-                             "read": re.sub(r"<[^>]+>", "", raw).strip(), "score": float(conf[0])})
-            write_jsonl(args.out, rows, "a")
+            out = trace([Image.open(it["image"]).convert("RGB") for it in chunk], [it["text"] for it in chunk], prompt)
+            write_jsonl(args.out, [{"image": it["image"], "hash": it["hash"], "prompt": prompt, "strokes": strokes,
+                                    "read": read, "engine": args.engine} for it, (strokes, read) in zip(chunk, out)], "a")
             n += len(chunk)
-            print(f"[{prompt}] {i + len(chunk)}/{len(todo)} | {(time.time() - t0) / n:.1f} s/word", flush=True)
+            print(f"[{prompt}] {i + len(chunk)}/{len(todo)} | {(time.time() - t0) / n:.2f} s/word", flush=True)
 
 
 def levenshtein(a, b):
@@ -417,6 +463,8 @@ def qc_command(args):
         (accepted if q["passed"] else rejected).append(row)
     write_jsonl(args.out, accepted)
     write_jsonl(os.path.splitext(args.out)[0] + "_rejected.jsonl", rejected)
+    write_jsonl(os.path.splitext(args.out)[0] + "_retry.jsonl",
+                [{k: r[k] for k in ("image", "text", "baseline")} for r in rejected if "reason" not in r["qc"]])
     print(f"accepted {len(accepted)} / {len(items)} ({100 * len(accepted) / max(1, len(items)):.0f}%), "
           f"rejected {len(rejected)}")
     if args.sheet:
@@ -428,7 +476,7 @@ def peek_command(args):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     items = {file_hash(it["image"]): it for it in read_jsonl(args.manifest)}
-    rows = [r for r in read_jsonl(args.traces) if r.get("hash") in items]
+    rows = [r for r in read_jsonl(args.traces) if r.get("hash") in items and r["prompt"].startswith(args.prompt)]
     if args.worst:
         sign = 1 if args.worst in ("coverage", "precision", "min_mark") else -1
         rows = sorted(rows, key=lambda r: sign * judge(items[r["hash"]], r, args)[1][args.worst])[:args.n]
@@ -455,7 +503,7 @@ def peek_command(args):
         a.set_title(f"{'PASS' if q['passed'] else 'FAIL'}  {item['text']!r}  read {r['read']!r}", loc="left", fontsize=9,
                     color="darkgreen" if q["passed"] else "firebrick")
         b.set_title(f"{len(kept)} strokes  cov {q['coverage']:.2f}  mark {q['min_mark']:.2f}  prec {q['precision']:.2f}  "
-                    f"len {q['length_ratio']:.2f}  retrace {q['retrace']:.2f}  score {r.get('score', float('nan')):.2f}", loc="left", fontsize=8)
+                    f"len {q['length_ratio']:.2f}  retrace {q['retrace']:.2f}  {r.get('engine', 'tf')}", loc="left", fontsize=8)
     fig.subplots_adjust(left=0.01, right=0.99, top=0.98, bottom=0.01, hspace=0.5, wspace=0.05)
     fig.savefig(args.out, dpi=110, bbox_inches="tight")
     print(f"peek: {len(rows)} random traces -> {args.out}")
@@ -509,11 +557,15 @@ def main():
     p.add_argument("--transcript", required=True, help="one line of text per written line")
     p.add_argument("--overview", default="", help="write the page with every crop box drawn on it")
     p.add_argument("--out", required=True)
+    p = sub.add_parser("export", help="InkSight weights and tokenizer for the torch engine (needs TensorFlow)")
+    p.add_argument("--out", default="inksight")
     p = sub.add_parser("trace", help="trace word images with InkSight; resumable")
     p.add_argument("--manifest", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--batch", type=int, default=8)
-    p.add_argument("--prompts", nargs="+", default=["Recognize and derender."])
+    p.add_argument("--prompts", nargs="+", default=["Derender the ink: {text}"])
+    p.add_argument("--engine", default="torch", choices=["torch", "tf"])
+    p.add_argument("--inksight", default="inksight", help="torch engine: dir written by export")
     rules = argparse.ArgumentParser(add_help=False)
     rules.add_argument("--manifest", required=True)
     rules.add_argument("--traces", required=True)
@@ -531,9 +583,10 @@ def main():
     p.add_argument("--n", type=int, default=12)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--worst", default="", help="show the n worst by this QC metric instead of random traces")
+    p.add_argument("--prompt", default="", help="only traces whose prompt starts with this")
     p.add_argument("--out", default="peek.png")
     args = parser.parse_args()
-    {"words": words_command, "render": render_command, "segment": segment_command, "trace": trace_command,
+    {"words": words_command, "render": render_command, "export": export_command, "segment": segment_command, "trace": trace_command,
      "qc": qc_command, "peek": peek_command}[args.command](args)
 
 
