@@ -6,6 +6,7 @@ import time
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from scipy import ndimage
 
 from tools.ink import file_hash, ink_baseline, on_ink, read_jsonl, write_jsonl
 
@@ -78,6 +79,36 @@ def cut(row, strokes, font, xh):
     return out
 
 
+def dots(image, lo, hi, xh):
+    ink = np.asarray(Image.open(image).convert("L")) < 128
+    lab, n = ndimage.label(ink)
+    out = []
+    for k in range(1, n + 1):
+        ys, xs = np.nonzero(lab == k)
+        r = np.sqrt(len(ys) / np.pi)
+        if r < 0.25 * xh and max(np.ptp(xs), np.ptp(ys)) < 1.6 * min(np.ptp(xs), np.ptp(ys)) + 2 and lo <= xs.mean() <= hi:
+            out.append((xs.mean(), ys.mean(), r))
+    return out
+
+
+def circle(x, y, r, n=10):
+    a = np.pi / 2 + np.linspace(0, 2 * np.pi, n + 1)
+    return np.column_stack([x + r * np.cos(a), y - r * np.sin(a)])
+
+
+def snap_dots(strokes, found, xh):
+    out = list(strokes)
+    for x, y, r in found:
+        near = [k for k, p in enumerate(out) if np.ptp(p, 0).max() < 0.4 * xh and np.hypot(*(p.mean(0) - [x, y])) < r + 0.15 * xh]
+        dot = circle(x, y, 0.5 * r)
+        if near:
+            out[near[0]] = dot
+            out = [p for k, p in enumerate(out) if k not in near[1:]]
+        else:
+            out.append(dot)
+    return out
+
+
 def is_mark(s, c):
     ext = np.ptp(s, 0) if len(s) > 1 else np.zeros(2)
     return (c in "ij" and ext.max() < 0.4) or (c in "tx" and ext[0] > 1.5 * ext[1] and ext[1] < 0.5)
@@ -113,12 +144,29 @@ def build(font_path, fixes):
         t = traces[(image, g.get("prompt", PROMPTS[0]))]
         strokes = [np.asarray(p, float) for p in on_ink(t["strokes"], Image.open(image)) if len(p)]
         strokes = apply_ops(cut(row, strokes, font, xh), g.get("ops", []))
+        lo = row["x0"] + advance(font, row["text"], row["pos"]) if row["pos"] else -1e9
+        hi = row["x0"] + advance(font, row["text"], row["pos"] + 1) if row["pos"] + 1 < len(row["text"]) else 1e9
+        strokes = snap_dots(strokes, dots(image, lo, hi, xh), xh)
         origin = [row["x0"] + advance(font, row["text"], row["pos"]), row["baseline"] + shift]
         strokes = [(p - origin) / xh for p in strokes]
         marks = g.get("marks", [k for k, p in enumerate(strokes) if is_mark(p, c)])
         glyphs[c] = {"strokes": [p.round(4).tolist() for p in strokes], "marks": marks}
     return {"font": os.path.basename(font_path), "size": SIZE, "xh": float(xh), "cursive": bool(fix.get("cursive")),
             "reviewed": bool(fix.get("reviewed")), "glyphs": glyphs}
+
+
+def against_grain(entry):
+    out = []
+    for c, g in entry["glyphs"].items():
+        for k, s in enumerate(map(np.asarray, g["strokes"])):
+            if len(s) < 3 or np.hypot(*(s[0] - s[-1])) < 0.15:
+                continue
+            dx, dy = s[-1] - s[0]
+            if abs(dy) > 1.5 * abs(dx) and dy < -0.4:
+                out.append(f"{c}[{k}] up")
+            elif abs(dx) > 1.5 * abs(dy) and dx < -0.4:
+                out.append(f"{c}[{k}] leftward")
+    return out
 
 
 def compose(entry, text, xs, bridge=1.0):
@@ -155,34 +203,43 @@ def sheet(entry, path, words=("minimum", "Ithaca,", "quick brown", "Hello!", "ju
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    cols = 14
-    fig = plt.figure(figsize=(cols * 1.4, 1.6 * (len(CHARS) // cols + 1) + 1.4 * len(words)))
-    grid = fig.add_gridspec(len(CHARS) // cols + 1 + len(words), cols)
-    for k, c in enumerate(CHARS):
-        ax = fig.add_subplot(grid[k // cols, k % cols])
-        strokes = [np.asarray(s) for s in entry["glyphs"][c]["strokes"]]
-        for i, (s, col) in enumerate(zip(strokes, plt.cm.plasma(np.linspace(0, 0.85, max(1, len(strokes)))))):
-            ax.plot(s[:, 0], -s[:, 1], color=col, lw=1.5, ls="--" if i in entry["glyphs"][c]["marks"] else "-")
+    cols, rows = 14, (len(CHARS) + 13) // 14
+    fig = plt.figure(figsize=(18, 1.25 * rows + 1.5 * (len(words) + 1) // 2 + 0.6))
+    grid = fig.add_gridspec(rows + (len(words) + 1) // 2, 2 * cols, height_ratios=[1.25] * rows + [1.5] * ((len(words) + 1) // 2),
+                            left=0.01, right=0.99, top=0.95, bottom=0.01, hspace=0.25, wspace=0.05)
+
+    def draw(ax, strokes, marks=(), numbered=False):
+        cmap = plt.cm.plasma if numbered else plt.cm.viridis
+        for i, (s, col) in enumerate(zip(strokes, cmap(np.linspace(0, 0.85, max(1, len(strokes)))))):
+            ax.plot(s[:, 0], -s[:, 1], color=col, lw=1.6, ls="--" if i in marks else "-", solid_capstyle="round")
             ax.plot(s[0, 0], -s[0, 1], "o", color=col, ms=3.5)
-            if len(s) > 3:
+            if numbered and len(s) > 3:
                 m = len(s) * 3 // 5
                 ax.annotate("", (s[min(m + 1, len(s) - 1), 0], -s[min(m + 1, len(s) - 1), 1]), (s[m - 1, 0], -s[m - 1, 1]),
                             arrowprops=dict(arrowstyle="-|>", color=col, lw=1.1, mutation_scale=10))
-            ax.text(s[0, 0] - 0.05, -s[0, 1] + 0.05, str(i), fontsize=7, color=col, ha="right")
-        ax.set_title(f"{c} ({len(strokes)})", fontsize=9)
+            if numbered:
+                ax.text(s[0, 0] - 0.06, -s[0, 1] + 0.06, str(i), fontsize=7, color=col, ha="right", clip_on=True)
         ax.set_aspect("equal")
         ax.axis("off")
+
+    for k, c in enumerate(CHARS):
+        ax = fig.add_subplot(grid[k // cols, 2 * (k % cols):2 * (k % cols) + 2])
+        for y in (0, 1):
+            ax.axhline(y, color="0.9", lw=0.8, zorder=0)
+        draw(ax, [np.asarray(s) for s in entry["glyphs"][c]["strokes"]], entry["glyphs"][c]["marks"], True)
+        ax.set_xlim(-0.25, 1.65)
+        ax.set_ylim(-0.85, 2.05)
+        ax.text(-0.2, -0.8, f"{c}  ({len(entry['glyphs'][c]['strokes'])})", fontsize=9, va="bottom")
     for j, w in enumerate(words):
-        ax = fig.add_subplot(grid[len(CHARS) // cols + 1 + j, :])
+        ax = fig.add_subplot(grid[rows + j // 2, cols * (j % 2):cols * (j % 2) + cols])
         strokes = compose(entry, w, layout(entry, w))
-        for s, col in zip(strokes, plt.cm.viridis(np.linspace(0, 0.9, max(1, len(strokes))))):
-            ax.plot(s[:, 0], -s[:, 1], color=col, lw=1.8, solid_capstyle="round")
-            ax.plot(s[0, 0], -s[0, 1], "o", color=col, ms=3)
-        ax.set_title(f"{w!r}: {len(strokes)} strokes", loc="left", fontsize=9)
-        ax.set_aspect("equal")
-        ax.axis("off")
-    fig.suptitle(f"{entry['font']}: numbered in drawing order, dot = start, arrow = direction, dashed = drawn after the word", fontsize=12)
-    fig.tight_layout()
+        draw(ax, strokes)
+        pts = np.vstack(strokes)
+        ax.set_xlim(pts[:, 0].min() - 0.2, pts[:, 0].min() + max(np.ptp(pts[:, 0]) + 0.4, 9))
+        ax.set_ylim(-pts[:, 1].max() - 0.15, -pts[:, 1].min() + 0.15)
+        ax.text(pts[:, 0].min() - 0.2, -pts[:, 1].min() + 0.1, f"{w!r}: {len(strokes)} strokes", fontsize=9, va="bottom")
+    fig.suptitle(f"{entry['font']}: strokes numbered in drawing order, dot = start, arrow = direction, dashed = drawn after the word; "
+                 "grey lines = baseline and x-height", fontsize=11)
     fig.savefig(path, dpi=80)
 
 
@@ -201,6 +258,9 @@ def build_command(args):
     path = f"data/raw/glyphs/{slug(args.font)}/review.png"
     sheet(entry, path)
     print(f"{slug(args.font)}: {len(entry['glyphs'])} glyphs -> {args.store}; review sheet {path}")
+    flags = against_grain(entry)
+    if flags:
+        print(f"  check by eye, strokes against the usual direction: {', '.join(flags)}")
 
 
 def words_command(args):

@@ -20,8 +20,40 @@
         "marks": [
           1
         ]
+      },
+      "D": {
+        "note": "first stroke runs leftward into the loop; correct for cursive D"
+      },
+      "F": {
+        "note": "leftward hook stroke is part of the letterform"
       }
     },
     "todo": "H traces as 5 strokes and 4/5 have extra pieces; review once capitals and digits matter"
+  },
+  "patrickhand_regular": {
+    "cursive": false,
+    "glyphs": {
+      "!": {
+        "prompt": "Recognize and derender.",
+        "note": "the text-hint prompt drew only the dot"
+      },
+      "?": {
+        "prompt": "Recognize and derender.",
+        "note": "the text-hint prompt added a stray point"
+      },
+      "f": {
+        "ops": [
+          "reverse:0"
+        ],
+        "note": "InkSight draws the stem bottom-up with both prompts; people write it top-down"
+      },
+      "Q": {
+        "ops": [
+          "reverse:1"
+        ],
+        "note": "the tail is traced up into the bowl; it is flicked down and out"
+      }
+    },
+    "reviewed": true
   }
 }

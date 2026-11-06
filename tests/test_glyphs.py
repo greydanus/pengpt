@@ -53,3 +53,12 @@ def test_cut_keeps_the_middle_letter_and_its_descender():
     word = np.array([[2, 50], [9, 40], [12, 45], [18, 40], [15, 70], [8, 75], [21, 48], [28, 40]], float)
     (mid,) = cut(row, [word], Font(), 10)
     assert np.allclose(mid[0], [12, 45]) and np.allclose(mid[-1], [8, 75])
+
+
+def test_dots_snap_to_the_ink_and_missing_dots_are_added():
+    from tools.glyphs import snap_dots
+    stem, near = np.array([[50.0, 40], [50, 100]]), np.array([[57.0, 22], [58, 23]])
+    out = snap_dots([stem, near], [(60.0, 20.0, 10.0), (90.0, 95.0, 8.0)], xh=100)
+    assert len(out) == 3 and np.allclose(out[0], stem)
+    assert np.allclose(out[1].mean(0), [60, 20], atol=1) and np.allclose(np.hypot(*(out[1] - [60, 20]).T), 5)
+    assert np.allclose(out[2][0], [90, 91])
