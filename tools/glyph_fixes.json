@@ -135,6 +135,12 @@
           "join:0,1"
         ],
         "note": "user: top bar right-to-left, down, bottom bar as one stroke; then the middle bar"
+      },
+      "'": {
+        "ops": [
+          "reverse:0"
+        ],
+        "note": "drawn top-down"
       }
     },
     "reviewed": true,
@@ -157,17 +163,15 @@
       },
       "T": {
         "ops": [
-          "reverse:1",
-          "order:1,0"
+          "reverse:1"
         ],
-        "note": "bar first, left to right, then the stem"
+        "note": "template: stem first, then the bar left-to-right"
       },
       ",": {
         "ops": [
-          "join:0,1",
-          "reverse:0"
+          "drop:1"
         ],
-        "note": "one stroke, from the head down the tail"
+        "note": "traced twice; keep the top-down copy"
       },
       "N": {
         "note": "starting bottom-left and going up is a normal way to write N"
@@ -175,6 +179,43 @@
       "Q": {
         "prompt": "Recognize and derender.",
         "note": "auto: 1 strokes, cover 1.00 vs 12 strokes, cover 1.00 with the text-hint prompt"
+      },
+      "D": {
+        "ops": [
+          "split:0,9",
+          "reverse:1"
+        ],
+        "note": "template: stem top-down, then the bowl top-down"
+      },
+      "E": {
+        "ops": [
+          "drop:3",
+          "reverse:2",
+          "order:2,0,1",
+          "join:0,1"
+        ],
+        "note": "template: top bar right-to-left, stem, bottom bar as one stroke; then the middle bar (middle bar was traced twice)"
+      },
+      "M": {
+        "ops": [
+          "reverse:0",
+          "join:0,1"
+        ],
+        "note": "template: one stroke from the bottom"
+      },
+      "Y": {
+        "ops": [
+          "split:1,7",
+          "reverse:1",
+          "join:0,1"
+        ],
+        "note": "template: the V as one stroke, then the stem"
+      },
+      "'": {
+        "ops": [
+          "reverse:0"
+        ],
+        "note": "drawn top-down"
       }
     },
     "reviewed": true

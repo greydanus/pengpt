@@ -23,3 +23,12 @@ def test_glyph_library_spacing_and_layout():
     lib = glyph_library(entry, "OFL-1.1")
     steps = np.hypot(*np.diff(np.asarray(lib["glyphs"]["o"]["strokes"][0]), axis=0).T)
     assert np.allclose(steps, lib["step"], rtol=0.1) and lib["width"]["o"] > 0 and len(lib["sha256"]) == 64
+
+
+def test_suggest_joins_reverses_and_drops_double_traces():
+    from tools.template import suggest
+    left, diag = np.array([[0.0, -1.0], [0.0, -0.5], [0.0, 0.0]]), np.array([[0.0, -1.0], [0.4, -0.5], [0.8, 0.0], [0.8, -0.5], [0.8, -1.0]])
+    template = [s.tolist() for s in normalize([np.vstack([left[::-1], diag])])]
+    assert suggest([left, diag], template)[0] == ["reverse:0", "join:0,1"]
+    assert suggest([left, diag, diag + 0.01], template)[0] == ["drop:2", "reverse:0", "join:0,1"]
+    assert suggest([np.vstack([left[::-1], diag])], template) == ([], True)
