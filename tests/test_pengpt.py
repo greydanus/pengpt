@@ -553,3 +553,19 @@ def test_trimmed_eval_matches_full_length_loss(tiny_dataset):
     assert Xt.shape[1] < X.shape[1] and (Yt != IGNORE_INDEX).sum() == (Y != IGNORE_INDEX).sum()
     with torch.inference_mode():
         assert torch.allclose(model(X, C, Y)[1], model(Xt, Ct, Yt)[1], atol=1e-5)
+
+
+def test_generate_drops_a_word_cut_off_by_the_block(tmp_path, tiny_dataset):
+    st, cfg = tiny_dataset.stroke_tok, tiny_dataset.cfg
+    model = PenTransformer(ModelConfig(n_layer=1, n_head=2, n_embd=32, n_writers=2, vocab_size=st.vocab_size,
+                                       block_size=cfg.max_seq_length, context_vocab_size=257,
+                                       context_block_size=cfg.max_text_length))
+    attach_pen_deltas(model, st)
+    with torch.no_grad():
+        model.head.weight.zero_()
+        model.head.weight[0] = 1.0
+    from pengpt import generate_paragraph
+    words, tokens = generate(model, tiny_dataset, "ab cd", SampleParams(max_tokens=20, do_sample=False))
+    assert words == [] and tokens == []
+    para = generate_paragraph(model, tiny_dataset, "ab cd ef", SampleParams(max_tokens=20, do_sample=False))
+    assert len(para) == 3 and all(len(w) == 0 for w in para)

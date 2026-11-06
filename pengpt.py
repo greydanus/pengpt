@@ -931,7 +931,7 @@ def generate(model, dataset, text, params=None, prefix=()):
     end = np.flatnonzero(new == st.END)
     new = new[:end[0]] if end.size else new
     tokens = [w[w != st.WORD] for w in np.split(new[new != st.PAD], np.flatnonzero(new[new != st.PAD] == st.WORD))]
-    tokens = [t for t in tokens if len(t)]
+    tokens = [t for t in tokens if len(t)][:None if end.size else -1]
     return [st.decode_word(t) for t in tokens], tokens
 
 
@@ -1004,7 +1004,10 @@ def generate_paragraph(model, dataset, text, params=None, words=None, redo=None)
         if len(" ".join(prior + chunk).encode()) > dataset.cfg.max_text_length:
             prior, prior_tokens = [], []
         out, tokens = generate(model, dataset, " ".join(prior + chunk), params, prior_tokens)
-        words += (out + [np.zeros((0, 3))] * len(chunk))[:len(chunk)]
+        for word in chunk[len(out):]:
+            more, more_tokens = generate(model, dataset, word, params)
+            out, tokens = out + (more or [np.zeros((0, 3))])[:1], tokens + more_tokens[:1]
+        words += out[:len(chunk)]
         complete = params.burn_in and len(tokens) >= len(chunk)
         prior, prior_tokens = (chunk[-params.burn_in:], tokens[:len(chunk)][-params.burn_in:]) if complete else ([], [])
     return words
