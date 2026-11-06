@@ -49,10 +49,14 @@
       },
       "Q": {
         "ops": [
-          "reverse:0",
-          "order:1,0"
+          "split:1,5",
+          "split:2,9",
+          "drop:1",
+          "order:2,1,0",
+          "join:0,1",
+          "reverse:1"
         ],
-        "note": "bowl first (counterclockwise), then the tail flicked down and out"
+        "note": "user: start the loop where the O starts (top), then the tail"
       },
       "x": {
         "ops": [
