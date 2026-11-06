@@ -2,364 +2,238 @@ import argparse
 import json
 import os
 import string
-from itertools import combinations
+import time
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from scipy import ndimage
+
+from tools.ink import file_hash, ink_baseline, on_ink, read_jsonl, write_jsonl
 
 CHARS = string.ascii_lowercase + string.ascii_uppercase + string.digits + "\"'(),.?!"
 SHORT = "acemnorsuvwxz"
-XH = 120
-NB8 = [(-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1)]
+PROMPTS = ("Derender the ink: {text}", "Recognize and derender.")
+STORE, FIXES = "data/glyphs.json", "tools/glyph_fixes.json"
+SIZE, PAD = 200, 8
 
 
-def thin(img):
-    img = np.pad(img.astype(np.uint8), 1)
-    while True:
-        changed = False
-        for step in (0, 1):
-            p = [np.roll(np.roll(img, -dy, 0), -dx, 1) for dy, dx in NB8]
-            b = sum(p)
-            a = sum((p[i] == 0) & (p[(i + 1) % 8] == 1) for i in range(8))
-            c1 = p[0] * p[2] * p[4] if step == 0 else p[0] * p[2] * p[6]
-            c2 = p[2] * p[4] * p[6] if step == 0 else p[0] * p[4] * p[6]
-            kill = (img == 1) & (b >= 2) & (b <= 6) & (a == 1) & (c1 == 0) & (c2 == 0)
-            if kill.any():
-                img[kill], changed = 0, True
-        if not changed:
-            return img[1:-1, 1:-1].astype(bool)
+def slug(font_path):
+    return os.path.splitext(os.path.basename(font_path))[0].lower().replace("-", "_")
 
 
-def crossings(sk):
-    p = [np.roll(np.roll(np.pad(sk, 1), -dy, 0), -dx, 1)[1:-1, 1:-1] for dy, dx in NB8]
-    return sum(~p[i] & p[(i + 1) % 8] for i in range(8)) * sk
+def advance(font, text, i):
+    return font.getlength(text[:i + 1]) - font.getlength(text[i])
 
 
-def neighbors(sk, p):
-    h, w = sk.shape
-    return [(p[0] + dy, p[1] + dx) for dy, dx in NB8 if 0 <= p[0] + dy < h and 0 <= p[1] + dx < w and sk[p[0] + dy, p[1] + dx]]
+def contexts(c, cursive):
+    if cursive and c in string.ascii_lowercase:
+        return "n" + c + "n", 1
+    if cursive and c in string.ascii_uppercase:
+        return c + "n", 0
+    return c, 0
 
 
-def prune(sk, length, thick):
-    sk = sk.copy()
-    for _ in range(3):
-        kind, removed = crossings(sk), False
-        for y, x in np.argwhere(kind == 1):
-            path, prev, cur = [(y, x)], None, (y, x)
-            while len(path) <= 6 * length:
-                nb = [q for q in neighbors(sk, cur) if q != prev and q not in path]
-                if len(nb) != 1:
-                    break
-                prev, cur = cur, nb[0]
-                if kind[cur] >= 3:
-                    break
-                path.append(cur)
-            if kind[cur] >= 3 and len(path) <= max(length, 1.3 * thick[cur]):
-                for q in path:
-                    sk[q] = False
-                removed = True
-        if not removed:
-            return sk
-    return sk
+def render(font_path, out, cursive):
+    font = ImageFont.truetype(font_path, SIZE)
+    os.makedirs(f"{out}/images", exist_ok=True)
+    rows = []
+    for k, c in enumerate(CHARS):
+        text, pos = contexts(c, cursive)
+        left, top, right, bottom = font.getbbox(text, anchor="ls")
+        img = Image.new("RGB", (right - left + 2 * PAD, bottom - top + 2 * PAD), "white")
+        ImageDraw.Draw(img).text((PAD - left, PAD - top), text, font=font, fill="black", anchor="ls")
+        path = f"{out}/images/{k:02d}.png"
+        img.save(path)
+        rows.append({"image": path, "char": c, "text": text, "pos": pos, "baseline": PAD - top, "x0": PAD - left})
+    write_jsonl(f"{out}/manifest.jsonl", rows)
+    return rows
 
 
-def walk(sk, start, first, node, nid, visited):
-    path, prev, cur = [start, first], start, first
-    visited[first] = True
-    while True:
-        cand = [r for r in neighbors(sk, cur) if r != prev and r not in path[-3:]]
-        hit = [r for r in cand if node[r] and (nid[r] != nid[start] or len(path) > 4)]
-        if hit:
-            return path + [hit[0]]
-        cand = sorted((r for r in cand if not visited[r] and not node[r]), key=lambda r: abs(r[0] - cur[0]) + abs(r[1] - cur[1]))
-        if not cand:
-            return path
-        prev, cur = cur, cand[0]
-        visited[cur] = True
-        path.append(cur)
+def trace(rows, out, weights, batch=16):
+    from tools.inksight import InkSight
+    model = InkSight(weights)
+    done = {(r["hash"], r["prompt"]) for r in read_jsonl(out)}
+    for prompt in PROMPTS:
+        todo = [r for r in rows if (file_hash(r["image"]), prompt) not in done]
+        t = time.time()
+        for i in range(0, len(todo), batch):
+            chunk = todo[i:i + batch]
+            got = model.trace([Image.open(r["image"]) for r in chunk], [r["text"] for r in chunk], prompt)
+            write_jsonl(out, [{"image": r["image"], "hash": file_hash(r["image"]), "prompt": prompt, "strokes": s, "read": read}
+                              for r, (s, read) in zip(chunk, got)], "a")
+        print(f"[{prompt}] {len(todo)} glyphs in {time.time() - t:.0f}s")
 
 
-def edges(sk):
-    kind = crossings(sk)
-    node = sk & (kind != 2)
-    nid, _ = ndimage.label(node, np.ones((3, 3)))
-    visited, out = np.zeros_like(sk), []
-    for p in map(tuple, np.argwhere(node)):
-        for q in neighbors(sk, p):
-            if not node[q] and not visited[q]:
-                out.append(walk(sk, p, q, node, nid, visited))
-    loops, n = ndimage.label(sk & ~node & ~visited, np.ones((3, 3)))
-    for k in range(1, n + 1):
-        pts = np.argwhere(loops == k)
-        start = tuple(pts[pts[:, 0].argmin()])
-        nb = neighbors(sk, start)
-        path = walk(sk, start, nb[0], node, nid, visited) if nb else [start]
-        out.append(path + [path[0]])
-    touched = {nid[e[0]] for e in out} | {nid[e[-1]] for e in out}
-    for k in set(range(1, nid.max() + 1)) - touched:
-        out.append([tuple(np.round(np.argwhere(nid == k).mean(0)).astype(int))])
-    return out, nid
-
-
-def strokes_of(sk, bridge=0, spur=0, tangent_len=25):
-    es, nid = edges(sk)
-    closed = [len(e) > 2 and e[0] == e[-1] and not nid[e[0]] for e in es]
-    count = {}
-    for i, e in enumerate(es):
-        if len(e) > 1 and not closed[i]:
-            for p in (e[0], e[-1]):
-                count[nid[p]] = count.get(nid[p], 0) + 1
-    def tangent(i, side):
-        pts = np.asarray(es[i] if side == 0 else es[i][::-1], float)
-        v = pts[min(len(pts) - 1, tangent_len)] - pts[0]
-        return v / (np.linalg.norm(v) + 1e-9)
-
-    def along(i):
-        v = np.subtract(es[i][-1], es[i][0]) / (np.linalg.norm(np.subtract(es[i][-1], es[i][0])) + 1e-9)
-        arms = lambda k: [tangent(j, side) for j, f in enumerate(es) if j != i and len(f) > 1 for side, p in ((0, f[0]), (1, f[-1])) if nid[p] == k]
-        return all(max([abs(v @ t) for t in arms(k)] or [0]) > 0.8 for k in (nid[es[i][0]], nid[es[i][-1]]))
-
-    root = {}
-    find = lambda k: k if root.get(k, k) == k else find(root[k])
-    skip, tips = set(), []
-    for i, e in enumerate(es):
-        a, b = nid[e[0]], nid[e[-1]]
-        if len(e) > 1 and not closed[i] and a and b and count[a] >= 3 and count[b] >= 3 and (len(e) <= bridge / 3 or (len(e) <= bridge and along(i))):
-            if find(a) != find(b):
-                root[find(a)] = find(b)
-            skip.add(i)
-        elif len(e) > 1 and not closed[i] and len(e) <= spur and min(count.get(a, 1), count.get(b, 1)) == 1 and max(count.get(a, 1), count.get(b, 1)) >= 3:
-            skip.add(i)
-            tips.append((a, e[-1]) if count.get(a, 1) >= 3 else (b, e[0]))
-    ends = {}
-    for i, e in enumerate(es):
-        if len(e) > 1 and not closed[i] and i not in skip:
-            ends.setdefault(find(nid[e[0]]), []).append((i, 0))
-            ends.setdefault(find(nid[e[-1]]), []).append((i, 1))
-
-    link = {}
-    for node, group in ends.items():
-        if node == 0:
-            continue
-        for d, a, b in sorted((tangent(*a) @ tangent(*b), a, b) for a, b in combinations(group, 2)):
-            if d > -0.5:
-                break
-            if a not in link and b not in link:
-                link[a], link[b] = b, a
-        left = [e for e in group if e not in link]
-        if len(left) == 2:
-            link[left[0]], link[left[1]] = left[1], left[0]
-    done, out = set(skip), []
-
-    tip = {find(k): p for k, p in tips}
-
-    def run(i, side):
-        pts = []
-        while True:
-            done.add(i)
-            seg = es[i] if side == 0 else es[i][::-1]
-            pts += seg if not pts else seg[1:]
-            if (i, 1 - side) not in link:
-                return pts, False
-            j, t = link[(i, 1 - side)]
-            node = find(nid[seg[-1]])
-            if node in tip and tangent(i, 1 - side) @ tangent(j, t) > -0.7:
-                pts.append(tip[node])
-            i, side = j, t
-            if i in done:
-                return pts, True
-    for i, side in [(i, s) for i, e in enumerate(es) if len(e) > 1 and not closed[i] for s in (0, 1)]:
-        if i not in done and (i, side) not in link:
-            out.append(run(i, side))
-    for i, e in enumerate(es):
-        if i not in done:
-            done.add(i)
-            out.append(run(i, 0) if len(e) > 1 and not closed[i] else (e, len(e) > 1))
-    return [(np.asarray(p, float)[:, ::-1], c) for p, c in out]
-
-
-def orient(pts, closed):
-    if len(pts) < 2:
-        return pts
-    if closed:
-        pts = pts[:-1]
-        area = np.sum(pts[:, 0] * np.roll(pts[:, 1], -1) - np.roll(pts[:, 0], -1) * pts[:, 1])
-        pts = pts[::-1] if area > 0 else pts
-        top = np.argmin(pts[:, 1])
-        return np.vstack([np.roll(pts, -top, 0), np.roll(pts, -top, 0)[:1]])
-    lead = lambda p: p[1] + 0.5 * p[0]
-    return pts[::-1] if lead(pts[-1]) < lead(pts[0]) else pts
-
-
-def dot(p, thick, n=10):
-    r = max(1.5, 0.6 * thick[int(round(p[1])), int(round(p[0]))])
-    a = np.pi / 2 + np.linspace(0, 2 * np.pi, n + 1)
-    return np.column_stack([p[0] + r * np.cos(a), p[1] - r * np.sin(a)])
-
-
-def sharpen(s, thick, w):
-    if len(s) < 2 * w + 1:
-        return s
-    s = s.copy()
-    d = lambda v: v / (np.linalg.norm(v) + 1e-9)
-    turn = np.array([0.0] * w + [1 - d(s[k] - s[k - w]) @ d(s[k + w] - s[k]) for k in range(w, len(s) - w)] + [0.0] * w)
-    r = np.median([thick[int(round(y)), int(round(x))] for x, y in s])
-    for k in range(w, len(s) - w):
-        if turn[k] < 1.0 or turn[k] < turn[k - 1] or turn[k] < turn[k + 1]:
-            continue
-        out = d(d(s[k] - s[k - w]) - d(s[k + w] - s[k]))
-        q = s[k].copy()
-        while True:
-            nxt = q + out
-            y, x = int(round(nxt[1])), int(round(nxt[0]))
-            if not (0 <= y < thick.shape[0] and 0 <= x < thick.shape[1]) or thick[y, x] < 0.75 * r:
-                break
-            q = nxt
-        s[k] = q
-        for j in range(1, w // 2):
-            s[k - j] = s[k - w // 2] + (q - s[k - w // 2]) * (1 - j / (w // 2))
-            s[k + j] = s[k + w // 2] + (q - s[k + w // 2]) * (1 - j / (w // 2))
-    return s
-
-
-def delayed(s, others):
-    ext = np.ptp(s, 0) if len(s) > 1 else np.zeros(2)
-    if ext.max() < 0.2 * XH:
-        return True
-    if ext[0] > 2 * ext[1] and len(s) > 4:
-        mid = s[len(s) // 5: -len(s) // 5 or None]
-        return any(len(o) > 1 and np.min(np.hypot(*(mid[:, None] - o[None]).transpose(2, 0, 1))) < 0.06 * XH for o in others)
-    return False
-
-
-def smooth(pts, w=5):
-    if len(pts) <= 4 * w:
-        return pts
-    k = np.ones(w) / w
-    out = pts.copy()
-    out[w // 2: -(w // 2)] = np.column_stack([np.convolve(pts[:, i], k, "valid") for i in (0, 1)])
-    return np.vstack([out[::3], out[-1:]]) if len(out) % 3 != 1 else out[::3]
-
-
-def font_at_xheight(path, xh=XH):
-    probe = ImageFont.truetype(path, 100)
-    h = np.median([np.ptp(probe.getbbox(c, anchor="ls")[1::2]) for c in SHORT])
-    return ImageFont.truetype(path, max(8, int(round(100 * xh / h))))
-
-
-def glyph_strokes(font, c, fixes=None):
-    l, t, r, b = font.getbbox(c, anchor="ls")
-    pad = 20
-    img = Image.new("L", (r - l + 2 * pad, b - t + 2 * pad), 255)
-    ox, oy = pad - l, pad - t
-    ImageDraw.Draw(img).text((ox, oy), c, font=font, fill=0, anchor="ls")
-    ink = np.asarray(img) < 128
-    if not ink.any():
-        return [], img, (ox, oy)
-    thick = ndimage.distance_transform_edt(ink)
-    width = 2 * np.median(thick[ink])
-    sk = prune(thin(ink), int(1.5 * width), thick)
-    raw = [orient(p, closed) if len(p) > 1 else dot(p[0], thick) for p, closed in strokes_of(sk, int(6 * width + 4), int(2 * width))]
-    raw = [s for s in raw if len(s) > 2 or np.ptp(s, 0).max() > 0.08 * XH]
-    raw = [sharpen(s, thick, max(4, int(width))) for s in raw]
-    late = [delayed(s, [o for o in raw if o is not s]) for s in raw]
-    order = sorted(range(len(raw)), key=lambda i: (late[i], raw[i][0][0]))
-    out = [smooth(raw[i]) - [ox, oy] for i in order]
-    for fix in (fixes or {}).get(c, {}).get("ops", []):
-        op, arg = fix.split(":")
-        k = [int(a) for a in arg.split(",")]
-        if op == "reverse":
-            out[k[0]] = out[k[0]][::-1]
-        elif op == "order":
-            out = [out[i] for i in k]
-        elif op == "drop":
-            out.pop(k[0])
-        elif op == "join":
-            a, b = out[k[0]], out[k[1]]
-            pairs = [(np.hypot(*(x[-1] - y[0])), x, y) for x in (a, a[::-1]) for y in (b, b[::-1])]
-            _, x, y = min(pairs, key=lambda q: q[0])
-            out[k[0]] = np.vstack([x, y])
-            out.pop(k[1])
-    return out, img, (ox, oy)
-
-
-def load_fixes(path):
-    return json.load(open(path)) if path and os.path.exists(path) else {}
-
-
-def compose(font, glyphs, text, join=0.06 * XH):
+def cut(row, strokes, font, xh):
+    text, pos = row["text"], row["pos"]
+    base = row["baseline"]
+    lo = row["x0"] + advance(font, text, pos) if pos else -1e9
+    hi = row["x0"] + advance(font, text, pos + 1) if pos + 1 < len(text) else 1e9
     out = []
-    for i, c in enumerate(text):
-        x = font.getlength(text[:i + 1]) - font.getlength(c)
-        for s in glyphs.get(c, []):
-            s = s + [x, 0]
-            if out and len(s) > 1 and len(out[-1]) > 1 and np.hypot(*(out[-1][-1] - s[0])) < join:
-                out[-1] = np.vstack([out[-1], s[1:]])
-            else:
-                out.append(s)
+    for s in strokes:
+        mid = ((s[:, 0] >= lo) & (s[:, 0] <= hi)) | (s[:, 1] < base - 1.15 * xh) | (s[:, 1] > base + 0.15 * xh)
+        if mid.any():
+            a, b = np.flatnonzero(mid)[[0, -1]]
+            if b > a or len(s) == 1:
+                out.append(s[a:b + 1])
     return out
 
 
-def sheet_command(args):
+def is_mark(s, c):
+    ext = np.ptp(s, 0) if len(s) > 1 else np.zeros(2)
+    return (c in "ij" and ext.max() < 0.4) or (c in "tx" and ext[0] > 1.5 * ext[1] and ext[1] < 0.5)
+
+
+def apply_ops(strokes, ops):
+    for op in ops:
+        name, arg = op.split(":")
+        k = [int(a) for a in arg.split(",")]
+        if name == "reverse":
+            strokes[k[0]] = strokes[k[0]][::-1]
+        elif name == "order":
+            strokes = [strokes[i] for i in k]
+        elif name == "drop":
+            strokes.pop(k[0])
+        elif name == "join":
+            strokes[k[0]] = np.vstack([strokes[k[0]], strokes[k[1]]])
+            strokes.pop(k[1])
+    return strokes
+
+
+def build(font_path, fixes):
+    s = slug(font_path)
+    out, fix = f"data/raw/glyphs/{s}", fixes.get(s, {})
+    font = ImageFont.truetype(font_path, SIZE)
+    xh = np.median([np.ptp(font.getbbox(c, anchor="ls")[1::2]) for c in SHORT])
+    shift = ink_baseline(font)
+    rows = {r["image"]: r for r in read_jsonl(f"{out}/manifest.jsonl")}
+    traces = {(r["image"], r["prompt"]): r for r in read_jsonl(f"{out}/traces.jsonl")}
+    glyphs = {}
+    for image, row in rows.items():
+        c, g = row["char"], fix.get("glyphs", {}).get(row["char"], {})
+        t = traces[(image, g.get("prompt", PROMPTS[0]))]
+        strokes = [np.asarray(p, float) for p in on_ink(t["strokes"], Image.open(image)) if len(p)]
+        strokes = apply_ops(cut(row, strokes, font, xh), g.get("ops", []))
+        origin = [row["x0"] + advance(font, row["text"], row["pos"]), row["baseline"] + shift]
+        strokes = [(p - origin) / xh for p in strokes]
+        marks = g.get("marks", [k for k, p in enumerate(strokes) if is_mark(p, c)])
+        glyphs[c] = {"strokes": [p.round(4).tolist() for p in strokes], "marks": marks}
+    return {"font": os.path.basename(font_path), "size": SIZE, "xh": float(xh), "cursive": bool(fix.get("cursive")),
+            "reviewed": bool(fix.get("reviewed")), "glyphs": glyphs}
+
+
+def compose(entry, text, xs, bridge=1.0):
+    g = entry["glyphs"]
+    out, marks, prev = [], [], None
+    for c, x in zip(text, xs):
+        if c not in g:
+            out, marks, prev = out + marks, [], None
+            continue
+        for k, s in enumerate(g[c]["strokes"]):
+            s = np.asarray(s) + [x, 0]
+            if k in g[c]["marks"]:
+                (marks if entry["cursive"] else out).append(s)
+                continue
+            joined = k > 0 or (prev or "").islower() or ((prev or "").isupper() and np.hypot(*(out[-1][-1] - s[0])) < bridge)
+            if entry["cursive"] and c.islower() and out and joined:
+                out[-1] = np.vstack([out[-1], s])
+            else:
+                out.append(s)
+        prev = c
+    return out + marks
+
+
+def layout(entry, text, font_dir="data/raw/fonts"):
+    font = ImageFont.truetype(f"{font_dir}/{entry['font']}", entry["size"])
+    return [advance(font, text, i) / entry["xh"] for i in range(len(text))]
+
+
+def load(path):
+    return json.load(open(path)) if os.path.exists(path) else {}
+
+
+def sheet(entry, path, words=("minimum", "Ithaca,", "quick brown", "Hello!", "jumpy (1184)", "Queen")):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    font, fixes = font_at_xheight(args.font), load_fixes(args.fixes)
-    chars = args.chars or CHARS
-    cols = 13
-    fig, axes = plt.subplots((len(chars) + cols - 1) // cols, cols, figsize=(cols * 1.5, 1.9 * ((len(chars) + cols - 1) // cols)))
-    for ax in axes.flat:
-        ax.axis("off")
-    for ax, c in zip(axes.flat, chars):
-        strokes, img, (ox, oy) = glyph_strokes(font, c, fixes)
-        ax.imshow(img, cmap="gray", alpha=0.18, extent=(-ox, img.size[0] - ox, img.size[1] - oy, -oy))
-        colors = plt.cm.plasma(np.linspace(0, 0.85, max(1, len(strokes))))
-        for k, (s, col) in enumerate(zip(strokes, colors)):
-            ax.plot(s[:, 0], s[:, 1], color=col, lw=1.6)
-            ax.plot(*s[0], "o", color=col, ms=4)
+    cols = 14
+    fig = plt.figure(figsize=(cols * 1.4, 1.6 * (len(CHARS) // cols + 1) + 1.4 * len(words)))
+    grid = fig.add_gridspec(len(CHARS) // cols + 1 + len(words), cols)
+    for k, c in enumerate(CHARS):
+        ax = fig.add_subplot(grid[k // cols, k % cols])
+        strokes = [np.asarray(s) for s in entry["glyphs"][c]["strokes"]]
+        for i, (s, col) in enumerate(zip(strokes, plt.cm.plasma(np.linspace(0, 0.85, max(1, len(strokes)))))):
+            ax.plot(s[:, 0], -s[:, 1], color=col, lw=1.5, ls="--" if i in entry["glyphs"][c]["marks"] else "-")
+            ax.plot(s[0, 0], -s[0, 1], "o", color=col, ms=3.5)
             if len(s) > 3:
                 m = len(s) * 3 // 5
-                ax.annotate("", s[min(m + 1, len(s) - 1)], s[m - 1], arrowprops=dict(arrowstyle="-|>", color=col, lw=1.2, mutation_scale=11))
-            ax.text(s[0][0] - 6, s[0][1] - 6, str(k), fontsize=7, color=col, ha="right")
-        ax.set_title(f"{c}  ({len(strokes)})", fontsize=10)
+                ax.annotate("", (s[min(m + 1, len(s) - 1), 0], -s[min(m + 1, len(s) - 1), 1]), (s[m - 1, 0], -s[m - 1, 1]),
+                            arrowprops=dict(arrowstyle="-|>", color=col, lw=1.1, mutation_scale=10))
+            ax.text(s[0, 0] - 0.05, -s[0, 1] + 0.05, str(i), fontsize=7, color=col, ha="right")
+        ax.set_title(f"{c} ({len(strokes)})", fontsize=9)
         ax.set_aspect("equal")
-    fig.suptitle(f"{os.path.basename(args.font)}: strokes numbered in drawing order, dot = start, arrow = direction", fontsize=12)
+        ax.axis("off")
+    for j, w in enumerate(words):
+        ax = fig.add_subplot(grid[len(CHARS) // cols + 1 + j, :])
+        strokes = compose(entry, w, layout(entry, w))
+        for s, col in zip(strokes, plt.cm.viridis(np.linspace(0, 0.9, max(1, len(strokes))))):
+            ax.plot(s[:, 0], -s[:, 1], color=col, lw=1.8, solid_capstyle="round")
+            ax.plot(s[0, 0], -s[0, 1], "o", color=col, ms=3)
+        ax.set_title(f"{w!r}: {len(strokes)} strokes", loc="left", fontsize=9)
+        ax.set_aspect("equal")
+        ax.axis("off")
+    fig.suptitle(f"{entry['font']}: numbered in drawing order, dot = start, arrow = direction, dashed = drawn after the word", fontsize=12)
     fig.tight_layout()
-    fig.savefig(args.out, dpi=90)
-    print(f"sheet: {args.out}")
+    fig.savefig(path, dpi=80)
+
+
+def trace_command(args):
+    fixes = load(args.fixes)
+    out = f"data/raw/glyphs/{slug(args.font)}"
+    rows = render(args.font, out, bool(fixes.get(slug(args.font), {}).get("cursive")))
+    trace(rows, f"{out}/traces.jsonl", args.weights, args.batch)
+
+
+def build_command(args):
+    entry = build(args.font, load(args.fixes))
+    store = load(args.store)
+    store[slug(args.font)] = entry
+    json.dump(store, open(args.store, "w"))
+    path = f"data/raw/glyphs/{slug(args.font)}/review.png"
+    sheet(entry, path)
+    print(f"{slug(args.font)}: {len(entry['glyphs'])} glyphs -> {args.store}; review sheet {path}")
 
 
 def words_command(args):
-    font, fixes = font_at_xheight(args.font), load_fixes(args.fixes)
-    glyphs = {c: glyph_strokes(font, c, fixes)[0] for c in CHARS}
+    entry = load(args.store)[args.name]
     rows = []
     for text in (w.strip() for w in open(args.words) if w.strip()):
-        strokes = compose(font, glyphs, text)
-        rows.append({"text": text, "strokes": [s.round(2).tolist() for s in strokes], "baseline": 0.0, "style": args.style,
-                     "writer": args.style, "source": os.path.basename(args.font), "license": args.license})
-    with open(args.out, "w") as f:
-        f.writelines(json.dumps(r) + "\n" for r in rows)
-    print(f"wrote {len(rows)} words from glyph strokes to {args.out}")
+        strokes = compose(entry, text, layout(entry, text))
+        rows.append({"text": text, "strokes": [s.round(4).tolist() for s in strokes], "baseline": 0.0, "style": args.name,
+                     "writer": args.name, "source": entry["font"], "license": args.license})
+    write_jsonl(args.out, rows)
+    print(f"wrote {len(rows)} words in {args.name} to {args.out}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="pen strokes straight from a font's glyphs: skeleton, stroke order, word assembly")
+    parser = argparse.ArgumentParser(description="pen strokes for a font: trace each glyph with InkSight, review, assemble words")
     sub = parser.add_subparsers(dest="command", required=True)
-    p = sub.add_parser("sheet", help="every glyph's strokes, numbered and arrowed, for checking by eye")
+    p = sub.add_parser("trace", help="render every glyph (cursive: inside joining context) and trace it with InkSight")
     p.add_argument("--font", required=True)
-    p.add_argument("--fixes", default="")
-    p.add_argument("--chars", default="")
-    p.add_argument("--out", required=True)
-    p = sub.add_parser("words", help="assemble words from glyph strokes, as rows like tools/ink.py qc writes")
+    p.add_argument("--batch", type=int, default=16)
+    p.add_argument("--weights", default="inksight", help="folder with the port's weights.npz and spm.model")
+    p.add_argument("--fixes", default=FIXES)
+    p = sub.add_parser("build", help="apply review fixes, save the font's glyphs to the store, draw the review sheet")
     p.add_argument("--font", required=True)
-    p.add_argument("--fixes", default="")
+    p.add_argument("--fixes", default=FIXES)
+    p.add_argument("--store", default=STORE)
+    p = sub.add_parser("words", help="assemble words from stored glyphs, as rows like tools/ink.py qc writes")
+    p.add_argument("--name", required=True)
     p.add_argument("--words", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--style", required=True)
     p.add_argument("--license", required=True)
+    p.add_argument("--store", default=STORE)
     args = parser.parse_args()
-    {"sheet": sheet_command, "words": words_command}[args.command](args)
+    {"trace": trace_command, "build": build_command, "words": words_command}[args.command](args)
 
 
 if __name__ == "__main__":

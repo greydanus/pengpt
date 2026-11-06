@@ -145,13 +145,20 @@ one scale per recording frame, plus a sheet of samples to eyeball. Sources:
   than the original on a GPU (43 ms/word on an RTX 4090); `export` (needs TensorFlow, once) writes its weights.
   `tools/pod.sh` runs all of this on a RunPod GPU, and `peek` draws traces
   over their images to check quality.
+- Fonts: `tools/glyphs.py` traces each of a font's 70 characters once with
+  InkSight (cursive letters inside an "n_n" context so their joins come out),
+  then assembles any word from those glyphs. `trace --font F` takes about a
+  minute on a laptop GPU; `build --font F` applies the by-eye review fixes in
+  `tools/glyph_fixes.json`, saves the glyphs to `data/glyphs.json` and draws a
+  review sheet; `words` writes rows for `traces`. Cursive words come out as one
+  stroke, with i/j dots and t/x crosses drawn after the word.
 
 ## Repo map
 
 ```
 pengpt.py     tokenizer, data, model, training, sampling; train/sample/rank/check commands
 utils.py      training presets
-tools/        datasets.py (public corpora), ink.py (image tracing), inksight.py (InkSight in PyTorch), pod.sh (RunPod)
+tools/        datasets.py (public corpora), ink.py (image tracing), inksight.py (InkSight in PyTorch), glyphs.py (fonts), pod.sh (RunPod)
 collect.html  data collection page
 tests/        pytest suite
 EXPERIMENTS.md  measured results behind the defaults

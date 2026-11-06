@@ -1,0 +1,27 @@
+{
+  "playwriteustrad_variable": {
+    "cursive": true,
+    "glyphs": {
+      "4": {
+        "prompt": "Recognize and derender.",
+        "note": "two natural strokes; the text-hint prompt adds a third"
+      },
+      "7": {
+        "prompt": "Recognize and derender.",
+        "note": "one stroke; the text-hint prompt lifts before the diagonal"
+      },
+      ",": {
+        "prompt": "Recognize and derender.",
+        "note": "one stroke instead of two"
+      },
+      "x": {
+        "prompt": "Recognize and derender.",
+        "note": "the text-hint prompt drew only the hump, no cross stroke; its cross stroke is drawn after the word",
+        "marks": [
+          1
+        ]
+      }
+    },
+    "todo": "H traces as 5 strokes and 4/5 have extra pieces; review once capitals and digits matter"
+  }
+}
