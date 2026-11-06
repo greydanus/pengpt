@@ -75,6 +75,62 @@
       ",": {
         "prompt": "Derender the ink: {text}",
         "note": "the recognize prompt draws the comma upward"
+      },
+      "D": {
+        "ops": [
+          "split:0,14",
+          "reverse:0"
+        ],
+        "note": "user: stem top-down, then the bowl top-down"
+      },
+      "u": {
+        "ops": [
+          "join:0,1"
+        ],
+        "note": "user: one stroke"
+      },
+      "b": {
+        "ops": [
+          "join:0,1"
+        ],
+        "note": "user: one stroke, back up the stem into the bowl"
+      },
+      "p": {
+        "ops": [
+          "join:0,1"
+        ],
+        "note": "user: one stroke, down, back up, then the bowl"
+      },
+      "M": {
+        "ops": [
+          "reverse:0",
+          "join:0,1"
+        ],
+        "note": "user: one stroke from the bottom"
+      },
+      "N": {
+        "ops": [
+          "reverse:0",
+          "join:0,1"
+        ],
+        "note": "user: one stroke from the bottom"
+      },
+      "Y": {
+        "ops": [
+          "split:1,7",
+          "reverse:1",
+          "join:0,1"
+        ],
+        "note": "user: the V as one stroke, then the stem"
+      },
+      "E": {
+        "ops": [
+          "reverse:1",
+          "order:1,0,3,2",
+          "join:0,1",
+          "join:0,1"
+        ],
+        "note": "user: top bar right-to-left, down, bottom bar as one stroke; then the middle bar"
       }
     },
     "reviewed": true

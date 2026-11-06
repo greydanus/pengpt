@@ -142,6 +142,8 @@ def apply_ops(strokes, ops):
         elif name == "join":
             strokes[k[0]] = np.vstack([strokes[k[0]], strokes[k[1]]])
             strokes.pop(k[1])
+        elif name == "split":
+            strokes[k[0]:k[0] + 1] = [strokes[k[0]][:k[1] + 1], strokes[k[0]][k[1]:]]
     return strokes
 
 
@@ -284,8 +286,52 @@ def compose(entry, text, xs, bridge=1.0, rails=None, log=None):
     return out + marks
 
 
-def write(entry, text, log=None):
-    return compose(entry, text, layout(entry, text), rails=Rails(entry, text) if entry["cursive"] else None, log=log)
+def unloop(s, reach=0.05, close=0.02):
+    keep, i = [0], 1
+    while i < len(s):
+        ahead = np.flatnonzero((walk(s[i:])[1:] < reach) & (np.hypot(*(s[i + 1:] - s[keep[-1]]).T) < close))[:len(s)]
+        i = i + 1 + ahead[-1] if len(ahead) else i
+        if i < len(s):
+            keep.append(i)
+        i += 1
+    return s[keep] if len(keep) > 1 else s
+
+
+def corners(s, scale=0.12, angle=60):
+    w = walk(s)
+    out = []
+    for i in range(1, len(s) - 1):
+        a, b = np.searchsorted(w, w[i] - scale), np.searchsorted(w, w[i] + scale)
+        u, v = s[i] - s[max(a, 0)], s[min(b, len(s) - 1)] - s[i]
+        cos = u @ v / (np.linalg.norm(u) * np.linalg.norm(v) + 1e-9)
+        if cos < np.cos(np.radians(angle)):
+            out.append(i)
+    return [i for k, i in enumerate(out) if k == 0 or i - out[k - 1] > 2]
+
+
+def clean(s, step=0.02, sigma=0.04):
+    if len(s) < 4:
+        return s
+    s = unloop(s)
+    cuts = [0] + corners(s) + [len(s) - 1]
+    out = []
+    for a, b in zip(cuts[:-1], cuts[1:]):
+        seg = s[a:b + 1]
+        w = walk(seg)
+        if w[-1] < 2 * step:
+            out.append(seg if not out else seg[1:])
+            continue
+        t = np.linspace(0, w[-1], max(2, int(round(w[-1] / step)) + 1))
+        u = np.column_stack([np.interp(t, w, seg[:, i]) for i in (0, 1)])
+        sm = ndimage.gaussian_filter1d(u, sigma / step, axis=0, mode="nearest")
+        sm[0], sm[-1] = u[0], u[-1]
+        out.append(sm if not out else sm[1:])
+    return np.vstack(out)
+
+
+def write(entry, text, log=None, smooth=True):
+    strokes = compose(entry, text, layout(entry, text), rails=Rails(entry, text) if entry["cursive"] else None, log=log)
+    return [clean(s) for s in strokes] if entry["cursive"] and smooth else strokes
 
 
 def layout(entry, text, font_dir="data/raw/fonts"):
