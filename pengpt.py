@@ -70,6 +70,7 @@ class TrainConfig:
     print_every: int = 100
     device: str = "auto"
     compile: bool = True
+    fp16: bool = False
     train_seed: int = 0
     out_dir: str = "out/default"
     resume: str = ""
@@ -839,7 +840,7 @@ def make_optimizers(model, cfg):
     is_matrix = lambda n, p: p.ndim == 2 and n.startswith("blocks.")
     opts = [torch.optim.AdamW([p for n, p in model.named_parameters() if not is_matrix(n, p)],
                               lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
-                              betas=(0.9, 0.99), eps=1e-8),
+                              betas=(0.9, 0.99), eps=1e-8, fused=True),
             Muon([p for n, p in model.named_parameters() if is_matrix(n, p)], lr=cfg.matrix_lr)]
     for opt in opts:
         for group in opt.param_groups:
@@ -1148,15 +1149,19 @@ def train(data_cfg, model_cfg, train_cfg):
 
     step_model = torch.compile(model) if train_cfg.compile and device != "cpu" else model
     loss_sum, n_loss = torch.zeros((), device=device), 0
+    scaler = torch.amp.GradScaler(device, enabled=train_cfg.fp16)
     t_start = t_print = time.time()
     while step < train_cfg.steps:
         X, C, Y, W = [t.to(device, non_blocking=True) for t in next(batches)]
-        _, loss = step_model(X, C, Y, W)
+        with torch.autocast(device, dtype=torch.float16, enabled=train_cfg.fp16):
+            _, loss = step_model(X, C, Y, W)
         model.zero_grad(set_to_none=True)
-        loss.backward()
+        scaler.scale(loss).backward()
         loss_sum += loss.detach()
         n_loss += 1
         if train_cfg.grad_clip > 0:
+            for opt in optimizers:
+                scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
         mult = lr_multiplier(step, train_cfg)
         for opt in optimizers:
@@ -1164,7 +1169,8 @@ def train(data_cfg, model_cfg, train_cfg):
                 group["lr"] = group["initial_lr"] * mult
                 if isinstance(opt, Muon):
                     group["momentum"] = 0.85 + 0.10 * min(1.0, step / 300)
-            opt.step()
+            scaler.step(opt)
+        scaler.update()
         step += 1
 
         if step % train_cfg.print_every == 0:
