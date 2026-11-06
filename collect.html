@@ -253,9 +253,9 @@
                     setAsciiSequence('');
                     setErrorMessage('');
                     drawStrokes();
-                    return true; // Entry successfully added
+                    return true;
                 }
-                return false; // Entry not added due to error
+                return false;
             };
 
             const exportDataset = () => {
@@ -277,7 +277,7 @@
                             setBackgroundImage(img);
                             setImagePosition({ x: 0, y: 0 });
                             setImageScale(1);
-                            setAsciiSequence(''); // Clear ASCII box when an image is uploaded
+                            setAsciiSequence('');
                         };
                         img.src = event.target.result;
                     };
@@ -302,9 +302,9 @@
                 setStrokes([]);
                 setCurrentStroke([]);
                 setErrorMessage('');
-                setBackgroundImage(null); // Clear the uploaded image
-                setImagePosition({ x: 0, y: 0 }); // Reset image position
-                setImageScale(1); // Reset image scale
+                setBackgroundImage(null);
+                setImagePosition({ x: 0, y: 0 });
+                setImageScale(1);
                 if (samplingMode === 'random') {
                     generatePrompt();
                 }
@@ -345,7 +345,7 @@
                     if (samplingMode === 'random') {
                         setCurrentPrompt(prompt);
                     }
-                setAsciiSequence(prompt); // Populate ASCII box with the prompt
+                setAsciiSequence(prompt);
             };
 
             React.useEffect(() => {
@@ -356,7 +356,6 @@
                 if (samplingMode === 'random') {
                     generatePrompt();
                 } else if (wordBank.length > 0) {
-                // For ordered mode, generate prompt once when wordBank is loaded
                     generatePrompt();
                 }
             }, [samplingMode, wordCount, wordBank]);
@@ -386,8 +385,6 @@
                             onChange={(e) => {
                                 const newWordCount = parseInt(e.target.value);
                                 setWordCount(newWordCount);
-                                 // Generate a new prompt only for random mode
-                                 // or if it's the initial load for ordered mode
                                 setTimeout(() => generatePrompt(), 0);
                             }}
                         />

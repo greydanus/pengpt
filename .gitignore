@@ -8,7 +8,6 @@ build/
 dist/
 .venv/
 
-# One subfolder per run: out/<experiment>/{best.pt,last.pt,progress/,samples/}
 out/
 *.log
 *.pt
@@ -17,12 +16,9 @@ out/
 data/*.json
 !data/*.json.zip
 
-# Large corpora, rebuilt by tools/.
 data/*.jsonl
 data/*.jsonl.gz
 
-# Source downloads: many GB, all re-fetchable.
 data/raw/
 
-# InkSight weights for the torch engine, written by `python -m tools.ink export`.
 inksight/
