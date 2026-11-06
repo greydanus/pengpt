@@ -512,7 +512,7 @@ def test_load_for_sampling_and_generate(tmp_path, tiny_dataset):
     words, tokens = generate(loaded, ds, "ab", SampleParams(max_tokens=30, writer="sam"))
     assert isinstance(words, list) and len(words) == len(tokens)
     from pengpt import generate_paragraph
-    para = generate_paragraph(loaded, ds, "ab cd ef ga bc", SampleParams(max_tokens=200, writer="sam", verbose=False,
+    para = generate_paragraph(loaded, ds, "ab cd ef ga bc", SampleParams(max_tokens=200, writer="sam",
                                                                          n_at_a_time=1, burn_in=1))
     assert len(para) == 5
 

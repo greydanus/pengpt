@@ -121,3 +121,31 @@ Rotating 4 of each head's 16 rotary pairs by pen x and 4 by pen y, instead of th
 ## Eval cost
 
 Evals used ~28% of a run (a train-loss pass, padded batches, two generation passes for the progress image every eval). Now train loss is the running mean of step losses, eval batches are trimmed to their real length, and the progress image renders every `--sample_every` (5,000) steps in one batched generation: ~1 s per eval, ~4% of training.
+
+## Step time (Nov 6, 4 words / block 256 / batch 32, M3 Pro)
+
+A training step was ~26 ms: forward ~7 ms, backward ~25 ms, optimizer ~5 ms (timed on synthetic batches; absolute numbers run high under load, ratios held). The backward has no single slow op. Removing pieces one at a time:
+
+| Removed or replaced | Step change |
+|---|---|
+| cross-attention (all layers) | −7.1 ms |
+| QK-norm | −2.0 ms |
+| hand-written attention instead of SDPA | ~0 (backward −4.5, forward +4) |
+| cross-attention's padding mask, RMSNorm kernel, embedding grads, pen features, logit soft cap | ~0 each |
+
+Fused AdamW cut the AdamW update from 2.0 to 0.2 ms (26.0 vs 27.7 ms/step), now the default. Compiling the optimizer saves another ~0.6 ms but would recompile as the learning rate changes; not done.
+
+4,000-step runs at the defaults:
+
+| Change | Params | ms/step | Score |
+|---|---|---|---|
+| none (three seeds) | 395k | 25.8 | 0.5957–0.5986 |
+| 1 head | 396k | 24.7 | 0.6094 |
+| fp16 autocast + grad scaling | 395k | 57.3 | 0.5990 |
+| n_embd 96, 1 head | 839k | 29.2 | 0.5943 |
+
+1 head saves 4%, not the 15% a synthetic benchmark showed, and costs 0.011. fp16 matches quality but runs 2.2× slower on MPS. The 96-wide 1-head model ties the 20k-step run's score at 4k steps; one seed, within ~0.003 of the baseline, so not adopted yet.
+
+## Steps (Nov 6)
+
+At the 4-word defaults, 20k steps (10.5 min) scored 0.5943 against 0.5957–0.5986 at 4k steps (~2 min). Test loss flattened after ~12k steps while train loss kept falling (1.84 vs 1.90 at 20k).

@@ -29,7 +29,6 @@ class DataConfig:
     n_merges: int = 512
     augment: bool = True
     spacing: float = 0.0
-    spacing_jitter: float = 0.20
     scale_jitter: float = 0.10
     rotate: float = 2.0
     offset: float = 0.5
@@ -70,7 +69,6 @@ class TrainConfig:
     print_every: int = 100
     device: str = "auto"
     compile: bool = True
-    fp16: bool = False
     train_seed: int = 0
     out_dir: str = "out/default"
     resume: str = ""
@@ -442,19 +440,16 @@ def augment_params(cfg, rng):
     return {"shear": rng.uniform(cfg.shear_min, cfg.shear_max),
             "angle": np.deg2rad(rng.uniform(-cfg.rotate, cfg.rotate)),
             "scale": rng.uniform(1 - cfg.scale_jitter, 1 + cfg.scale_jitter, 2),
-            "offset": rng.uniform(-cfg.offset, cfg.offset, 2) * cfg.grid,
-            "spacing": cfg.spacing * rng.uniform(1 - cfg.spacing_jitter, 1 + cfg.spacing_jitter)}
+            "offset": rng.uniform(-cfg.offset, cfg.offset, 2) * cfg.grid}
 
 
 def prepare_word(points, cfg, aug=None):
-    spacing = cfg.spacing
     if aug is not None:
         points = points.copy()
         points[:, 0] += aug["shear"] * points[:, 1]
         c, s = np.cos(aug["angle"]), np.sin(aug["angle"])
         points[:, :2] = points[:, :2] @ np.array([[c, s], [-s, c]]) * aug["scale"] + aug["offset"]
-        spacing = aug["spacing"]
-    return resample(points, spacing) if spacing > 0 else points
+    return resample(points, cfg.spacing) if cfg.spacing > 0 else points
 
 
 class PenDataset:
@@ -913,7 +908,6 @@ class SampleParams:
     seed: int = 42
     writer: str = ""
     linewidth: float = 1.3
-    verbose: bool = True
 
 
 def writer_id(dataset, name):
@@ -1149,19 +1143,15 @@ def train(data_cfg, model_cfg, train_cfg):
 
     step_model = torch.compile(model) if train_cfg.compile and device != "cpu" else model
     loss_sum, n_loss = torch.zeros((), device=device), 0
-    scaler = torch.amp.GradScaler(device, enabled=train_cfg.fp16)
     t_start = t_print = time.time()
     while step < train_cfg.steps:
         X, C, Y, W = [t.to(device, non_blocking=True) for t in next(batches)]
-        with torch.autocast(device, dtype=torch.float16, enabled=train_cfg.fp16):
-            _, loss = step_model(X, C, Y, W)
+        _, loss = step_model(X, C, Y, W)
         model.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
+        loss.backward()
         loss_sum += loss.detach()
         n_loss += 1
         if train_cfg.grad_clip > 0:
-            for opt in optimizers:
-                scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
         mult = lr_multiplier(step, train_cfg)
         for opt in optimizers:
@@ -1169,8 +1159,7 @@ def train(data_cfg, model_cfg, train_cfg):
                 group["lr"] = group["initial_lr"] * mult
                 if isinstance(opt, Muon):
                     group["momentum"] = 0.85 + 0.10 * min(1.0, step / 300)
-            scaler.step(opt)
-        scaler.update()
+            opt.step()
         step += 1
 
         if step % train_cfg.print_every == 0:

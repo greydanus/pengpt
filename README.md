@@ -2,7 +2,7 @@
 
 A small transformer that writes handwriting from text. It is a ground-up
 rewrite of [cursivetransformer](https://github.com/greydanus/cursivetransformer)
-([paper](https://arxiv.org/abs/2504.00051)) that trains in about 15 minutes on
+([paper](https://arxiv.org/abs/2504.00051)) that trains in about 10 minutes on
 an M-series laptop.
 
 ![hero](static/hero.png)
