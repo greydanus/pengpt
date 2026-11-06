@@ -3,16 +3,15 @@ import os
 import numpy as np
 import pytest
 
-from tools.template import compare, normalize
+from tools.template import normalize, suggest
 
 
-def test_template_flags_order_and_direction():
-    stem, bar = np.array([[0.0, -1.0], [0.0, 0.0]]), np.array([[-0.4, -1.0], [0.4, -1.0]])
+def test_suggest_reorders_and_reverses():
+    stem, bar = np.array([[0.0, -1.0], [0.0, -0.5], [0.0, 0.0]]), np.array([[-0.4, -1.0], [0.0, -1.0], [0.4, -1.0]])
     template = [s.tolist() for s in normalize([stem, bar])]
-    assert compare([stem, bar], template) == (None, None)
-    assert compare([bar, stem], template)[1] == ["order:1,0"]
-    assert compare([stem[::-1], bar], template)[1] == ["reverse:0"]
-    assert "strokes" in compare([stem], template)[0]
+    assert suggest([stem, bar], template) == ([], True)
+    assert suggest([bar, stem], template)[0] == ["order:1,0"]
+    assert suggest([stem[::-1], bar], template)[0] == ["reverse:0"]
 
 
 @pytest.mark.skipif(not os.path.exists("data/raw/fonts/PatrickHand-Regular.ttf"), reason="font not downloaded")
@@ -26,7 +25,6 @@ def test_glyph_library_spacing_and_layout():
 
 
 def test_suggest_joins_reverses_and_drops_double_traces():
-    from tools.template import suggest
     left, diag = np.array([[0.0, -1.0], [0.0, -0.5], [0.0, 0.0]]), np.array([[0.0, -1.0], [0.4, -0.5], [0.8, 0.0], [0.8, -0.5], [0.8, -1.0]])
     template = [s.tolist() for s in normalize([np.vstack([left[::-1], diag])])]
     assert suggest([left, diag], template)[0] == ["reverse:0", "join:0,1"]
