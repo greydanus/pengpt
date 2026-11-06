@@ -198,3 +198,14 @@ n_embd 96 with 1 head (839k params, 31.1 ms/step) scored 0.5976 at 12k steps aga
 - **Spelling census.** 300 dictionary words written greedily and read back by InkSight: 34% exact (CER 0.25), against 77% (CER 0.075) for InkSight on 81 real English words in your hand. Length drives the errors: 64% exact at 4–6 letters, 40% at 7–8, 14% at 9–10, with errors in the middles of words. Doubled letters are not a problem at grid 0.02 (39% exact with one, 29% without). Training words average 5.3 characters, so longer words in new data are the clearest lever.
 - **Layer probes** (linear, held-out words): pen height is readable from the input embedding (R² 1.0, from the Fourier pen features). Pen x within the word and the fraction of the word written appear only at layers 2–3 (R² 0.71–0.76), fade by layer 5 (0.15), and feed the alignment heads in layers 3–4. Pen down/up is perfectly decodable from layer 2 on.
 - **Token embeddings** are organized like a compass: a token's stroke direction is linearly readable from its embedding (R² 0.71 for cos, 0.86 for sin), its length less so (0.51).
+
+## Word-relative pen position (Nov 6)
+
+The pen-position features sum token displacements from the start of the sequence, so each word's coordinates start wherever the previous word's last stroke ended, and a ±32-cell random offset hides the absolute values. `--pen_pos_word` restarts the sum at each word instead, matching the frame the tokens are written in: y is height above the baseline and x is distance into the word, so it drops the random offset.
+
+| | 4k steps | 12k steps | Greedy at 12k |
+|---|---|---|---|
+| default | 0.5973 | **0.5849** (test loss 1.8551) | 26/26 |
+| `--pen_pos_word` | **0.5901** | 0.5876 (test loss 1.8628) | 26/26 |
+
+It learns faster early but ties at 12k, perhaps because the random offset it removes also regularizes once the model starts to overfit. Kept as an option, off by default. Cross-attention only in layers 3–5 lost at 4k (0.6000, Iliad 15/17) and was removed.

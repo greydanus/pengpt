@@ -44,12 +44,14 @@ class ModelConfig:
     n_embd: int = 64
     pen_pos_bands: int = 8
     pen_pos_jitter: int = 32
+    pen_pos_word: bool = False
     writer_dropout: float = 0.1
     n_writers: int = 0
     vocab_size: int = -1
     block_size: int = -1
     context_vocab_size: int = -1
     context_block_size: int = -1
+    word_token: int = -1
 
 
 @dataclass
@@ -78,7 +80,7 @@ class TrainConfig:
     wandb_run_name: str = ""
 
 
-DERIVED_FIELDS = {"vocab_size", "block_size", "context_vocab_size",
+DERIVED_FIELDS = {"vocab_size", "block_size", "context_vocab_size", "word_token",
                   "context_block_size", "n_writers"}
 
 def add_config_args(parser):
@@ -674,6 +676,7 @@ class PenTransformer(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         assert cfg.vocab_size > 0, "fill in the derived ModelConfig fields first"
+        assert not cfg.pen_pos_word or cfg.word_token >= 0, "pen_pos_word needs word_token"
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)
         self.ctx_emb = nn.Embedding(cfg.context_vocab_size, cfg.n_embd)
@@ -736,7 +739,10 @@ class PenTransformer(nn.Module):
         B, T = idx.shape
         assert T <= self.cfg.block_size, f"sequence length {T} > block size {self.cfg.block_size}"
         pen_xy = self.pen_deltas[idx].cumsum(dim=1)
-        if self.training and self.cfg.pen_pos_jitter > 0:
+        if self.cfg.pen_pos_word:
+            start = torch.where(idx == self.cfg.word_token, torch.arange(T, device=idx.device), 0).cummax(1).values
+            pen_xy = pen_xy - pen_xy.gather(1, start[..., None].expand(-1, -1, 2))
+        if self.training and self.cfg.pen_pos_jitter > 0 and not self.cfg.pen_pos_word:
             j = self.cfg.pen_pos_jitter
             pen_xy = pen_xy + torch.randint(-j, j + 1, (B, 1, 2), device=idx.device)
         rotary = rotary_tables(T, self.cfg.n_embd // self.cfg.n_head, idx.device)
@@ -764,6 +770,8 @@ class PenTransformer(nn.Module):
         tokens = list(idx.split(1, dim=1))
         for step in range(n - 1):
             pen_xy = pen_xy + self.pen_deltas[tokens[step]]
+            if self.cfg.pen_pos_word:
+                pen_xy = torch.where(tokens[step][..., None] == self.cfg.word_token, 0, pen_xy)
             rotary = cos.index_select(0, t), sin.index_select(0, t)
             mask = (slots <= t)[None, None, None]
             logits = self.logits(self.embed(tokens[step], pen_xy), c, ctx_mask, rotary, mask,
@@ -1120,6 +1128,7 @@ def train(data_cfg, model_cfg, train_cfg):
     model_cfg.block_size = data_cfg.max_seq_length
     model_cfg.context_vocab_size = char_tok.vocab_size
     model_cfg.context_block_size = data_cfg.max_text_length
+    model_cfg.word_token = stroke_tok.WORD
     writer_id(train_dataset, train_cfg.showcase_writer)
 
     model = PenTransformer(model_cfg).to(device)

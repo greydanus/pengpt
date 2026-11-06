@@ -415,9 +415,11 @@ def test_pen_pos_features_are_causal_and_checkpoint_safe(tiny_dataset, tmp_path)
     assert logits0.shape == logits.shape
 
 
-def test_cached_generation_matches_full_recompute(tiny_dataset):
+@pytest.mark.parametrize("variant", [{}, {"pen_pos_word": True, "word_token": "WORD"}])
+def test_cached_generation_matches_full_recompute(tiny_dataset, variant):
     st, ct, cfg = tiny_dataset.stroke_tok, tiny_dataset.char_tok, tiny_dataset.cfg
-    mcfg = ModelConfig(n_layer=2, n_head=2, n_embd=32, n_writers=3, vocab_size=st.vocab_size,
+    variant = {k: getattr(st, v) if v == "WORD" else v for k, v in variant.items()}
+    mcfg = ModelConfig(n_layer=2, n_head=2, n_embd=32, n_writers=3, **variant, vocab_size=st.vocab_size,
                        block_size=cfg.max_seq_length, context_vocab_size=ct.vocab_size,
                        context_block_size=cfg.max_text_length)
     torch.manual_seed(0)
@@ -428,7 +430,9 @@ def test_cached_generation_matches_full_recompute(tiny_dataset):
     model.eval()
     x, c, _, _ = (t[:2] for t in tiny_dataset.batch(range(2)))
     w = torch.tensor([1, 2])
-    prefix = x[:, :3]
+    n = int((x[0] == st.WORD).nonzero()[0]) + 3 if variant else 3
+    assert not variant or (x[0, :n] == st.WORD).any()
+    prefix = x[:, :n]
     cached = model.generate(prefix, c, max_new_tokens=40, do_sample=False, writer=w)
     full = prefix
     with torch.inference_mode():
