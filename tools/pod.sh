@@ -48,7 +48,7 @@ N=\$(( \$(nvidia-smi -L | wc -l) ))
 for g in \$(seq 0 \$((N - 1))); do
   if [ -f run/gpu\$g.pid ] && kill -0 \$(cat run/gpu\$g.pid) 2> /dev/null; then echo "GPU \$g busy: \$(cat run/gpu\$g.font)"; continue; fi
   awk -v n=\$N -v g=\$g 'NR % n == g' $MANIFEST > $W/manifest_\$g.jsonl
-  CUDA_VISIBLE_DEVICES=\$g setsid nohup bash -c "$PY -u -m tools.ink trace --manifest $W/manifest_\$g.jsonl --out $W/traces_\$g.jsonl --prompts '$PROMPT' --batch ${BATCH:-128}; echo EXIT \\\$?" > $W/trace_\$g.log 2>&1 < /dev/null &
+  CUDA_VISIBLE_DEVICES=\$g setsid nohup bash -c "$PY -u -m tools.ink trace --manifest $W/manifest_\$g.jsonl --out $W/traces_\$g.jsonl --prompts '$PROMPT' --batch ${BATCH:-256}; echo EXIT \\\$?" > $W/trace_\$g.log 2>&1 < /dev/null &
   echo \$! > run/gpu\$g.pid
   echo $W > run/gpu\$g.font
   echo "GPU \$g: \$(wc -l < $W/manifest_\$g.jsonl) words, prompt '$PROMPT'"

@@ -137,8 +137,8 @@ one scale per recording frame, plus a sheet of samples to eyeball. Sources:
   `segment` (from a page scan) makes word images, `trace` traces them with
   InkSight, and `qc --out data/raw/traces/accepted.jsonl` keeps traces that
   match the ink (`pip install -e ".[ink]"`). `trace` runs `tools/inksight.py`,
-  a PyTorch port of InkSight-Small-p with a cached decoder, about 30x faster
-  than the original; `export` (needs TensorFlow, once) writes its weights.
+  a PyTorch port of InkSight-Small-p with a cached decoder, about 100x faster
+  than the original on a GPU (43 ms/word on an RTX 4090); `export` (needs TensorFlow, once) writes its weights.
   `tools/pod.sh` runs all of this on a RunPod GPU, and `peek` draws traces
   over their images to check quality.
 

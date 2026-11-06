@@ -30,12 +30,13 @@ def bucket(rel, bidirectional, n_buckets=32, max_distance=128):
 
 class InkSight:
 
-    def __init__(self, path="inksight", device=None, dtype=torch.float32):
+    def __init__(self, path="inksight", device=None, dtype=torch.float32, kv_dtype=None):
         import sentencepiece
         device = device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
         z = np.load(f"{path}/weights.npz")
         w = {k: torch.from_numpy(z[k]).to(device=device, dtype=dtype) for k in z.files}
         self.w, self.device, self.dtype = w, device, dtype
+        self.kv_dtype = kv_dtype or (torch.bfloat16 if device == "cuda" else dtype)
         self.sp = sentencepiece.SentencePieceProcessor(model_file=f"{path}/spm.model")
         per_layer = lambda prefix, l: {k[len(prefix):]: v[:, l] for k, v in w.items() if k.startswith(prefix)}
         self.enc = [per_layer("encoder__encoder__", l) for l in range(L)]
@@ -87,36 +88,61 @@ class InkSight:
         return rms(x, w["encoder__encoder_norm__scale"]), valid
 
     @torch.inference_mode()
-    def generate(self, img, tokens, max_len=MAX_LEN, static=None):
+    def generate(self, img, tokens, caps=None, max_len=MAX_LEN, graphs=None, kv_dtype=None, bucket_len=128):
         w, B, dev = self.w, len(img), self.device
-        static = dev != "cuda" if static is None else static
-        slots = torch.arange(max_len, device=dev)
+        graphs, kv_dtype = dev == "cuda" if graphs is None else graphs, kv_dtype or self.kv_dtype
         enc, valid = self.encode(img, tokens)
-        cross = [(self.heads(enc, wl["encoder_decoder_attention__key__kernel"]), self.heads(enc, wl["encoder_decoder_attention__value__kernel"]))
-                 for wl in self.dec]
-        cmask = torch.zeros(B, 1, 1, enc.shape[1], device=dev, dtype=self.dtype).masked_fill(~valid[:, None, None], -1e10)
-        kc = torch.zeros(L, B, H, max_len, HD, device=dev, dtype=self.dtype)
+        cross = [tuple(self.heads(enc, wl[f"encoder_decoder_attention__{n}__kernel"]).to(kv_dtype) for n in ("key", "value")) for wl in self.dec]
+        cmask = torch.zeros(B, 1, 1, enc.shape[1], device=dev, dtype=kv_dtype).masked_fill(~valid[:, None, None], -1e10)
+        caps = torch.full((B,), max_len, device=dev) if caps is None else caps.to(dev)
+        kc = torch.zeros(L, B, H, max_len, HD, device=dev, dtype=kv_dtype)
         vc = torch.zeros_like(kc)
-        tok, out, done = torch.zeros(B, dtype=torch.long, device=dev), [], torch.zeros(B, dtype=torch.bool, device=dev)
-        for t in range(max_len):
+        tok, t = torch.zeros(B, dtype=torch.long, device=dev), torch.zeros(1, dtype=torch.long, device=dev)
+        out, done = torch.zeros(B, max_len, dtype=torch.long, device=dev), torch.zeros(B, dtype=torch.bool, device=dev)
+        slots = torch.arange(max_len, device=dev)
+
+        def step(n):
             x = w["token_embedder__embedding"][tok][:, None]
-            n = max_len if static else t + 1
-            bias = (self.dec_bias[..., (t - slots).clamp(min=0)] + torch.zeros(max_len, device=dev, dtype=self.dtype).masked_fill(slots > t, -1e10)
-                    if static else self.dec_bias[..., :t + 1].flip(-1))
+            d = t - slots[:n]
+            bias = self.dec_bias[..., d.clamp(min=0)] + torch.zeros(n, device=dev, dtype=self.dtype).masked_fill(d < 0, -1e10)
             for l, wl in enumerate(self.dec):
                 h = rms(x, wl["pre_self_attention_layer_norm__scale"])
-                q, kc[l, :, :, t], vc[l, :, :, t] = (h[:, 0] @ wl["qkv"]).view(B, 3, H, HD).unbind(1)
-                o = F.scaled_dot_product_attention(q[:, :, None], kc[l, :, :, :n], vc[l, :, :, :n], attn_mask=bias[l], scale=1.0)
+                q, k, v = (h[:, 0] @ wl["qkv"]).view(B, 3, H, HD).unbind(1)
+                kc[l].index_copy_(2, t, k[:, :, None].to(kv_dtype))
+                vc[l].index_copy_(2, t, v[:, :, None].to(kv_dtype))
+                o = F.scaled_dot_product_attention(q[:, :, None].to(kv_dtype), kc[l, :, :, :n], vc[l, :, :, :n],
+                                                   attn_mask=bias[l].to(kv_dtype), scale=1.0).to(self.dtype)
                 x = x + o.transpose(1, 2).reshape(B, 1, D) @ wl["self_attention__out__kernel"]
                 h = rms(x, wl["pre_cross_attention_layer_norm__scale"])
-                o = F.scaled_dot_product_attention(self.heads(h, wl["encoder_decoder_attention__query__kernel"]), *cross[l], attn_mask=cmask, scale=1.0)
+                o = F.scaled_dot_product_attention(self.heads(h, wl["encoder_decoder_attention__query__kernel"]).to(kv_dtype), *cross[l],
+                                                   attn_mask=cmask, scale=1.0).to(self.dtype)
                 x = self.mlp(x + o.transpose(1, 2).reshape(B, 1, D) @ wl["encoder_decoder_attention__out__kernel"], wl)
-            tok = torch.where(done, 0, (rms(x[:, 0], w["decoder__decoder_norm__scale"]) @ w["decoder__logits_dense__kernel"]).argmax(-1))
-            out.append(tok)
-            done |= tok == EOS
-            if t % 16 == 15 and bool(done.all()):
+            nxt = (rms(x[:, 0], w["decoder__decoder_norm__scale"]) @ w["decoder__logits_dense__kernel"]).argmax(-1)
+            nxt = torch.where(done, 0, torch.where(t + 1 >= caps, EOS, nxt))
+            tok.copy_(nxt)
+            out.index_copy_(1, t, nxt[:, None])
+            done.logical_or_(nxt == EOS)
+            t.add_(1)
+
+        recorded, pool = {}, torch.cuda.graph_pool_handle() if graphs else None
+        for s in range(max_len):
+            n = min(max_len, (s // bucket_len + 1) * bucket_len) if graphs or dev != "cuda" else s + 1
+            if not graphs:
+                step(n)
+            elif n in recorded:
+                recorded[n].replay()
+            else:
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    step(n)
+                torch.cuda.current_stream().wait_stream(side)
+                recorded[n] = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(recorded[n], pool=pool):
+                    step(n)
+            if s % 16 == 15 and bool(done.all()):
                 break
-        return torch.stack(out, 1)
+        return out[:, :s + 1]
 
     def trace(self, images, texts, prompt="Derender the ink: {text}"):
         from tools.ink import scale_and_pad, detokenize
@@ -125,7 +151,8 @@ class InkSight:
         ids = [(self.sp.encode(prompt.replace("{text}", t)) + [EOS])[:TEXT_LEN] for t in texts]
         tokens = torch.tensor([i + [0] * (TEXT_LEN - len(i)) for i in ids], device=self.device)
         rows = []
-        for out, (_, ratio, dx, dy) in zip(self.generate(((px - 127.5) / 127.5).permute(0, 3, 1, 2).to(self.dtype), tokens).tolist(), padded):
+        caps = torch.tensor([min(MAX_LEN, 200 + 90 * len(t)) for t in texts])
+        for out, (_, ratio, dx, dy) in zip(self.generate(((px - 127.5) / 127.5).permute(0, 3, 1, 2).to(self.dtype), tokens, caps).tolist(), padded):
             out = out[:out.index(EOS)] if EOS in out else out
             ink = "".join(f"<ink_token_{i - INK0}>" for i in out if INK0 <= i < INK0 + N_INK)
             read = self.sp.decode([i for i in out if 2 < i < INK0 - 100])

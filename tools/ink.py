@@ -562,7 +562,7 @@ def main():
     p = sub.add_parser("trace", help="trace word images with InkSight; resumable")
     p.add_argument("--manifest", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--batch", type=int, default=8)
+    p.add_argument("--batch", type=int, default=64)
     p.add_argument("--prompts", nargs="+", default=["Derender the ink: {text}"])
     p.add_argument("--engine", default="torch", choices=["torch", "tf"])
     p.add_argument("--inksight", default="inksight", help="torch engine: dir written by export")
