@@ -146,7 +146,8 @@ def build(font_path, fixes):
         strokes = apply_ops(cut(row, strokes, font, xh), g.get("ops", []))
         lo = row["x0"] + advance(font, row["text"], row["pos"]) if row["pos"] else -1e9
         hi = row["x0"] + advance(font, row["text"], row["pos"] + 1) if row["pos"] + 1 < len(row["text"]) else 1e9
-        strokes = snap_dots(strokes, dots(image, lo, hi, xh), xh)
+        if c in "ij.!?":
+            strokes = snap_dots(strokes, dots(image, lo, hi, xh), xh)
         origin = [row["x0"] + advance(font, row["text"], row["pos"]), row["baseline"] + shift]
         strokes = [(p - origin) / xh for p in strokes]
         marks = g.get("marks", [k for k, p in enumerate(strokes) if is_mark(p, c)])
@@ -162,11 +163,20 @@ def against_grain(entry):
             if len(s) < 3 or np.hypot(*(s[0] - s[-1])) < 0.15:
                 continue
             dx, dy = s[-1] - s[0]
-            if abs(dy) > 1.5 * abs(dx) and dy < -0.4:
+            if dy < -0.4 and (abs(dy) > 1.5 * abs(dx) or not entry["cursive"] and abs(dx) < 2 * abs(dy)):
                 out.append(f"{c}[{k}] up")
             elif abs(dx) > 1.5 * abs(dy) and dx < -0.4:
                 out.append(f"{c}[{k}] leftward")
     return out
+
+
+def retrace(p, s, gap=0.25):
+    if len(s) < 3 or np.hypot(*(p - s[0])) < gap:
+        ahead = np.flatnonzero(s[:, 0] >= p[0] - 0.02)
+        return s[ahead[0]:] if len(ahead) and ahead[0] < len(s) // 2 else s
+    head = s[:max(2, len(s) * 3 // 5)]
+    j = int(np.argmin(np.hypot(*(head - p).T)))
+    return np.vstack([s[j::-1], s[1:]]) if j > 0 else s
 
 
 def compose(entry, text, xs, bridge=1.0):
@@ -183,7 +193,7 @@ def compose(entry, text, xs, bridge=1.0):
                 continue
             joined = k > 0 or (prev or "").islower() or ((prev or "").isupper() and np.hypot(*(out[-1][-1] - s[0])) < bridge)
             if entry["cursive"] and c.islower() and out and joined:
-                out[-1] = np.vstack([out[-1], s])
+                out[-1] = np.vstack([out[-1], retrace(out[-1][-1], s)])
             else:
                 out.append(s)
         prev = c

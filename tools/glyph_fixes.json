@@ -49,9 +49,22 @@
       },
       "Q": {
         "ops": [
+          "reverse:0",
+          "order:1,0"
+        ],
+        "note": "bowl first (counterclockwise), then the tail flicked down and out"
+      },
+      "x": {
+        "ops": [
           "reverse:1"
         ],
-        "note": "the tail is traced up into the bowl; it is flicked down and out"
+        "note": "second stroke runs top-right to bottom-left"
+      },
+      "5": {
+        "ops": [
+          "join:0,1"
+        ],
+        "note": "one stroke: the traced bar-and-stem stroke flows into the bowl"
       }
     },
     "reviewed": true
