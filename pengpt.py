@@ -22,8 +22,8 @@ class DataConfig:
     max_train_words: int = 0
     train_size: int = 500_000
     test_size: int = 3_000
-    max_words: int = 8
-    max_seq_length: int = 512
+    max_words: int = 4
+    max_seq_length: int = 256
     max_text_length: int = 50
     grid: float = 0.020
     n_merges: int = 512
@@ -32,6 +32,7 @@ class DataConfig:
     spacing_jitter: float = 0.20
     scale_jitter: float = 0.10
     rotate: float = 2.0
+    offset: float = 0.5
     shear_min: float = -0.1
     shear_max: float = 0.1
     seed: int = 1337
@@ -55,7 +56,7 @@ class ModelConfig:
 @dataclass
 class TrainConfig:
     steps: int = 20_000
-    batch_size: int = 16
+    batch_size: int = 32
     learning_rate: float = 6e-3
     matrix_lr: float = 0.04
     weight_decay: float = 1e-4
@@ -63,6 +64,7 @@ class TrainConfig:
     warmdown: float = 0.8
     grad_clip: float = 1.0
     eval_every: int = 1_000
+    sample_every: int = 5_000
     showcase: str = ""
     showcase_writer: str = ""
     print_every: int = 100
@@ -154,7 +156,7 @@ def _smooth_strokes(points, window=5):
 
 class ScribeTokenizer:
 
-    def __init__(self, grid=0.012, merges=None):
+    def __init__(self, grid=DataConfig.grid, merges=None):
         self.grid = grid
         self.merges = [(int(a), int(b), int(c)) for a, b, c in (merges or [])]
         self._pairs = {(a, b): c for a, b, c in self.merges}
@@ -439,7 +441,7 @@ def augment_params(cfg, rng):
     return {"shear": rng.uniform(cfg.shear_min, cfg.shear_max),
             "angle": np.deg2rad(rng.uniform(-cfg.rotate, cfg.rotate)),
             "scale": rng.uniform(1 - cfg.scale_jitter, 1 + cfg.scale_jitter, 2),
-            "offset": rng.uniform(-0.5, 0.5, 2) * cfg.grid,
+            "offset": rng.uniform(-cfg.offset, cfg.offset, 2) * cfg.grid,
             "spacing": cfg.spacing * rng.uniform(1 - cfg.spacing_jitter, 1 + cfg.spacing_jitter)}
 
 
@@ -777,8 +779,9 @@ class PenTransformer(nn.Module):
             if top_k is not None:
                 v, _ = torch.topk(logits, top_k)
                 logits[logits < v[:, [-1]]] = -float("inf")
-            nxt = (torch.multinomial(F.softmax(logits, dim=-1), 1, generator=generator) if do_sample
-                   else logits.argmax(dim=-1, keepdim=True))
+            nxt = torch.where(torch.as_tensor(do_sample, device=dev).view(-1, 1),
+                              torch.multinomial(F.softmax(logits, dim=-1), 1, generator=generator),
+                              logits.argmax(dim=-1, keepdim=True))
             if end_token is not None:
                 nxt[done] = pad_token if pad_token is not None else end_token
                 done |= nxt.squeeze(1) == end_token
@@ -1016,18 +1019,16 @@ def save_progress(model, dataset, out_dir, step, showcase=(), n=6, samples=3, sh
     X, C, _, W = dataset.batch(range(n))
     C = torch.cat([C] + [torch.from_numpy(dataset.encode_text(t))[None] for t in showcase])
     W = torch.cat([W, torch.full((len(showcase),), writer_id(dataset, showcase_writer))])
-    st, device, rows = dataset.stroke_tok, next(model.parameters()).device, len(C)
-    gen = lambda k, do_sample: model.generate(
-        torch.full((rows * k, 1), st.BOS, device=device), C.repeat_interleave(k, 0).to(device),
-        dataset.cfg.max_seq_length - 1, do_sample=do_sample, end_token=st.END, pad_token=st.PAD,
-        writer=W.repeat_interleave(k, 0).to(device),
-        generator=torch.Generator(device).manual_seed(3)).cpu()
-    greedy, out = gen(1, False), gen(samples, True)
+    st, device, rows, k = dataset.stroke_tok, next(model.parameters()).device, len(C), samples + 1
+    out = model.generate(torch.full((rows * k, 1), st.BOS, device=device), C.repeat_interleave(k, 0).to(device),
+                         dataset.cfg.max_seq_length - 1, do_sample=(torch.arange(rows * k) % k > 0).to(device),
+                         end_token=st.END, pad_token=st.PAD, writer=W.repeat_interleave(k, 0).to(device),
+                         generator=torch.Generator(device).manual_seed(3)).cpu()
     fig, axes = plt.subplots(rows, samples + 2, figsize=(3 * (samples + 2), 1.1 * rows),
                              squeeze=False, sharex="row", sharey="row")
     params = SampleParams(line_width=2.5)
     for i in range(rows):
-        drawings = [X[i] if i < n else None, greedy[i]] + list(out[i * samples:(i + 1) * samples])
+        drawings = [X[i] if i < n else None] + list(out[i * k:(i + 1) * k])
         for j, (ax, tokens) in enumerate(zip(axes[i], drawings)):
             words = [] if tokens is None else st.decode(tokens.numpy())
             plot_words(words, params, ax=ax, color=("darkgreen", "navy")[j] if j < 2 else "k")
@@ -1055,12 +1056,18 @@ def resolve_device(device):
     return "cpu"
 
 
+def trim(batch, pad):
+    X, C, Y, W = batch
+    n = int((X != pad).sum(1).max())
+    return X[:, :n], C, Y[:, :n], W
+
+
 @torch.inference_mode()
 def evaluate(model, dataset, device, batch_size=100, max_batches=10):
     model.eval()
     if not hasattr(dataset, "_eval_batches"):
         n = min(len(dataset), batch_size * max_batches)
-        dataset._eval_batches = [dataset.batch(range(i, min(i + batch_size, n)))
+        dataset._eval_batches = [trim(dataset.batch(range(i, min(i + batch_size, n))), dataset.stroke_tok.PAD)
                                  for i in range(0, n, batch_size)]
     total = count = 0
     for X, C, Y, W in dataset._eval_batches:
@@ -1070,6 +1077,23 @@ def evaluate(model, dataset, device, batch_size=100, max_batches=10):
         count += n_tok
     model.train()
     return total / count
+
+
+@torch.inference_mode()
+def word_score(model, dataset, device):
+    st = dataset.stroke_tok
+    if not hasattr(dataset, "_word_batch"):
+        tokens = [st.encode_word(prepare_word(dataset.bank_points[i], dataset.cfg)) for i in dataset.indices]
+        items = [dataset.make_item(t, dataset.bank_texts[i], int(dataset.writer_ids[i]))
+                 for t, i in zip(tokens, dataset.indices)]
+        dataset._word_batch = (trim(tuple(torch.stack(t) for t in zip(*items)), st.PAD),
+                               sum(len(st.expand(t)) for t in tokens))
+    (X, C, Y, W), moves = dataset._word_batch
+    model.eval()
+    logits, _ = model(X.to(device), C.to(device), writer=W.to(device))
+    nll = F.cross_entropy(logits.transpose(1, 2), Y.to(device), ignore_index=IGNORE_INDEX, reduction="sum")
+    model.train()
+    return nll.item() / moves
 
 
 def train(data_cfg, model_cfg, train_cfg):
@@ -1123,12 +1147,15 @@ def train(data_cfg, model_cfg, train_cfg):
     batches = infinite_batches(train_dataset, train_cfg.batch_size, seed=data_cfg.seed + step + 10_000 * train_cfg.train_seed)
 
     step_model = torch.compile(model) if train_cfg.compile and device != "cpu" else model
+    loss_sum, n_loss = torch.zeros((), device=device), 0
     t_start = t_print = time.time()
     while step < train_cfg.steps:
         X, C, Y, W = [t.to(device, non_blocking=True) for t in next(batches)]
         _, loss = step_model(X, C, Y, W)
         model.zero_grad(set_to_none=True)
         loss.backward()
+        loss_sum += loss.detach()
+        n_loss += 1
         if train_cfg.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
         mult = lr_multiplier(step, train_cfg)
@@ -1149,13 +1176,13 @@ def train(data_cfg, model_cfg, train_cfg):
         if step % train_cfg.eval_every and step < train_cfg.steps:
             continue
 
-        train_loss = evaluate(model, train_dataset, device)
+        t_eval = time.time()
+        train_loss, loss_sum, n_loss = (loss_sum / max(n_loss, 1)).item(), loss_sum * 0, 0
         test_loss = evaluate(model, test_dataset, device)
+        score = word_score(model, test_dataset, device)
         rank = text_rank(model, test_dataset, device)
-        print(f"step {step} | train loss {train_loss:.4f} | test loss {test_loss:.4f}"
-              f" | text rank {rank:.2f}/32 | {(time.time() - t_start) / 60:.1f} min")
         if run:
-            run.log({"train_loss": train_loss, "test_loss": test_loss, "text_rank": rank,
+            run.log({"train_loss": train_loss, "test_loss": test_loss, "word_score": score, "text_rank": rank,
                      "step": step})
 
         if best_loss is None or test_loss < best_loss:
@@ -1172,12 +1199,15 @@ def train(data_cfg, model_cfg, train_cfg):
                         asdict(data_cfg), stroke_tok.merges,
                         optimizers, step, best_loss, train_dataset.writers)
 
-        path = save_progress(model, test_dataset, os.path.join(train_cfg.out_dir, "progress"), step,
-                             [t for t in train_cfg.showcase.split("|") if t],
-                             showcase_writer=train_cfg.showcase_writer)
-        print(f"  wrote {path}")
-        if run:
-            run.log({"progress": wandb.Image(path), "step": step})
+        if step % train_cfg.sample_every == 0 or step >= train_cfg.steps:
+            path = save_progress(model, test_dataset, os.path.join(train_cfg.out_dir, "progress"), step,
+                                 [t for t in train_cfg.showcase.split("|") if t],
+                                 showcase_writer=train_cfg.showcase_writer)
+            print(f"  wrote {path}")
+            if run:
+                run.log({"progress": wandb.Image(path), "step": step})
+        print(f"step {step} | train loss {train_loss:.4f} | test loss {test_loss:.4f} | word score {score:.4f}"
+              f" | text rank {rank:.2f}/32 | eval {time.time() - t_eval:.1f}s | {(time.time() - t_start) / 60:.1f} min")
         t_print = time.time()
 
     if run:
@@ -1202,7 +1232,7 @@ def sample_command(args):
 
 @torch.inference_mode()
 def text_rank(model, dataset, device, n=32):
-    X, C, Y, W = (t.to(device) for t in dataset.batch(range(n)))
+    X, C, Y, W = (t.to(device) for t in trim(dataset.batch(range(n)), dataset.stroke_tok.PAD))
     model.eval()
     nll = torch.stack([F.cross_entropy(model(X, C[j].expand_as(C), writer=W)[0].transpose(1, 2), Y,
                                        ignore_index=IGNORE_INDEX, reduction="none").sum(1)

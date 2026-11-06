@@ -86,4 +86,38 @@ Each sequence packs 1 to `max_words` words, drawn uniformly. Scores by context:
 
 - Models break past the longest sequence they trained on. 2-word packing fails under burn-in, because burn-in plus 2 words makes a 3-word sequence.
 - Step time follows block size, not word count, so 8 words gets 1.7× the ink of 4 words for the same cost.
-- On sequences short enough for every model, the settings are within 0.01 of each other. 8 words stays the default.
+- On sequences short enough for every model, the settings are within 0.01 of each other. 8 words stayed the default until the matched-time test below.
+
+## Packing at matched training time (Nov 6)
+
+4,000 steps unless noted. Greedy counts are words right in the pangram (of 9) and the Iliad opening (of 17).
+
+| Setup | Training time | Score | Greedy pangram | Greedy Iliad |
+|---|---|---|---|---|
+| 8 words / block 512 / batch 16 | 2.2 min | 0.6107 | 3 | ~6 |
+| **4 words / block 256 / batch 32** | 2.0 min | **0.5980** | 9 | ~15 |
+| same, `--train_seed 1` | 1.8 min | **0.5957** | 9 | 16 |
+| 4 words / block 256 / batch 16, 8,000 steps | 2.8 min | 0.5970 | – | – |
+
+Four words wins by ~0.013 (4× seed noise) on both seeds, and the 8-word model's letters leaking across word boundaries ("teh azyy vegg") disappear. A 20k-step 8-word run scored 0.590 in ~14 min; this gets within 0.006 in 2 min. Now the default. Block 256 holds 146 tokens on average (57% full, vs 54% for 8 words at 512).
+
+## Augmentation ablation (Nov 6, 8 words / block 512)
+
+| Setting | Score |
+|---|---|
+| **current** (slant ±0.1, scale ±10%, rotate ±2°, offset ±½ cell) | **0.6107** |
+| half ranges (slant ±0.05, scale ±5%, rotate ±1°) | 0.6101 |
+| current + per-word jitter (¼ of the ranges, on top) | 0.6143 |
+| geometry only (no offset) | 0.6160 |
+| wider (slant ±0.2, scale ±15%, rotate ±3°) | 0.6268 |
+| offset only | 0.6271 (overfits) |
+
+Even a ±0.05-cell shift re-tokenizes 55% of a word's tokens, so any augmentation re-tokenizes. But offset alone overfits: the geometry matters, and wider ranges lose texture. Changing augmentation changes the learned merges, so compare by score, not test loss (geometry-only had the lowest test loss but a worse score).
+
+## Pen-position RoPE (Nov 6, 8 words / block 512)
+
+Rotating 4 of each head's 16 rotary pairs by pen x and 4 by pen y, instead of the additive Fourier features: score 0.6125 vs 0.6107, test loss 1.9931 vs 1.9794, greedy pangram 1/9 vs 3/9, with more letters leaking across words. Not kept.
+
+## Eval cost
+
+Evals used ~28% of a run (a train-loss pass, padded batches, two generation passes for the progress image every eval). Now train loss is the running mean of step losses, eval batches are trimmed to their real length, and the progress image renders every `--sample_every` (5,000) steps in one batched generation: ~1 s per eval, ~4% of training.

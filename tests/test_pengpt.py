@@ -537,3 +537,19 @@ def test_check_data_accepts_style_and_rejects_bad_scale():
     caps = fake_words(x_height=0.2, text="MANN")
     assert check_data(caps, 0.02)[0]["x_height"] is None and check_data(caps, 0.02)[1] == []
     assert check_data(fake_words(x_height=2.0, text="MANN"), 0.02)[1]
+
+
+def test_trimmed_eval_matches_full_length_loss(tiny_dataset):
+    from pengpt import trim, IGNORE_INDEX
+    st, ct, cfg = tiny_dataset.stroke_tok, tiny_dataset.char_tok, tiny_dataset.cfg
+    mcfg = ModelConfig(n_layer=2, n_head=2, n_embd=32, vocab_size=st.vocab_size, block_size=cfg.max_seq_length,
+                       context_vocab_size=ct.vocab_size, context_block_size=cfg.max_text_length)
+    torch.manual_seed(0)
+    model = PenTransformer(mcfg).eval()
+    for p in model.parameters():
+        p.data.normal_(0, 0.3)
+    X, C, Y, W = tiny_dataset.batch(range(4))
+    Xt, Ct, Yt, Wt = trim((X, C, Y, W), st.PAD)
+    assert Xt.shape[1] < X.shape[1] and (Yt != IGNORE_INDEX).sum() == (Y != IGNORE_INDEX).sum()
+    with torch.inference_mode():
+        assert torch.allclose(model(X, C, Y)[1], model(Xt, Ct, Yt)[1], atol=1e-5)

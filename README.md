@@ -21,7 +21,7 @@ python pengpt.py sample --checkpoint out/cursive/best.pt --greedy --text "The qu
 
 Each run writes to `out/<name>/`: `best.pt` (lowest test loss), `last.pt` (latest
 eval; resume with `--resume out/cursive/last.pt`), and `progress/`, one image
-per eval. Any flag overrides the preset. Add `--wandb` to log to Weights & Biases.
+every `--sample_every` steps and at the end. Any flag overrides the preset. Add `--wandb` to log to Weights & Biases.
 
 Sampling tips: `--greedy` spells unfamiliar words much better than sampling.
 To regenerate misspelled words, use `--show_indices` to find their index, then
@@ -33,6 +33,11 @@ To regenerate misspelled words, use `--show_indices` to find their index, then
 *The progress grid: real test word (green), greedy sample (blue), three samples
 (black). The bottom rows are the preset's showcase phrases. Prompts and seeds
 are fixed between evals.*
+
+Each eval logs train loss (the mean over steps since the last eval), test loss,
+and `word score`: nats per base pen move on each held-out word written alone,
+unaugmented. Word score doesn't depend on the tokenizer or the packing, so it
+is the number to compare runs by. Evals take about 4% of training time.
 
 Each eval also logs `text rank`: 32 test examples are each scored under their
 own prompt and the other 31 prompts, and the mean rank of the true prompt is
@@ -75,8 +80,9 @@ of up to ±`--pen_pos_jitter` grid cells, so the features carry position
 within the sequence, not on the page. `--pen_pos_bands 0` turns them off.
 
 **Batches.** Each training sequence comes from one writer. It packs a random
-1 to `--max_words` words, separated by `WORD` tokens, and never cuts a word in
-half. One augmentation is applied to the whole sequence: slant ±0.1, stretch
+1 to `--max_words` words (default 4, in a 256-token block), separated by `WORD`
+tokens, and never cuts a word in half. Four words beat eight on both held-out
+score and greedy spelling (see EXPERIMENTS.md). One augmentation is applied to the whole sequence: slant ±0.1, stretch
 ±10%, rotation ±2°, and a shift of up to half a grid cell (`--no-augment` turns
 it off). Test data is never augmented.
 
