@@ -41,10 +41,9 @@ def ink_mask(norm, weak=0.80, strong=0.55):
     return np.isin(labels, np.unique(labels[norm < strong])) & (labels > 0)
 
 
-def tone(norm, keep):
+def tone(norm):
     t = ((norm - 0.35) / (0.92 - 0.35)).clip(0, 1) ** 1.4
-    img = ndimage.gaussian_filter(np.where(keep, t, 1.0), 0.7)
-    return Image.fromarray((img * 255).astype(np.uint8)).convert("RGB")
+    return Image.fromarray((ndimage.gaussian_filter(t, 0.7) * 255).astype(np.uint8)).convert("RGB")
 
 
 def upsample(norm):
@@ -63,7 +62,7 @@ def render_command(args):
         ImageDraw.Draw(img).text((8 - left, 8 - top), text, font=font, fill="black", anchor="ls")
         path = f"{args.out}/{os.path.splitext(os.path.basename(args.font))[0]}_{i:05d}.png"
         img.save(path)
-        rows.append({"image": path, "text": text, "baseline": 8 - top, "style": args.style,
+        rows.append({"image": path, "text": text, "baseline": 8 - top, "style": args.style, "writer": args.style,
                      "source": os.path.basename(args.font), "license": args.license})
     replace_rows(f"{args.out}/manifest.jsonl", rows, os.path.basename(args.font))
     print(f"rendered {len(rows)} words to {args.out}/manifest.jsonl")
@@ -125,14 +124,14 @@ def segment_command(args):
     os.makedirs(args.out, exist_ok=True)
     stem = os.path.splitext(os.path.basename(args.page))[0]
     faint = ink_mask(norm, weak=0.90) & ndimage.binary_dilation(norm < 0.75, iterations=4)
-    slant = estimate_slant(ink, bands)
+    slant = estimate_slant(np.where(ink, 1 - norm, 0), bands)
     print(f"estimated slant: {np.degrees(np.arctan(slant)):.0f} degrees from vertical")
     ys_all, xs_all = np.mgrid[0:ink.shape[0], 0:ink.shape[1]]
-    rows, skipped, boxes = [], [], []
+    margin = int(np.ceil(abs(slant) * ink.shape[0])) + 1
+    rows, skipped, boxes, cut_words = [], [], [], []
     for li, ((a, b), text) in enumerate(zip(bands, lines)):
         continued = li > 0 and lines[li - 1].endswith(("=", "-"))
         h = b - a
-        y0, y1 = max(0, a - h // 2), min(ink.shape[0], b + h // 2)
         tokens = text.split()
         center = (a + b) / 2
         alone = faint.copy()
@@ -140,7 +139,10 @@ def segment_command(args):
             if (a2, b2) != (a, b):
                 alone[a2:b2] = False
         labels, _ = ndimage.label(alone, structure=np.ones((3, 3)))
-        margin = int(np.ceil(abs(slant) * ink.shape[0])) + 1
+        sheared_x = xs_all + np.rint((ys_all - center) * slant).astype(int) + margin
+        ids = np.arange(1, labels.max() + 1)
+        lo, hi = ndimage.minimum(sheared_x, labels, ids), ndimage.maximum(sheared_x, labels, ids)
+        cy = np.asarray(ndimage.center_of_mass(alone, labels, ids)).reshape(-1, 2)[:, 0]
         words = split_line(shear(ink[a:b], center - a, slant, margin), tokens, h)
         if words is None:
             skipped.append(text)
@@ -149,24 +151,29 @@ def segment_command(args):
             if token.endswith(("=", "-")) or (continued and wi == 0) or not token.strip(".,;:!?\"'"):
                 continue
             pad = h // 4
-            sheared_x = xs_all + np.rint((ys_all - center) * slant).astype(int) + margin
             core = labels[a + h // 4:b - h // 4] * ((sheared_x[a + h // 4:b - h // 4] >= s) & (sheared_x[a + h // 4:b - h // 4] < e))
-            mine = np.unique(core[core > 0])
             left = (words[wi - 1][1] + s) // 2 if wi else s - pad
             right = (e + words[wi + 1][0]) // 2 if wi + 1 < len(words) else e + pad
-            keep = np.isin(labels, mine) & (sheared_x >= left) & (sheared_x < right)
+            marks = ids[(lo >= left) & (hi < right) & (cy >= a - h) & (cy <= b + h)]
+            mine = np.union1d(np.unique(core[core > 0]), marks)
+            full = np.isin(labels, mine)
+            keep = full & (sheared_x >= left) & (sheared_x < right)
             if not keep.any():
+                continue
+            if (full & ~keep).sum() > 0.1 * full.sum():
+                cut_words.append(token)
                 continue
             ys, xs = np.nonzero(keep)
             y0, y1 = max(0, ys.min() - pad), min(ink.shape[0], ys.max() + pad)
             x0, x1 = max(0, xs.min() - pad), min(ink.shape[1], xs.max() + pad)
-            near = ndimage.binary_dilation(keep, iterations=2)[y0:y1, x0:x1]
+            near = ndimage.binary_dilation(keep[y0:y1, x0:x1], iterations=2)
             word = np.where(near, norm[y0:y1, x0:x1], 1.0)
             boxes.append((x0, y0, x1, y1, token))
             n = upsample(word)
             path = f"{args.out}/{stem}_{li:02d}_{wi:02d}.png"
-            tone(n, ink_mask(n) | (n < 0.92)).save(path)
+            tone(n).save(path)
             rows.append({"image": path, "text": token, "baseline": int((b - y0) * UP), "style": args.style,
+                         "writer": args.style,
                          "source": os.path.basename(args.page), "license": args.license})
     replace_rows(f"{args.out}/manifest.jsonl", rows, os.path.basename(args.page))
     print(f"{stem}: {len(rows)} words from {len(lines) - len(skipped)}/{len(lines)} lines")
@@ -174,6 +181,8 @@ def segment_command(args):
         overview(page, boxes, bands, lines, skipped, args.overview)
     for text in skipped:
         print(f"  skipped (could not split confidently): {text}")
+    if cut_words:
+        print(f"  skipped {len(cut_words)} words whose ink runs past the word boundary: {' '.join(cut_words)}")
 
 
 def overview(page, boxes, bands, lines, skipped, path):
@@ -251,7 +260,7 @@ def trace_command(args):
             rows = []
             for it, img, o, (_, ratio, dx, dy) in zip(chunk, images, out, padded):
                 raw = o[0].decode()
-                strokes = on_ink([[[(x - dx) / ratio, (y - dy) / ratio] for x, y in s] for s in detokenize(raw)], img)
+                strokes = [[[(x - dx) / ratio, (y - dy) / ratio] for x, y in s] for s in detokenize(raw)]
                 rows.append({"image": it["image"], "hash": it["hash"], "prompt": prompt, "strokes": strokes,
                              "read": re.sub(r"<[^>]+>", "", raw).strip()})
             write_jsonl(args.out, rows, "a")
@@ -268,31 +277,35 @@ def levenshtein(a, b):
     return row[-1]
 
 
+def resample_path(strokes):
+    pts = []
+    for s in map(lambda s: np.asarray(s, float), strokes):
+        if len(s) == 1:
+            pts.append(s)
+            continue
+        seg = np.diff(s, axis=0)
+        n = np.maximum(1, np.ceil(np.hypot(*seg.T)).astype(int))
+        k = np.repeat(np.arange(len(seg)), n)
+        t = (np.arange(n.sum()) - np.repeat(np.cumsum(n) - n, n)) / n[k]
+        pts.append(s[k] + seg[k] * t[:, None])
+    return np.concatenate(pts) if pts else np.zeros((0, 2))
+
+
 def score(item, cand):
     gray = np.asarray(Image.open(item["image"]).convert("L"))
     ink = gray < INK_LEVEL
-    if not ink.any() or not cand["strokes"]:
+    pts = resample_path(cand["strokes"])
+    if not ink.any() or not len(pts):
         return {"coverage": 0.0, "precision": 0.0, "length_ratio": 0.0, "points": 0}
-    width = max(2.0, 2 * np.median(ndimage.distance_transform_edt(ink)[ink]))
-    canvas = Image.new("L", (gray.shape[1], gray.shape[0]), 0)
-    draw = ImageDraw.Draw(canvas)
-    pts = []
-    for s in cand["strokes"]:
-        s = np.asarray(s, float)
-        if len(s) > 1:
-            draw.line([tuple(p) for p in s], fill=255, width=1)
-            seg = np.diff(s, axis=0)
-            steps = np.maximum(1, np.ceil(np.hypot(*seg.T)).astype(int))
-            pts += [s[k] + seg[k] * t for k in range(len(seg)) for t in np.linspace(0, 1, steps[k], endpoint=False)]
-        else:
-            draw.point(tuple(s[0]), fill=255)
-            pts.append(s[0])
-    path = ndimage.binary_dilation(np.asarray(canvas) > 0, iterations=int(np.ceil(width)))
-    near = ndimage.binary_dilation(ink, iterations=int(np.ceil(width / 2)) + 2)
-    pts = np.clip(np.rint(np.asarray(pts)).astype(int), 0, [gray.shape[1] - 1, gray.shape[0] - 1])
+    half = max(1.0, 2 * np.median(ndimage.distance_transform_edt(ink)[ink]) - 1)
+    canvas = np.zeros(ink.shape, bool)
+    ij = np.clip(np.rint(pts).astype(int), 0, [ink.shape[1] - 1, ink.shape[0] - 1])
+    canvas[ij[:, 1], ij[:, 0]] = True
+    path = ndimage.distance_transform_edt(~canvas) <= half + 1
+    near = ndimage.distance_transform_edt(~ink) <= half / 2 + 2
     return {"coverage": float((ink & path).sum() / ink.sum()),
-            "precision": float(near[pts[:, 1], pts[:, 0]].mean()),
-            "length_ratio": float(len(pts) * width / ink.sum()),
+            "precision": float(near[ij[:, 1], ij[:, 0]].mean()),
+            "length_ratio": float(len(pts) * 2 * half / ink.sum()),
             "points": int(len(pts))}
 
 
@@ -300,11 +313,11 @@ def qc_command(args):
     items = {it["image"]: it for it in read_jsonl(args.manifest)}
     cands = {}
     for c in read_jsonl(args.traces):
-        cands.setdefault(c.get("hash") or c["image"], []).append(c)
+        cands.setdefault(c.get("hash"), []).append(c)
     accepted, rejected = [], []
     for image, item in items.items():
         best = None
-        for c in cands.get(file_hash(image), []) + cands.get(image, []):
+        for c in cands.get(file_hash(image), []):
             c = {**c, "strokes": on_ink(c["strokes"], Image.open(image))}
             q = score(item, c)
             label = item["text"].lower()
@@ -324,7 +337,7 @@ def qc_command(args):
         row = {**item, "strokes": c["strokes"], "qc": q}
         (accepted if q["passed"] else rejected).append(row)
     write_jsonl(args.out, accepted)
-    write_jsonl(args.out.replace(".jsonl", "_rejected.jsonl"), rejected)
+    write_jsonl(os.path.splitext(args.out)[0] + "_rejected.jsonl", rejected)
     print(f"accepted {len(accepted)} / {len(items)} ({100 * len(accepted) / max(1, len(items)):.0f}%), "
           f"rejected {len(rejected)}")
     if args.sheet:
@@ -385,10 +398,10 @@ def main():
     p.add_argument("--traces", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--sheet", default="")
-    p.add_argument("--min_coverage", type=float, default=0.88)
+    p.add_argument("--min_coverage", type=float, default=0.85)
     p.add_argument("--min_precision", type=float, default=0.90)
     p.add_argument("--max_read_error", type=float, default=0.34)
-    p.add_argument("--max_length_ratio", type=float, default=1.3)
+    p.add_argument("--max_length_ratio", type=float, default=1.6)
     args = parser.parse_args()
     {"render": render_command, "segment": segment_command, "trace": trace_command,
      "qc": qc_command}[args.command](args)

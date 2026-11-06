@@ -1,5 +1,4 @@
 import argparse
-import collections
 import gzip
 import itertools
 import json
@@ -14,7 +13,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from torch.utils.data import Dataset
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -34,10 +32,10 @@ class DataConfig:
     augment: str = "handwriting"
     spacing: float = 0.0
     spacing_jitter: float = 0.20
-    scale_jitter: float = 0.15
-    rotate: float = 0.0
-    shear_min: float = -0.22
-    shear_max: float = -0.18
+    scale_jitter: float = 0.10
+    rotate: float = 2.0
+    shear_min: float = -0.1
+    shear_max: float = 0.1
     hflip: float = 0.0
     tremor: float = 0.0
     stroke_dropout: float = 0.0
@@ -51,6 +49,8 @@ class ModelConfig:
     n_embd: int = 64
     pen_pos_bands: int = 8
     pen_pos_jitter: int = 32
+    writer_dropout: float = 0.1
+    n_writers: int = 0
     vocab_size: int = -1
     block_size: int = -1
     context_vocab_size: int = -1
@@ -69,6 +69,7 @@ class TrainConfig:
     grad_clip: float = 1.0
     eval_every: int = 1_000
     showcase: str = ""
+    showcase_writer: str = ""
     print_every: int = 100
     device: str = "auto"
     compile: bool = True
@@ -81,7 +82,7 @@ class TrainConfig:
 
 
 DERIVED_FIELDS = {"vocab_size", "block_size", "context_vocab_size",
-                  "context_block_size"}
+                  "context_block_size", "n_writers"}
 
 CHOICES = {"augment": ("none", "general", "handwriting")}
 
@@ -220,14 +221,6 @@ class ScribeTokenizer:
             previous_end = grid_xy[stop - 1]
         return np.array(out, dtype=np.int64)
 
-    def encode_words(self, words):
-        parts = []
-        for i, word in enumerate(words):
-            if i:
-                parts.append(np.array([self.WORD] * 2, dtype=np.int64))
-            parts.append(self.encode_word(word))
-        return np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
-
     def apply_merges(self, tokens):
         if not self._pairs:
             return tokens
@@ -291,29 +284,16 @@ class ScribeTokenizer:
 
 
 def learn_merges(token_sequences, n_merges=512, min_count=20):
-    sequences = [list(s) for s in token_sequences]
-    merges, next_id = [], N_BASE
-    for _ in range(n_merges):
-        counts = collections.Counter()
-        for s in sequences:
-            for pair in zip(s, s[1:]):
-                if DOWN not in pair and UP not in pair:
-                    counts[pair] += 1
-        if not counts:
+    s = np.concatenate([np.r_[t, UP] for t in token_sequences]).astype(np.int64)
+    vocab, merges = N_BASE + n_merges, []
+    for merged in range(N_BASE, vocab):
+        a, b = s[:-1], s[1:]
+        ok = (a != UP) & (a != DOWN) & (b != UP) & (b != DOWN)
+        pairs, counts = np.unique(a[ok] * vocab + b[ok], return_counts=True)
+        if not len(counts) or counts.max() < min_count:
             break
-        (a, b), count = counts.most_common(1)[0]
-        if count < min_count:
-            break
-        merges.append((a, b, next_id))
-        for i, s in enumerate(sequences):
-            out, j = [], 0
-            while j < len(s):
-                if j + 1 < len(s) and s[j] == a and s[j + 1] == b:
-                    out.append(next_id); j += 2
-                else:
-                    out.append(s[j]); j += 1
-            sequences[i] = out
-        next_id += 1
+        merges.append((*divmod(int(pairs[counts.argmax()]), vocab), merged))
+        s = ScribeTokenizer(merges=merges[-1:]).apply_merges(s)
     return merges
 
 
@@ -337,17 +317,54 @@ Y_BASELINE = 0.65
 INK_HEIGHT = 0.22
 
 
-def check_scale(examples, grid, n=200):
-    heights = [np.quantile(d[:, 1], 0.95) - np.quantile(d[:, 1], 0.05)
-               for d in (e["points"][e["points"][:, 2] == 1] for e in examples[:n])
-               if len(d) > 2]
-    if not heights:
-        return
-    ratio = float(np.median(heights)) / INK_HEIGHT
-    if not 0.5 < ratio < 2:
-        print(f"WARNING: ink is {ratio:.1f}x the usual size. "
-              f"Sequences will be about {ratio:.1f}x as long; "
-              f"pass --grid {grid * ratio:.4f} to compensate, or rescale the data.")
+X_HEIGHT = 0.12
+SPACING = 0.01
+SHORT_LETTERS = set("acemnorsuvwxz")
+
+
+def check_data(examples, grid, name="", n=500, seed=0):
+    rng = np.random.default_rng(seed)
+    sample = [examples[i] for i in rng.choice(len(examples), min(n, len(examples)), replace=False)]
+    short = [e for e in examples if len(e["text"]) >= 2 and set(e["text"]) <= SHORT_LETTERS]
+    short = [short[i] for i in rng.choice(len(short), min(2000, len(short)), replace=False)] if short else []
+    downs = [d for d in (np.asarray(e["points"], float) for e in short) if (d[:, 2] == 1).sum() >= 3]
+    heights = [np.quantile(d[d[:, 2] == 1, 1], 0.98) - np.quantile(d[d[:, 2] == 1, 1], 0.02) for d in downs]
+    bottoms = [np.quantile(d[d[:, 2] == 1, 1], 0.98) for d in downs]
+    steps, tokens, chars = [], 0, 0
+    for e in sample:
+        p = np.asarray(e["points"], float)
+        if (p[:, 2] == 1).sum() < 3:
+            continue
+        same = (p[1:, 2] == 1) & (p[:-1, 2] == 1)
+        steps.append(np.hypot(*np.diff(p[:, :2], axis=0)[same].T))
+        tokens += len(ScribeTokenizer(grid=grid).encode_base(p))
+        chars += len(e["text"])
+    steps = np.concatenate(steps) if steps else np.zeros(1)
+    report = {"x_height": float(np.median(heights)) if len(heights) >= 5 else None,
+              "baseline": float(np.median(bottoms)) if len(bottoms) >= 5 else None,
+              "spacing": float(np.median(steps)), "long_steps": float(np.mean(steps > grid)),
+              "tokens_per_char": tokens / max(chars, 1)}
+    x = f"{report['x_height']:.3f}" if report["x_height"] is not None else "n/a"
+    b = f"{report['baseline']:+.3f}" if report["baseline"] is not None else "n/a"
+    print(f"{name}: x-height {x} (target {X_HEIGHT}), baseline {b}, point spacing {report['spacing']:.4f} "
+          f"(target {SPACING}), {100 * report['long_steps']:.0f}% steps > grid, {report['tokens_per_char']:.0f} tokens/char")
+    errors = []
+    if report["x_height"] is not None and not 0.6 < report["x_height"] / X_HEIGHT < 1.7:
+        errors.append(f"x-height {x} is {report['x_height'] / X_HEIGHT:.2f}x the target {X_HEIGHT}; rescale the ink")
+    if report["baseline"] is not None and abs(report["baseline"]) > 0.06:
+        errors.append(f"baseline sits at {b}; words should rest on y = 0")
+    if report["x_height"] is None:
+        heights = [np.ptp(d[:, 1]) for d in (np.asarray(e["points"])[np.asarray(e["points"])[:, 2] == 1] for e in sample)
+                   if len(d) > 2]
+        ratio = float(np.median(heights)) / INK_HEIGHT if heights else 1.0
+        if not 0.5 < ratio < 2:
+            errors.append(f"ink is {ratio:.1f}x the usual size; rescale it")
+    if report["long_steps"] > 0.05:
+        print(f"  WARNING ({name}): {100 * report['long_steps']:.0f}% of in-stroke steps skip a grid cell; "
+              f"resampling to {SPACING} spacing would match the other datasets")
+    for err in errors:
+        print(f"  ERROR ({name}): {err}")
+    return report, errors
 
 
 def read_items(path, limit=None):
@@ -410,11 +427,12 @@ def read_ink(path):
 
 
 def read_ink_points(path):
-    _, flat, lens, texts, first = _decode_ink(path)
+    z, flat, lens, texts, first = _decode_ink(path)
     ends = np.cumsum(lens)
     rows = np.insert(np.c_[flat, np.ones(len(flat))], ends, np.c_[flat[ends - 1], np.zeros(len(ends))], axis=0)
     per_word = np.diff(np.r_[0, np.cumsum(lens + 1)][first])
-    return texts, np.split(rows, np.cumsum(per_word)[:-1])
+    writers = json.loads(z["tables"].tobytes())["writer"]
+    return texts, np.split(rows.astype(np.float32), np.cumsum(per_word)[:-1]), [writers[int(i)] for i in z["writer"]]
 
 
 def strokes_to_points(strokes):
@@ -425,8 +443,8 @@ def strokes_to_points(strokes):
 
 def load_examples(path, limit=None):
     if str(path).endswith(".ink.npz"):
-        texts, points = read_ink_points(path)
-        examples = [{"text": t, "points": p} for t, p in zip(texts, points)][:limit]
+        texts, points, writers = read_ink_points(path)
+        examples = [{"text": t, "points": p, "writer": w} for t, p, w in zip(texts, points, writers)][:limit]
         print(f"Loaded {len(examples)} examples from {path}")
         return examples
     examples = []
@@ -438,7 +456,7 @@ def load_examples(path, limit=None):
             points[:, 1] -= Y_BASELINE
         points[:, 0] -= points[0, 0]
         text = item.get("text", meta.get("asciiSequence", ""))
-        examples.append({"text": text, "points": points})
+        examples.append({"text": text, "points": points, "writer": os.path.basename(str(path)).split(".")[0]})
     print(f"Loaded {len(examples)} examples from {path}")
     return examples
 
@@ -471,19 +489,22 @@ def resample(points, spacing):
     return np.array(out)
 
 
-def prepare_word(points, cfg, rng=None):
+def augment_params(cfg, rng):
+    return {"shear": rng.uniform(cfg.shear_min, cfg.shear_max) if cfg.augment == "handwriting" else 0.0,
+            "angle": np.deg2rad(rng.uniform(-cfg.rotate, cfg.rotate)),
+            "scale": rng.uniform(1 - cfg.scale_jitter, 1 + cfg.scale_jitter, 2),
+            "offset": rng.uniform(-0.5, 0.5, 2) * cfg.grid,
+            "spacing": cfg.spacing * rng.uniform(1 - cfg.spacing_jitter, 1 + cfg.spacing_jitter)}
+
+
+def prepare_word(points, cfg, aug=None):
     spacing = cfg.spacing
-    if rng is not None and cfg.augment != "none":
+    if aug is not None:
         points = points.copy()
-        if cfg.augment == "handwriting":
-            points[:, 0] += rng.uniform(cfg.shear_min, cfg.shear_max) * points[:, 1]
-        if cfg.rotate:
-            a = np.deg2rad(rng.uniform(-cfg.rotate, cfg.rotate))
-            c, s = np.cos(a), np.sin(a)
-            points[:, :2] = points[:, :2] @ np.array([[c, s], [-s, c]])
-        points[:, 0] *= rng.uniform(1 - cfg.scale_jitter, 1 + cfg.scale_jitter)
-        points[:, 1] *= rng.uniform(1 - cfg.scale_jitter, 1 + cfg.scale_jitter)
-        spacing *= rng.uniform(1 - cfg.spacing_jitter, 1 + cfg.spacing_jitter)
+        points[:, 0] += aug["shear"] * points[:, 1]
+        c, s = np.cos(aug["angle"]), np.sin(aug["angle"])
+        points[:, :2] = points[:, :2] @ np.array([[c, s], [-s, c]]) * aug["scale"] + aug["offset"]
+        spacing = aug["spacing"]
     return resample(points, spacing) if spacing > 0 else points
 
 
@@ -533,19 +554,25 @@ def augment_drawing(points, text, cfg, rng):
     return points
 
 
-class PenDataset(Dataset):
+class PenDataset:
 
     def __init__(self, bank_points, bank_texts, indices, stroke_tok, char_tok, cfg,
-                 length, augment=True, name="", seed=0):
+                 length, augment=True, seed=0, writer_ids=None, weights=None, writers=("",)):
         self.bank_points = bank_points
         self.bank_texts = bank_texts
-        self.indices = np.asarray(indices)
+        self.indices = np.asarray(indices, int)
+        self.writer_ids = np.zeros(len(bank_texts), int) if writer_ids is None else np.asarray(writer_ids)
+        self.writers = list(writers)
+        w = np.ones(len(bank_texts)) if weights is None else np.asarray(weights, float)
+        ids = self.writer_ids[self.indices]
+        self.groups = [self.indices[ids == g] for g in np.unique(ids)]
+        p = np.array([w[g].sum() for g in self.groups])
+        self.group_p = p / p.sum()
         self.stroke_tok = stroke_tok
         self.char_tok = char_tok
         self.cfg = cfg
         self.length = length
         self.augment = augment
-        self.name = name
         self.seed = seed
 
     def encode_text(self, text):
@@ -555,35 +582,33 @@ class PenDataset(Dataset):
         return self.length
 
     def draw_words(self, rng):
-        draw = min(self.cfg.max_words, len(self.indices))
+        group = self.groups[rng.choice(len(self.groups), p=self.group_p)]
+        draw = min(self.cfg.max_words, len(group))
         limit = rng.integers(1, draw + 1)
-        chosen = rng.choice(self.indices, size=draw, replace=False)[:limit]
+        chosen = rng.choice(group, size=draw, replace=False)[:limit]
+        aug = augment_params(self.cfg, rng) if self.augment else None
         base = []
         for i in chosen:
-            word = prepare_word(self.bank_points[i], self.cfg,
-                                rng if self.augment else None)
+            word = prepare_word(self.bank_points[i], self.cfg, aug)
             if self.augment:
                 word = augment_drawing(word, self.bank_texts[i], self.cfg, rng)
             base.append(self.stroke_tok.encode_base(word))
         return chosen, base
 
     def pack(self, chosen, words):
-        block = self.cfg.max_seq_length
+        block, room = self.cfg.max_seq_length, self.cfg.max_text_length
         kept, parts, total = [], [], 0
         for i, tokens in zip(chosen, words):
             extra = len(tokens) + (2 if parts else 0)
-            if parts and total + extra > block - 2:
+            text = " ".join(self.bank_texts[j] for j in kept + [i])
+            if parts and (total + extra > block - 2 or len(text.encode()) > room):
                 break
             if parts:
                 parts.append(np.array([self.stroke_tok.WORD] * 2, dtype=np.int64))
             parts.append(tokens)
             total += extra
             kept.append(i)
-        return np.concatenate(parts), " ".join(self.bank_texts[i] for i in kept)
-
-    def pick_words(self, rng):
-        chosen, base = self.draw_words(rng)
-        return self.pack(chosen, self.stroke_tok.encode_many(base))
+        return np.concatenate(parts), " ".join(self.bank_texts[i] for i in kept), int(self.writer_ids[kept[0]])
 
     def batch(self, indices):
         draws = [self.draw_words(np.random.default_rng([self.seed, int(i)])) for i in indices]
@@ -593,9 +618,9 @@ class PenDataset(Dataset):
         return tuple(torch.stack(t) for t in zip(*items))
 
     def __getitem__(self, idx):
-        return self.make_item(*self.pick_words(np.random.default_rng([self.seed, idx])))
+        return tuple(t[0] for t in self.batch([idx]))
 
-    def make_item(self, tokens, text):
+    def make_item(self, tokens, text, writer=0):
         st, block = self.stroke_tok, self.cfg.max_seq_length
         x = torch.full((block,), st.PAD, dtype=torch.long)
         y = torch.full((block,), IGNORE_INDEX, dtype=torch.long)
@@ -606,36 +631,61 @@ class PenDataset(Dataset):
         y[:n + 1] = x[1:n + 2]
         if len(tokens) > n:
             y[n] = IGNORE_INDEX
-        return x, torch.from_numpy(self.encode_text(text)), y
+        return x, torch.from_numpy(self.encode_text(text)), y, torch.tensor(writer)
 
 
-def create_datasets(cfg, merges=None):
-    examples = load_examples(cfg.dataset, cfg.max_examples or None)
-    check_scale(examples, cfg.grid)
-    bank_points = [e["points"] for e in examples]
-    bank_texts = [e["text"] for e in examples]
+def dataset_specs(spec):
+    out = []
+    for part in spec.split(","):
+        path, _, weight = part.strip().partition(":")
+        out.append((path, float(weight or 1)))
+    return out
+
+
+def create_datasets(cfg, merges=None, writers=None):
+    bank_points, bank_texts, bank_writers, weights, train_ix, test_ix = [], [], [], [], [], []
+    for path, weight in dataset_specs(cfg.dataset):
+        examples = load_examples(path, cfg.max_examples or None)
+        long = sum(len(e["text"].encode()) > cfg.max_text_length for e in examples)
+        if long:
+            print(f"Dropping {long} examples from {path} whose text exceeds max_text_length {cfg.max_text_length}")
+            examples = [e for e in examples if len(e["text"].encode()) <= cfg.max_text_length]
+        if check_data(examples, cfg.grid, os.path.basename(path))[1]:
+            raise SystemExit(f"{path} is not in the shared coordinate system; see the errors above")
+        offset = len(bank_texts)
+        bank_points += [e["points"] for e in examples]
+        bank_texts += [e["text"] for e in examples]
+        bank_writers += [e["writer"] for e in examples]
+        weights += [weight / len(examples)] * len(examples)
+        perm = np.random.default_rng(cfg.seed).permutation(len(examples)) + offset
+        n_test = min(1000, len(examples) // 20)
+        train_ix += list(perm[:len(perm) - n_test])
+        test_ix += list(perm[len(perm) - n_test:])
+    if not test_ix:
+        raise SystemExit("too few examples to hold out test words; need at least 20 in some dataset")
+    writers = writers or [""] + sorted(set(bank_writers) - {""})
+    lookup = {w: i for i, w in enumerate(writers)}
+    writer_ids = [lookup.get(w, 0) for w in bank_writers]
     char_tok = ByteTokenizer()
-
     rng = np.random.default_rng(cfg.seed)
-    perm = rng.permutation(len(examples))
-    n_test = min(1000, max(10, int(0.05 * len(examples))))
-    train_ix, test_ix = perm[:-n_test], perm[-n_test:]
 
     if merges is None:
         base = ScribeTokenizer(grid=cfg.grid)
-        sample = rng.choice(train_ix, size=min(600, len(train_ix)), replace=False)
-        corpus = [base.encode_word(prepare_word(bank_points[i], cfg, rng)) for i in sample]
+        p = np.asarray(weights)[train_ix] / np.sum(np.asarray(weights)[train_ix])
+        sample = rng.choice(train_ix, size=min(600, len(train_ix)), replace=False, p=p)
+        corpus = [base.encode_word(prepare_word(bank_points[i], cfg, augment_params(cfg, rng))) for i in sample]
         merges = learn_merges(corpus, cfg.n_merges)
         print(f"Learned {len(merges)} BPE merges")
     stroke_tok = ScribeTokenizer(grid=cfg.grid, merges=merges)
 
-    def build(ix, n, name, seed):
+    def build(ix, n, seed, augment):
         return PenDataset(bank_points, bank_texts, ix, stroke_tok, char_tok, cfg,
-                          length=n, augment=cfg.augment != "none", name=name, seed=seed)
+                          length=n, augment=augment, seed=seed,
+                          writer_ids=writer_ids, weights=weights, writers=writers)
 
-    train_dataset = build(train_ix, cfg.train_size, "train", cfg.seed)
-    test_dataset = build(test_ix, cfg.test_size, "test", cfg.seed + 1)
-    print(f"Word bank: {len(train_ix)} train / {len(test_ix)} test words; "
+    train_dataset = build(train_ix, cfg.train_size, cfg.seed, cfg.augment != "none")
+    test_dataset = build(test_ix, cfg.test_size, cfg.seed + 1, False)
+    print(f"Word bank: {len(train_ix)} train / {len(test_ix)} test words from {len(writers) - 1} writers; "
           f"stroke vocab {stroke_tok.vocab_size}")
     return train_dataset, test_dataset, stroke_tok, char_tok
 
@@ -645,12 +695,18 @@ def infinite_batches(dataset, batch_size, seed=0, prefetch=4):
     q = queue.Queue(maxsize=prefetch)
 
     def produce():
-        while True:
-            q.put(dataset.batch(rng.integers(0, len(dataset), batch_size)))
+        try:
+            while True:
+                q.put(dataset.batch(rng.integers(0, 2 ** 62, batch_size)))
+        except Exception as e:
+            q.put(e)
 
     threading.Thread(target=produce, daemon=True).start()
     while True:
-        yield q.get()
+        item = q.get()
+        if isinstance(item, Exception):
+            raise item
+        yield item
 
 
 def _split_heads(t, n_head):
@@ -694,12 +750,12 @@ class Attention(nn.Module):
         q = _split_heads(self.q(x), self.n_head)
         k, v = (_split_heads(t, self.n_head)
                 for t in self.kv(x if source is None else source).split(x.size(-1), dim=2))
+        q, k = self.q_norm(q), self.k_norm(k)
         if rotary is not None:
             q, k = apply_rotary(q, *rotary), apply_rotary(k, *rotary)
-        q, k = self.q_norm(q), self.k_norm(k)
         if cache is not None:
-            buf, slot = cache
-            buf.copy_(torch.where(slot, torch.stack([k, v]), buf))
+            buf, t = cache
+            buf.index_copy_(3, t, torch.stack([k, v]))
             k, v = buf
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=mask is None)
         return self.proj(_merge_heads(y))
@@ -731,6 +787,8 @@ class PenTransformer(nn.Module):
         self.resid_scale = nn.Parameter(torch.ones(cfg.n_layer))
         self.x0_scale = nn.Parameter(torch.zeros(cfg.n_layer))
         self.head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
+        if cfg.n_writers > 0:
+            self.writer_emb = nn.Embedding(cfg.n_writers, cfg.n_embd)
         self.register_buffer("pen_deltas", torch.zeros(cfg.vocab_size, 2, dtype=torch.long))
         if cfg.pen_pos_bands > 0:
             self.pen_pos_proj = nn.Linear(4 * cfg.pen_pos_bands, cfg.n_embd, bias=False)
@@ -750,6 +808,8 @@ class PenTransformer(nn.Module):
         for emb in (self.tok_emb, self.ctx_emb, self.ctx_pos_emb):
             nn.init.normal_(emb.weight, std=0.8)
         nn.init.normal_(self.head.weight, std=0.001)
+        if self.cfg.n_writers > 0:
+            nn.init.normal_(self.writer_emb.weight, std=0.8)
 
     def embed(self, idx, pen_xy):
         x = self.tok_emb(idx)
@@ -759,9 +819,15 @@ class PenTransformer(nn.Module):
             x = x + self.pen_pos_proj(torch.cat([angles.sin(), angles.cos()], dim=-1).flatten(-2))
         return rms_norm(x)
 
-    def encode_context(self, context):
+    def encode_context(self, context, writer=None):
         c = rms_norm(self.ctx_emb(context) + self.ctx_pos_emb.weight[:context.size(1)])
         mask = (context != 0)[:, None, None, :]
+        if self.cfg.n_writers > 0:
+            w = torch.zeros(len(context), dtype=torch.long, device=context.device) if writer is None else writer
+            if self.training:
+                w = torch.where(torch.rand(w.shape, device=w.device) < self.cfg.writer_dropout, 0, w)
+            c = torch.cat([rms_norm(self.writer_emb(w))[:, None], c], dim=1)
+            mask = torch.cat([torch.ones_like(mask[..., :1]), mask], dim=-1)
         return c, mask | ~mask.any(-1, keepdim=True)
 
     def logits(self, x, c, ctx_mask, rotary, self_mask=None, caches=None):
@@ -771,7 +837,7 @@ class PenTransformer(nn.Module):
                       self_mask, caches[i] if caches else None)
         return 15 * torch.tanh(self.head(rms_norm(x)) / 15)
 
-    def forward(self, idx, context, targets=None):
+    def forward(self, idx, context, targets=None, writer=None):
         B, T = idx.shape
         assert T <= self.cfg.block_size, f"sequence length {T} > block size {self.cfg.block_size}"
         pen_xy = self.pen_deltas[idx].cumsum(dim=1)
@@ -779,16 +845,16 @@ class PenTransformer(nn.Module):
             j = self.cfg.pen_pos_jitter
             pen_xy = pen_xy + torch.randint(-j, j + 1, (B, 1, 2), device=idx.device)
         rotary = rotary_tables(T, self.cfg.n_embd // self.cfg.n_head, idx.device)
-        logits = self.logits(self.embed(idx, pen_xy), *self.encode_context(context), rotary)
+        logits = self.logits(self.embed(idx, pen_xy), *self.encode_context(context, writer), rotary)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.flatten(0, 1).float(), targets.flatten(),
+            loss = F.cross_entropy(logits.flatten(0, 1), targets.flatten(),
                                    ignore_index=IGNORE_INDEX)
         return logits, loss
 
     @torch.inference_mode()
     def generate(self, idx, context, max_new_tokens, temperature=1.0, top_k=None,
-                 do_sample=True, end_token=None, pad_token=None):
+                 do_sample=True, end_token=None, pad_token=None, writer=None, generator=None):
         was_training = self.training
         self.eval()
         B, T0 = idx.shape
@@ -796,7 +862,7 @@ class PenTransformer(nn.Module):
         head_dim = self.cfg.n_embd // self.cfg.n_head
         caches = [torch.zeros(2, B, self.cfg.n_head, n, head_dim, device=dev) for _ in self.blocks]
         cos, sin = rotary_tables(n, head_dim, dev)
-        c, ctx_mask = self.encode_context(context)
+        c, ctx_mask = self.encode_context(context, writer)
         slots, t = torch.arange(n, device=dev), torch.zeros(1, dtype=torch.long, device=dev)
         pen_xy = torch.zeros(B, 1, 2, dtype=torch.long, device=dev)
         done = torch.zeros(B, dtype=torch.bool, device=dev)
@@ -805,9 +871,8 @@ class PenTransformer(nn.Module):
             pen_xy = pen_xy + self.pen_deltas[tokens[step]]
             rotary = cos.index_select(0, t), sin.index_select(0, t)
             mask = (slots <= t)[None, None, None]
-            slot = (slots == t)[:, None]
             logits = self.logits(self.embed(tokens[step], pen_xy), c, ctx_mask, rotary, mask,
-                                 [(buf, slot) for buf in caches])[:, -1]
+                                 [(buf, t) for buf in caches])[:, -1]
             t += 1
             if step < T0 - 1:
                 continue
@@ -815,13 +880,13 @@ class PenTransformer(nn.Module):
             if top_k is not None:
                 v, _ = torch.topk(logits, top_k)
                 logits[logits < v[:, [-1]]] = -float("inf")
-            nxt = (torch.multinomial(F.softmax(logits, dim=-1), 1) if do_sample
+            nxt = (torch.multinomial(F.softmax(logits, dim=-1), 1, generator=generator) if do_sample
                    else logits.argmax(dim=-1, keepdim=True))
             if end_token is not None:
                 nxt[done] = pad_token if pad_token is not None else end_token
                 done |= nxt.squeeze(1) == end_token
             tokens.append(nxt)
-            if end_token is not None and done.all():
+            if end_token is not None and step % 16 == 0 and done.all():
                 break
         self.train(was_training)
         return torch.cat(tokens, dim=1)
@@ -848,11 +913,11 @@ def orthogonalize(G):
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, momentum=0.95, weight_decay=0.0):
+    def __init__(self, params, lr=0.02, momentum=0.95):
         params = list(params)
         groups = [dict(params=[p for p in params if p.shape == shape])
                   for shape in sorted({p.shape for p in params})]
-        super().__init__(groups, dict(lr=lr, momentum=momentum, weight_decay=weight_decay))
+        super().__init__(groups, dict(lr=lr, momentum=momentum))
 
     @torch.no_grad()
     def step(self):
@@ -867,7 +932,7 @@ class Muon(torch.optim.Optimizer):
             rows, cols = params[0].shape
             lr = group["lr"] * max(1.0, rows / cols) ** 0.5
             for p, u in zip(params, update):
-                p.mul_(1 - lr * group["weight_decay"]).add_(u.to(p.dtype), alpha=-lr)
+                p.add_(u.to(p.dtype), alpha=-lr)
 
 
 def make_optimizers(model, cfg):
@@ -895,12 +960,13 @@ def attach_pen_deltas(model, stroke_tok):
 
 
 def save_checkpoint(path, model, data_config, merges=None, optimizers=None,
-                    step=None, best_loss=None):
+                    step=None, best_loss=None, writers=None):
     checkpoint = {
         "model": model.state_dict(),
         "model_config": asdict(model.cfg),
         "data_config": data_config,
         "merges": [[int(a), int(b), int(c)] for a, b, c in (merges or [])],
+        "writers": list(writers or [""]),
         "step": int(step) if step is not None else None,
         "best_loss": float(best_loss) if best_loss is not None else None,
     }
@@ -921,8 +987,8 @@ def load_for_sampling(path, device="cpu"):
     model, checkpoint = load_checkpoint(path, device)
     cfg = DataConfig(**checkpoint["data_config"])
     stroke_tok = ScribeTokenizer(grid=cfg.grid, merges=checkpoint["merges"])
-    attach_pen_deltas(model, stroke_tok)
-    dataset = PenDataset([], [], [], stroke_tok, ByteTokenizer(), cfg, length=0)
+    dataset = PenDataset([], [], [], stroke_tok, ByteTokenizer(), cfg, length=0,
+                         writers=checkpoint.get("writers", [""]))
     return model, dataset, cfg, checkpoint
 
 
@@ -937,19 +1003,27 @@ class SampleParams:
     line_width: float = 8.0
     line_height: float = 0.55
     seed: int = 42
+    writer: str = ""
     linewidth: float = 1.3
     verbose: bool = True
+
+
+def writer_id(dataset, name):
+    if name and name not in dataset.writers:
+        raise SystemExit(f"unknown writer {name!r}; known: {', '.join(w for w in dataset.writers if w)}")
+    return dataset.writers.index(name) if name else 0
 
 
 def generate(model, dataset, text, params=None):
     params = params or SampleParams()
     st = dataset.stroke_tok
     device = next(model.parameters()).device
+    writer = torch.tensor([writer_id(dataset, params.writer)], device=device)
     context = torch.from_numpy(dataset.encode_text(text)).unsqueeze(0).to(device)
     idx = torch.full((1, 1), st.BOS, dtype=torch.long, device=device)
     out = model.generate(idx, context, max_new_tokens=params.max_tokens,
                          temperature=params.temperature, top_k=params.top_k,
-                         do_sample=params.do_sample, end_token=st.END, pad_token=st.PAD)
+                         do_sample=params.do_sample, end_token=st.END, pad_token=st.PAD, writer=writer)
     return st.decode(out[0].cpu().numpy()[1:])
 
 
@@ -1035,14 +1109,16 @@ def generate_paragraph(model, dataset, text, params=None, words=None, redo=None)
     return words
 
 
-def save_progress(model, dataset, out_dir, step, showcase=(), n=6, samples=3):
-    X, C, _ = dataset.batch(range(n))
+def save_progress(model, dataset, out_dir, step, showcase=(), n=6, samples=3, showcase_writer=""):
+    X, C, _, W = dataset.batch(range(n))
     C = torch.cat([C] + [torch.from_numpy(dataset.encode_text(t))[None] for t in showcase])
+    W = torch.cat([W, torch.full((len(showcase),), writer_id(dataset, showcase_writer))])
     st, device, rows = dataset.stroke_tok, next(model.parameters()).device, len(C)
     gen = lambda k, do_sample: model.generate(
         torch.full((rows * k, 1), st.BOS, device=device), C.repeat_interleave(k, 0).to(device),
-        dataset.cfg.max_seq_length - 1, do_sample=do_sample, end_token=st.END, pad_token=st.PAD).cpu()
-    torch.manual_seed(3)
+        dataset.cfg.max_seq_length - 1, do_sample=do_sample, end_token=st.END, pad_token=st.PAD,
+        writer=W.repeat_interleave(k, 0).to(device),
+        generator=torch.Generator(device).manual_seed(3)).cpu()
     greedy, out = gen(1, False), gen(samples, True)
     fig, axes = plt.subplots(rows, samples + 2, figsize=(3 * (samples + 2), 1.1 * rows),
                              squeeze=False, sharex="row", sharey="row")
@@ -1084,8 +1160,8 @@ def evaluate(model, dataset, device, batch_size=100, max_batches=10):
         dataset._eval_batches = [dataset.batch(range(i, min(i + batch_size, n)))
                                  for i in range(0, n, batch_size)]
     total = count = 0
-    for X, C, Y in dataset._eval_batches:
-        _, loss = model(X.to(device), C.to(device), Y.to(device))
+    for X, C, Y, W in dataset._eval_batches:
+        _, loss = model(X.to(device), C.to(device), Y.to(device), W.to(device))
         n_tok = (Y != IGNORE_INDEX).sum().item()
         total += loss.item() * n_tok
         count += n_tok
@@ -1100,7 +1176,8 @@ def train(data_cfg, model_cfg, train_cfg):
 
     ckpt = None
     if train_cfg.resume:
-        _, ckpt = load_checkpoint(train_cfg.resume, device)
+        ckpt = torch.load(train_cfg.resume, map_location=device, weights_only=True)
+        model_cfg = ModelConfig(**ckpt["model_config"])
         resumed_cfg = DataConfig(**ckpt["data_config"])
         if asdict(resumed_cfg) != asdict(data_cfg):
             changed = {k: (v, getattr(data_cfg, k))
@@ -1112,11 +1189,13 @@ def train(data_cfg, model_cfg, train_cfg):
 
     torch.manual_seed(data_cfg.seed)
     train_dataset, test_dataset, stroke_tok, char_tok = create_datasets(
-        data_cfg, merges=ckpt["merges"] if ckpt else None)
+        data_cfg, merges=ckpt["merges"] if ckpt else None, writers=ckpt.get("writers") if ckpt else None)
+    model_cfg.n_writers = len(train_dataset.writers)
     model_cfg.vocab_size = stroke_tok.vocab_size
     model_cfg.block_size = data_cfg.max_seq_length
     model_cfg.context_vocab_size = char_tok.vocab_size
     model_cfg.context_block_size = data_cfg.max_text_length
+    writer_id(train_dataset, train_cfg.showcase_writer)
 
     model = PenTransformer(model_cfg).to(device)
     attach_pen_deltas(model, stroke_tok)
@@ -1143,8 +1222,8 @@ def train(data_cfg, model_cfg, train_cfg):
     step_model = torch.compile(model) if train_cfg.compile and device != "cpu" else model
     t_start = t_print = time.time()
     while step < train_cfg.steps:
-        X, C, Y = [t.to(device, non_blocking=True) for t in next(batches)]
-        _, loss = step_model(X, C, Y)
+        X, C, Y, W = [t.to(device, non_blocking=True) for t in next(batches)]
+        _, loss = step_model(X, C, Y, W)
         model.zero_grad(set_to_none=True)
         loss.backward()
         if train_cfg.grad_clip > 0:
@@ -1158,11 +1237,11 @@ def train(data_cfg, model_cfg, train_cfg):
             opt.step()
         step += 1
 
-        if run:
-            run.log({"train_loss_step": loss.item(), "step": step})
         if step % train_cfg.print_every == 0:
             ms = (time.time() - t_print) * 1000 / train_cfg.print_every
             print(f"step {step} | loss {loss.item():.4f} | {ms:.0f} ms/step | lr x{mult:.3f}")
+            if run:
+                run.log({"train_loss_step": loss.item(), "step": step})
             t_print = time.time()
         if step % train_cfg.eval_every and step < train_cfg.steps:
             continue
@@ -1180,7 +1259,7 @@ def train(data_cfg, model_cfg, train_cfg):
             best_loss = test_loss
             print(f"New best test loss; saving checkpoint to {checkpoint_path}")
             save_checkpoint(checkpoint_path, model, asdict(data_cfg),
-                            stroke_tok.merges, optimizers, step, best_loss)
+                            stroke_tok.merges, optimizers, step, best_loss, train_dataset.writers)
             if run:
                 artifact = wandb.Artifact("best_checkpoint", type="model")
                 artifact.add_file(checkpoint_path)
@@ -1188,10 +1267,11 @@ def train(data_cfg, model_cfg, train_cfg):
 
         save_checkpoint(os.path.join(train_cfg.out_dir, "last.pt"), model,
                         asdict(data_cfg), stroke_tok.merges,
-                        optimizers, step, best_loss)
+                        optimizers, step, best_loss, train_dataset.writers)
 
         path = save_progress(model, test_dataset, os.path.join(train_cfg.out_dir, "progress"), step,
-                             [t for t in train_cfg.showcase.split("|") if t])
+                             [t for t in train_cfg.showcase.split("|") if t],
+                             showcase_writer=train_cfg.showcase_writer)
         print(f"  wrote {path}")
         if run:
             run.log({"progress": wandb.Image(path), "step": step})
@@ -1206,7 +1286,7 @@ def sample_command(args):
     model, dataset, cfg, _ = load_for_sampling(args.checkpoint, device)
     params = SampleParams(temperature=args.temperature, top_k=args.top_k,
                           do_sample=not args.greedy, n_at_a_time=args.n_at_a_time,
-                          max_tokens=cfg.max_seq_length - 1, seed=args.seed)
+                          max_tokens=cfg.max_seq_length - 1, seed=args.seed, writer=args.writer)
     words = generate_paragraph(model, dataset, args.text, params)
     if args.redo:
         redo = [int(i) for i in args.redo.split(",") if i.strip()]
@@ -1219,9 +1299,9 @@ def sample_command(args):
 
 @torch.inference_mode()
 def text_rank(model, dataset, device, n=32):
-    X, C, Y = (t.to(device) for t in dataset.batch(range(n)))
+    X, C, Y, W = (t.to(device) for t in dataset.batch(range(n)))
     model.eval()
-    nll = torch.stack([F.cross_entropy(model(X, C[j].expand_as(C))[0].transpose(1, 2), Y,
+    nll = torch.stack([F.cross_entropy(model(X, C[j].expand_as(C), writer=W)[0].transpose(1, 2), Y,
                                        ignore_index=IGNORE_INDEX, reduction="none").sum(1)
                        for j in range(n)], dim=1)
     model.train()
@@ -1230,10 +1310,8 @@ def text_rank(model, dataset, device, n=32):
 
 def rank_command(args):
     device = resolve_device(args.device)
-    _, _, cfg, ckpt = load_for_sampling(args.checkpoint, device)
-    model, _ = load_checkpoint(args.checkpoint, device)
-    _, test, stroke_tok, _ = create_datasets(cfg, merges=ckpt["merges"])
-    attach_pen_deltas(model, stroke_tok)
+    model, _, cfg, ckpt = load_for_sampling(args.checkpoint, device)
+    _, test, _, _ = create_datasets(cfg, merges=ckpt["merges"], writers=ckpt.get("writers"))
     print(f"step {ckpt['step']}: true text ranks {text_rank(model, test, device, args.n):.2f} "
           f"of {args.n} (chance {(args.n + 1) / 2:.1f})")
 
@@ -1243,7 +1321,7 @@ def main(argv=None):
         description="pengpt: a minimal transformer for pen strokes")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    train_p = sub.add_parser("train", help="train a model on one dataset")
+    train_p = sub.add_parser("train", help="train a model on one or more weighted datasets")
     train_p.add_argument("--preset", type=str, default="",
                          help="per-dataset settings from utils.PRESETS "
                               "(cursive, quickdraw, icons); "
@@ -1261,6 +1339,8 @@ def main(argv=None):
     sample_p.add_argument("--redo", type=str, default="",
                           help="comma-separated word indices to regenerate")
     sample_p.add_argument("--seed", type=int, default=42)
+    sample_p.add_argument("--writer", type=str, default="", help="write in this writer's style; "
+                                                                  "empty for the unknown-writer style")
     sample_p.add_argument("--show_indices", action="store_true")
     sample_p.add_argument("--device", type=str, default="auto")
 
@@ -1269,6 +1349,11 @@ def main(argv=None):
     rank_p.add_argument("--checkpoint", type=str, default="out/cursive/best.pt")
     rank_p.add_argument("--n", type=int, default=32)
     rank_p.add_argument("--device", type=str, default="auto")
+
+    check_p = sub.add_parser("check", help="check datasets share one coordinate system: x-height, "
+                                           "baseline, point spacing")
+    check_p.add_argument("--dataset", type=str, required=True, help="path or comma-separated paths")
+    check_p.add_argument("--grid", type=float, default=DataConfig.grid)
 
     known, _ = parser.parse_known_args(argv)
     if getattr(known, "preset", ""):
@@ -1280,6 +1365,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     commands = {"train": lambda a: train(*configs_from_args(a)),
+                "check": lambda a: [check_data(load_examples(p), a.grid, os.path.basename(p))
+                                    for p, _ in dataset_specs(a.dataset)],
                 "sample": sample_command, "rank": rank_command}
     commands[args.command](args)
 

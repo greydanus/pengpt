@@ -119,7 +119,7 @@ def test_qc_ignores_traces_of_a_changed_image(tmp_path):
     write_jsonl(manifest, [{"image": image, "text": "wave", "source": "s"}])
     write_jsonl(traces, [{"image": image, "hash": file_hash(image), "prompt": "p", "strokes": [path], "read": ""}])
     args = Namespace(manifest=manifest, traces=traces, out=out, sheet="",
-                     min_coverage=0.88, min_precision=0.9, max_read_error=0.34, max_length_ratio=1.3)
+                     min_coverage=0.85, min_precision=0.9, max_read_error=0.34, max_length_ratio=1.6)
     qc_command(args)
     assert len(read_jsonl(out)) == 1
     ImageDraw.Draw(img).line([(10, 10), (190, 10)], fill="black", width=4)

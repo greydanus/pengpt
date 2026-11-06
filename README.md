@@ -106,8 +106,8 @@ python pengpt.py train --preset quickdraw
 ```
 
 The preset is the settings a drawing corpus needs: `--max_words 1` because
-each sample is a single object, `--augment general` because shear is an italic
-slant that presumes a baseline and is a distortion on a sketch, and
+each sample is a single object, `--augment general` because slant presumes a
+baseline, which a sketch doesn't have, and
 `--max_text_length 24 --max_seq_length 192` near the corpus's longest label
 and p99 token count — leaving these at the cursive defaults spends most of
 every sequence on padding.
@@ -262,8 +262,22 @@ save_ink([{"text": "hello", "strokes": [[[0.0, 0.0], [0.01, -0.02], ...], ...],
          "data/mine.ink.npz")
 ```
 
-y grows downward, the baseline sits at y = 0, and lowercase letters are
-roughly 0.1–0.3 units tall. Coordinates are stored in steps of 0.001, so a
+y grows downward, the baseline sits at y = 0, the x-height (the height of
+letters like a, e, n, o) is 0.12, and points within a stroke are about 0.01
+apart. Every dataset must share this coordinate system, or the model learns
+that one letter comes in several sizes. Check a dataset before training on it:
+
+```bash
+python pengpt.py check --dataset data/mine.ink.npz,data/bigbank_3500.ink.npz
+```
+
+It reports x-height, baseline, point spacing and tokens per character on a
+random sample. Training runs the same check on every dataset it loads and
+refuses one whose x-height is outside 0.6–1.7× of 0.12 or whose baseline is
+off by more than 0.06. Those ranges admit any real handwriting style, print,
+cursive or capitals, and catch the 2× to 1000× errors that wrong units or
+frames produce. Points spaced more than a grid cell apart get a warning:
+resample them to 0.01. Coordinates are stored in steps of 0.001, so a
 word costs a few hundred bytes; BRUSH's 85,349 words fit in 32 MB and load in
 under two seconds. Older JSON files of `{"text", "points": [[x, y, pen], ...]}`
 still load.
@@ -271,8 +285,9 @@ still load.
 - **Collect your own**: open `collect.html` in a browser, write with a
   mouse/trackpad, export JSON. This is how the bundled `bigbank_3500` dataset
   (3,500 words, one author) was made.
-- **Convert existing datasets**: `normalize` in `utils.py` brings absolute or
-  delta-encoded points to the expected conventions.
+- **Convert existing datasets**: `normalize` in `utils.py` brings absolute
+  points to the expected scale and baseline; convert delta-encoded data to
+  absolute coordinates first.
 - **Irregular point density?** Set `--spacing 0.02` to resample to uniform arc
   length. The bundled data does not need this: `collect.html` records a point
   every time the pen has moved a fixed distance, so its spacing is already
@@ -291,19 +306,41 @@ python pengpt.py train --dataset data/sketches.json --max_words 1 --augment gene
 ```
 
 `--max_words 1` treats each example as one trajectory, which makes the `WORD`
-separator inert. `--augment general` drops the shear: it is always negative, so
-it imposes an italic slant rather than jittering, and it presumes a baseline to
-slant about. `--augment none` disables augmentation entirely, and `--rotate 10`
-adds rotation, which suits data with no canonical upright.
+separator inert. `--augment general` drops the slant jitter, which presumes a
+baseline to slant about. `--augment none` disables augmentation entirely, and
+a larger `--rotate` suits data with no canonical upright.
 
 Ink scale is the one thing to get right. The grid is a fixed distance, so tokens
 per example scale with how large the drawing is; `normalize` in `utils.py`
 rescales to the bundled data's scale, and training warns with a suggested
 `--grid` if a dataset arrives at a different one.
 
-Measured on the bundled cursive, the shear earns its place: removing it costs
-0.79 → 0.95 bits per pen-point even with 37% more optimizer steps. That is a
-statement about this dataset, not about pen data in general.
+**Augmentation** varies each training sequence a little around the real
+writing: slant ±0.1, horizontal and vertical stretch ±10%, tilt ±2°, and a
+shift of up to half a grid cell, so the same shape is seen at every rounding
+phase. One draw covers a whole sequence, because a sequence holds one writer's
+words. Test data is never augmented. On the bundled cursive, scored on the same
+clean held-out words after 5,000 steps, this reached 0.60 nats per pen move;
+no augmentation overfits within 1,000 steps (0.78 at its best), and an older
+setting that slanted every word the same way did worse than none (0.83).
+
+## Mixing datasets and writers
+
+`--dataset` takes several files with sampling weights, and each training
+sequence is drawn from one dataset, then one writer, in proportion:
+
+```bash
+python pengpt.py train --preset cursive \
+    --dataset "data/bigbank_3500.ink.npz:3,data/raw/brush/brush.ink.npz:1"
+```
+
+Each dataset keeps its own fixed train/test split, so a dataset's held-out
+words never change when it is mixed with others. Every writer gets a learned
+style vector next to the prompt, and 10% of the time training swaps in a shared
+"unknown writer" vector, so the model can also write without one. Pick a hand
+when sampling with `--writer`, e.g. `--writer sam`; leave it out for the
+unknown-writer style. Datasets must share one coordinate system; see `check`
+above.
 
 ## Quick, Draw!
 
@@ -352,7 +389,7 @@ python pengpt.py train --preset icons
 ```
 
 The preset uses a finer grid (0.012 — the default 0.020 is too coarse for
-small icon detail) and `--tremor 0.004 --rotate 2`: designer geometry is
+small icon detail) and `--tremor 0.004`: designer geometry is
 ruler-perfect, and a model trained on it learns a drafting machine's hand, so
 tremor bridges it toward human ink.
 

@@ -1,19 +1,23 @@
 import argparse
 import glob
+import os
 import pickle
 import random
+import zipfile
 
 import numpy as np
 
 from pengpt import INK_HEIGHT, save_ink
 
 RAW = "data/raw"
+XHEIGHT = 0.123
+SPACING = 0.010
+XLETTERS = set("acemnorsuvwxz")
 
 
 class SafeUnpickler(pickle.Unpickler):
     allowed = {("numpy", "ndarray"), ("numpy", "dtype"), ("numpy.core.multiarray", "_reconstruct"),
-               ("numpy._core.multiarray", "_reconstruct"), ("numpy.core.multiarray", "scalar"),
-               ("numpy._core.multiarray", "scalar"), ("builtins", "list"), ("builtins", "str")}
+               ("numpy._core.multiarray", "_reconstruct"), ("builtins", "list"), ("builtins", "str")}
 
     def find_class(self, module, name):
         if (module, name) not in self.allowed:
@@ -31,20 +35,71 @@ def split_strokes(points, ends):
     return [s for s in strokes if len(s)]
 
 
+def catmull_rom(p, per=16):
+    p = p[np.r_[True, np.hypot(*np.diff(p, axis=0).T) > 1e-9]]
+    if len(p) < 3:
+        return p
+    q = np.vstack([2 * p[0] - p[1], p, 2 * p[-1] - p[-2]])
+    p0, p1, p2, p3 = q[:-3], q[1:-2], q[2:-1], q[3:]
+    t1 = np.hypot(*(p1 - p0).T) ** 0.5
+    t2 = t1 + np.hypot(*(p2 - p1).T) ** 0.5
+    t3 = t2 + np.hypot(*(p3 - p2).T) ** 0.5
+    t = t1[:, None] + (t2 - t1)[:, None] * np.linspace(0, 1, per, endpoint=False)
+    lerp = lambda pa, pb, ta, tb: ((tb[:, None, None] - t[..., None]) * pa[:, None] + (t[..., None] - ta[:, None, None]) * pb[:, None]) / (tb - ta)[:, None, None]
+    zero = np.zeros_like(t1)
+    a1, a2, a3 = lerp(p0, p1, zero, t1), lerp(p1, p2, t1, t2), lerp(p2, p3, t2, t3)
+    b1 = ((t2[:, None] - t)[..., None] * a1 + (t - zero[:, None])[..., None] * a2) / t2[:, None, None]
+    b2 = ((t3[:, None] - t)[..., None] * a2 + (t - t1[:, None])[..., None] * a3) / (t3 - t1)[:, None, None]
+    c = ((t2[:, None] - t)[..., None] * b1 + (t - t1[:, None])[..., None] * b2) / (t2 - t1)[:, None, None]
+    return np.vstack([c.reshape(-1, 2), p[-1:]])
+
+
+def resample_stroke(p, spacing=SPACING):
+    if len(p) < 2:
+        return p
+    dense = catmull_rom(np.asarray(p, float))
+    if len(dense) < 2:
+        return dense[:1]
+    cum = np.r_[0, np.cumsum(np.hypot(*np.diff(dense, axis=0).T))]
+    s = np.linspace(0, cum[-1], max(1, int(round(cum[-1] / spacing))) + 1)
+    return np.column_stack([np.interp(s, cum, dense[:, 0]), np.interp(s, cum, dense[:, 1])])
+
+
+def group_xheight(group):
+    words = [np.ptp(np.quantile(np.concatenate(s["strokes"])[:, 1], [0.02, 0.98])) for s in group
+             if len(s["text"]) >= 2 and set(s["text"]) <= XLETTERS]
+    if len(words) >= 5:
+        return float(np.median(words)), "words"
+    letters = [h for s in group for h in s.get("xh", [])]
+    if len(letters) >= 5:
+        return float(np.median(letters)), "letters"
+    return None, "none"
+
+
 def standardize(samples):
-    by_writer = {}
+    by_frame = {}
     for s in samples:
-        by_writer.setdefault(s["writer"], []).append(s)
-    out = []
-    for group in by_writer.values():
-        heights = [np.ptp(np.quantile(np.concatenate(s["strokes"])[:, 1], [0.05, 0.95])) for s in group]
-        k = INK_HEIGHT / max(np.median(heights), 1e-9)
+        by_frame.setdefault(s["frame"], []).append(s)
+    out, how = [], {}
+    for frame, group in by_frame.items():
+        xh, how[frame] = group_xheight(group)
+        if xh:
+            k = XHEIGHT / xh
+            if how[frame] in ("words", "letters"):
+                trial = [[resample_stroke(np.column_stack([st[:, 0] * k, st[:, 1] * k])) for st in s["strokes"]] for s in group
+                         if set(s["text"]) <= XLETTERS and len(s["text"]) >= (2 if how[frame] == "words" else 1)]
+                got = np.median([np.ptp(np.quantile(np.concatenate(t)[:, 1], [0.02, 0.98])) for t in trial])
+                k *= XHEIGHT / got
+        else:
+            heights = [np.ptp(np.quantile(np.concatenate(s["strokes"])[:, 1], [0.05, 0.95])) for s in group]
+            k = INK_HEIGHT / max(np.median(heights), 1e-9)
         for s in group:
-            x0 = min(st[:, 0].min() for st in s["strokes"])
-            strokes = [np.column_stack([(st[:, 0] - x0) * k, (st[:, 1] - s["baseline"]) * k]).round(5).tolist()
+            x0, y0 = s["strokes"][0][0, 0], s["baseline"]
+            strokes = [resample_stroke(np.column_stack([(st[:, 0] - x0) * k, (st[:, 1] - y0) * k])).round(5).tolist()
                        for st in s["strokes"]]
             out.append({"text": s["text"], "strokes": strokes, "style": s["style"],
                         "writer": s["writer"], "source": s["source"], "license": s["license"]})
+    print(f"one scale per recording frame, x-height measured from: {how}")
     return out
 
 
@@ -63,26 +118,66 @@ def brush_words(drawing, sentence, label):
             continue
         idx = np.flatnonzero(keep)
         breaks = ends[idx] | np.r_[np.diff(idx) > 1, True]
-        yield token, split_strokes(xy[idx], breaks)
+        xh = [np.ptp(xy[char == c, 1]) for c in range(a, b) if sentence[c] in XLETTERS and (char == c).sum() > 2]
+        yield token, split_strokes(xy[idx], breaks), xh
+
+
+DESCENDERS = set("gjpqyQ,;")
+
+
+def densify(strokes, step):
+    out = []
+    for s in strokes:
+        s = np.asarray(s, float)
+        if len(s) < 2:
+            out.append(s)
+            continue
+        seg = np.diff(s, axis=0)
+        n = np.maximum(1, (np.hypot(*seg.T) / step).astype(int))
+        out.append(np.concatenate([s[i] + seg[i] * np.linspace(0, 1, n[i], endpoint=False)[:, None]
+                                   for i in range(len(seg))] + [s[-1:]]))
+    return np.concatenate(out)
+
+
+def band_bottom(strokes, bins=40):
+    y = np.concatenate(strokes)[:, 1]
+    y = densify(strokes, max(np.ptp(y), 1e-6) / 200)[:, 1]
+    hist, edges = np.histogram(y, bins=bins)
+    hist = np.convolve(hist, np.ones(3) / 3, "same")
+    j = top = hist.argmax()
+    while j + 1 < bins and hist[j + 1] >= 0.5 * hist[top]:
+        j += 1
+    return float(edges[j + 1])
+
+
+def baseline(strokes, text):
+    if set(text) & DESCENDERS:
+        return band_bottom(strokes)
+    return float(np.quantile(np.concatenate(strokes)[:, 1], 0.95))
 
 
 def load_brush():
     samples = []
-    for path in sorted(glob.glob(f"{RAW}/brush/BRUSH/*/*")):
-        if "_resample" in path:
-            continue
-        writer = path.split("/")[-2]
-        with open(path, "rb") as f:
-            sentence, drawing, label = SafeUnpickler(f).load()
-        for token, strokes in brush_words(np.asarray(drawing), sentence, np.asarray(label)):
-            samples.append({"text": token, "strokes": strokes, "baseline": 100.0, "writer": f"brush_{writer}",
+    zf = zipfile.ZipFile(f"{RAW}/brush/brush.zip")
+    names = sorted(n for n in zf.namelist() if n.startswith("BRUSH/") and n.count("/") == 2
+                   and not n.endswith("/") and "_resample" not in n and ".DS_Store" not in n)
+    tops = {}
+    for name in names:
+        writer = name.split("/")[1]
+        sentence, drawing, label = SafeUnpickler(zf.open(name)).load()
+        tops.setdefault(writer, []).append(float(np.max(np.asarray(drawing)[:, 1])))
+        drawing, label = np.asarray(drawing), np.asarray(label)
+        flat = np.array([sentence[c] not in DESCENDERS and sentence[c] != " " for c in label.argmax(1)])
+        base = (float(np.quantile(drawing[flat, 1], 0.95)) if flat.sum() > 10
+                else baseline([drawing[:, :2].astype(float)], sentence))
+        for token, strokes, xh in brush_words(drawing, sentence, label):
+            samples.append({"text": token, "strokes": strokes, "baseline": base, "xh": xh, "writer": f"brush_{writer}",
                             "style": f"brush_{writer}", "source": "BRUSH",
                             "license": "BRUSH terms: non-commercial research only"})
+    big = {w for w, t in tops.items() if np.median(t) > 140}
+    for s in samples:
+        s["frame"] = "brush_big_frame" if s["writer"][6:] in big else "brush_frame"
     return samples
-
-
-def bottom(strokes):
-    return float(np.quantile(np.concatenate(strokes)[:, 1], 0.95))
 
 
 def load_uji():
@@ -94,7 +189,8 @@ def load_uji():
         n = int(lines[i + 1].split()[1])
         strokes = [np.array(lines[i + 2 + k].split("#")[1].split(), float).reshape(-1, 2) for k in range(n)]
         writer = tag.split("_")[-1].split("-")[0]
-        samples.append({"text": text, "strokes": strokes, "baseline": bottom(strokes), "writer": f"uji_{writer}",
+        xh = [np.ptp(np.concatenate(strokes)[:, 1])] if text in XLETTERS else []
+        samples.append({"text": text, "strokes": strokes, "baseline": baseline(strokes, text), "xh": xh, "frame": "uji", "writer": f"uji_{writer}",
                         "style": f"uji_{writer}", "source": "UJIpenchars2 (UCI)", "license": "CC BY 4.0"})
     return samples
 
@@ -110,7 +206,7 @@ def load_mathwriting():
         strokes = [np.array([p.split()[:2] for p in t.text.split(",")], float) for t in root.findall("i:trace", ns)]
         strokes = [s for s in strokes if len(s)]
         if label and strokes:
-            samples.append({"text": label, "strokes": strokes, "baseline": bottom(strokes), "writer": "mathwriting",
+            samples.append({"text": label, "strokes": strokes, "baseline": baseline(strokes, label), "frame": "mathwriting", "writer": "mathwriting",
                             "style": "mathwriting", "source": "MathWriting 2024", "license": "CC BY-NC-SA 4.0"})
     return samples
 
@@ -146,7 +242,9 @@ def main():
     for name in args.names:
         records = standardize(LOADERS[name]())
         out = f"{RAW}/{name}/{name}.ink.npz"
-        save_ink(records, out)
+        tmp = f"{RAW}/{name}/{name}.tmp.ink.npz"
+        save_ink(records, tmp)
+        os.replace(tmp, out)
         sheet(records, f"{RAW}/{name}/{name}_samples.png")
         writers = len({r["writer"] for r in records})
         print(f"{name}: {len(records)} samples from {writers} writers -> {out}")

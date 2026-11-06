@@ -84,7 +84,7 @@ def strokes_to_points(strokes):
         for x, y in s:
             rows.append([x, y, 1.0])
         rows.append([s[-1][0], s[-1][1], 0.0])
-    return normalize(np.array(rows), absolute=True).round(4)
+    return normalize(np.array(rows)).round(4)
 
 
 def sketchability(points):

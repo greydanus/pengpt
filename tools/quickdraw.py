@@ -31,7 +31,7 @@ def convert_quickdraw(path, max_items=None, categories=None):
             continue
         examples.append({
             "text": str(item.get("word", "")),
-            "points": normalize(np.array(points), absolute=True).round(4).tolist(),
+            "points": normalize(np.array(points)).round(4).tolist(),
         })
         if max_items and len(examples) >= max_items:
             break
@@ -340,7 +340,7 @@ def score_category(path, embedder, probe, fraction, limit, batch_size):
             kept.extend(flush(chunk))
             chunk = []
     kept.extend(flush(chunk))
-    examples = [{"text": label, "points": normalize(p, absolute=True).round(4).tolist()}
+    examples = [{"text": label, "points": normalize(p).round(4).tolist()}
                 for p in kept]
     return examples, seen
 

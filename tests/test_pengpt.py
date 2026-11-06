@@ -2,7 +2,8 @@ import numpy as np
 import pytest
 import torch
 
-from pengpt import (DataConfig, ModelConfig, PenTransformer, PenDataset,
+from pengpt import (augment_params, DataConfig, ModelConfig, PenTransformer, PenDataset, create_datasets,
+                    load_for_sampling, save_ink, writer_id, generate, SampleParams,
                     ScribeTokenizer, ByteTokenizer, learn_merges,
                     IGNORE_INDEX, prepare_word, resample, augment_drawing,
                     save_checkpoint, load_checkpoint, attach_pen_deltas,
@@ -106,7 +107,7 @@ def test_merges_match_sequential_application():
 def test_word_separation_and_end():
     st = ScribeTokenizer(grid=0.01)
     words = [make_word(seed=s) for s in range(3)]
-    tokens = st.encode_words(words)
+    tokens = np.concatenate([np.r_[[st.WORD] * 2 * bool(i), st.encode_word(w)] for i, w in enumerate(words)]).astype(int)
     tokens = np.concatenate([tokens, [st.END], tokens[:7], [st.PAD] * 5])
     assert len(st.decode(tokens)) == 3
 
@@ -174,8 +175,8 @@ def test_prepare_word_is_deterministic_and_optional():
     plain = prepare_word(word, cfg)
     assert np.array_equal(plain, word)
 
-    a = prepare_word(word, cfg, np.random.default_rng(7))
-    b = prepare_word(word, cfg, np.random.default_rng(7))
+    a = prepare_word(word, cfg, augment_params(cfg, np.random.default_rng(7)))
+    b = prepare_word(word, cfg, augment_params(cfg, np.random.default_rng(7)))
     assert np.array_equal(a, b)
     assert not np.array_equal(a, word)
     assert np.array_equal(a[:, 2], word[:, 2])
@@ -199,19 +200,19 @@ def test_works_without_word_structure():
                                              64, min_count=2))
     ct = ByteTokenizer()
     ds = PenDataset(shapes, labels, np.arange(6), st, ct, cfg, length=6,
-                    augment=False, name="sketch")
+                    augment=False)
 
-    x, c, _ = ds[0]
+    x, c, _, _ = ds[0]
     assert (x != st.PAD).sum() > 20
     assert st.WORD not in set(x.tolist())
     assert len(st.decode(x.numpy())) == 1
 
 
-def test_normalize_absolute_bypasses_delta_detection():
+def test_normalize_keeps_sparse_absolute_shapes():
     from utils import normalize
     square = np.array([[0, 0, 1], [255, 0, 1], [255, 255, 1],
                        [0, 255, 1], [0, 0, 1]], dtype=float)
-    out = normalize(square.copy(), absolute=True)
+    out = normalize(square.copy())
     assert np.allclose(out[0, :2], out[-1, :2])
     assert (np.diff(out[:, 0]) < 0).any()
 
@@ -270,11 +271,11 @@ def tiny_dataset():
     st = ScribeTokenizer(grid=cfg.grid)
     ct = ByteTokenizer()
     return PenDataset(bank, texts, np.arange(6), st, ct, cfg, length=8,
-                      augment=True, name="tiny")
+                      augment=True)
 
 
 def test_dataset_item(tiny_dataset):
-    x, c, y = tiny_dataset[0]
+    x, c, y, _ = tiny_dataset[0]
     st, cfg = tiny_dataset.stroke_tok, tiny_dataset.cfg
     assert x.shape == (cfg.max_seq_length,) and c.shape == (cfg.max_text_length,)
     assert x[0] == st.BOS
@@ -282,11 +283,11 @@ def test_dataset_item(tiny_dataset):
     assert y[end - 1] == st.END
     assert (y[end:] == IGNORE_INDEX).all()
     assert (x[end + 1:] == st.PAD).all()
-    assert tiny_dataset.char_tok.decode(c) == tiny_dataset.pick_words(np.random.default_rng([0, 0]))[1]
+    assert set(tiny_dataset.char_tok.decode(c).split()) <= set(tiny_dataset.bank_texts)
 
 
 def test_targets_are_inputs_shifted_by_one(tiny_dataset):
-    x, _, y = tiny_dataset[0]
+    x, _, y, _ = tiny_dataset[0]
     st = tiny_dataset.stroke_tok
     end = (x == st.END).nonzero().item()
     assert torch.equal(y[:end], x[1:end + 1])
@@ -301,7 +302,7 @@ def test_generation_prefix_occurs_in_training(tiny_dataset):
 def test_dataset_never_truncates_mid_word(tiny_dataset):
     st = tiny_dataset.stroke_tok
     for i in range(len(tiny_dataset)):
-        x, _, _ = tiny_dataset[i]
+        x, _, _, _ = tiny_dataset[i]
         end = (x == st.END).nonzero()
         assert len(end) == 1, "exactly one END expected"
         assert end.item() < tiny_dataset.cfg.max_seq_length
@@ -313,7 +314,7 @@ def test_truncated_word_does_not_supervise_end():
     long_word = make_word(n=200)
     ds = PenDataset([long_word], ["cab"], np.arange(1), st, ct, cfg, length=1,
                     augment=False)
-    x, _, y = ds[0]
+    x, _, y, _ = ds[0]
     end = (x == st.END).nonzero().item()
     assert end == cfg.max_seq_length - 1
     assert y[end - 1] == IGNORE_INDEX
@@ -329,7 +330,7 @@ def test_bank_smaller_than_max_words():
         texts = ["cab", "face", "bag", "dad", "egg", "fed", "gag"][:n_bank]
         ds = PenDataset(bank, texts, np.arange(n_bank), st, ct, cfg, length=4,
                         augment=False)
-        x, c, _ = ds[0]
+        x, c, _, _ = ds[0]
         assert (x != st.PAD).sum() > 2
         assert len(ct.decode(c).split()) <= n_bank
 
@@ -340,7 +341,7 @@ def test_model_forward_and_generate(tiny_dataset):
                        block_size=cfg.max_seq_length, context_vocab_size=ct.vocab_size,
                        context_block_size=cfg.max_text_length)
     model = PenTransformer(mcfg)
-    x, c, y = (t.unsqueeze(0) for t in tiny_dataset[0])
+    x, c, y, _ = (t.unsqueeze(0) for t in tiny_dataset[0])
     logits, loss = model(x, c, y)
     assert logits.shape == (1, cfg.max_seq_length, st.vocab_size)
     assert torch.isfinite(loss)
@@ -363,31 +364,12 @@ def test_checkpoint_roundtrip(tiny_dataset, tmp_path):
     for k, v in model.state_dict().items():
         assert torch.equal(reloaded.state_dict()[k], v)
 
-    x, c, y = (t.unsqueeze(0) for t in tiny_dataset[0])
+    x, c, y, _ = (t.unsqueeze(0) for t in tiny_dataset[0])
     model.eval(), reloaded.eval()
     with torch.inference_mode():
         a, _ = model(x, c, y)
         b, _ = reloaded(x, c, y)
     assert torch.allclose(a, b)
-
-
-def _apply_merges_reference(merges, pairs, tokens):
-    if not pairs:
-        return np.asarray(tokens)
-    out = [int(t) for t in tokens]
-    present = set(zip(out, out[1:]))
-    for a, b, merged in merges:
-        if (a, b) not in present:
-            continue
-        nxt, i, n = [], 0, len(out)
-        while i < n:
-            if i + 1 < n and out[i] == a and out[i + 1] == b:
-                nxt.append(merged); i += 2
-            else:
-                nxt.append(out[i]); i += 1
-        out = nxt
-        present = set(zip(out, out[1:]))
-    return np.array(out, dtype=np.int64)
 
 
 def _walk_reference(grid_xy):
@@ -398,20 +380,13 @@ def _walk_reference(grid_xy):
     return out
 
 
-def test_vectorized_tokenizer_matches_reference(tiny_dataset):
-    st = tiny_dataset.stroke_tok
+def test_vectorized_tokenizer_matches_reference():
     rng = np.random.default_rng(7)
     for trial in range(30):
         steps = rng.integers(-1, 2, size=(rng.integers(2, 60), 2))
         steps[rng.random(len(steps)) < 0.1] *= rng.integers(2, 9)
         grid = np.cumsum(steps, axis=0)
-        assert _walk(grid) == _walk_reference(grid)
-
-        tokens = rng.integers(0, st.vocab_size // 2, size=rng.integers(2, 200))
-        tokens[rng.random(len(tokens)) < 0.3] = tokens[0]
-        got = st.apply_merges(np.asarray(tokens))
-        want = _apply_merges_reference(st.merges, st._pairs, tokens)
-        assert (got == want).all(), trial
+        assert _walk(grid) == _walk_reference(grid), trial
 
 
 def test_augment_drawing():
@@ -474,7 +449,7 @@ def test_pen_pos_features_are_causal_and_checkpoint_safe(tiny_dataset, tmp_path)
     model = PenTransformer(mcfg)
     attach_pen_deltas(model, st)
     model.eval()
-    x, c, y = (t.unsqueeze(0) for t in tiny_dataset[0])
+    x, c, y, _ = (t.unsqueeze(0) for t in tiny_dataset[0])
     logits, loss = model(x, c, y)
     assert torch.isfinite(loss)
 
@@ -498,7 +473,7 @@ def test_pen_pos_features_are_causal_and_checkpoint_safe(tiny_dataset, tmp_path)
 
 def test_cached_generation_matches_full_recompute(tiny_dataset):
     st, ct, cfg = tiny_dataset.stroke_tok, tiny_dataset.char_tok, tiny_dataset.cfg
-    mcfg = ModelConfig(n_layer=2, n_head=2, n_embd=32, vocab_size=st.vocab_size,
+    mcfg = ModelConfig(n_layer=2, n_head=2, n_embd=32, n_writers=3, vocab_size=st.vocab_size,
                        block_size=cfg.max_seq_length, context_vocab_size=ct.vocab_size,
                        context_block_size=cfg.max_text_length)
     torch.manual_seed(0)
@@ -507,12 +482,110 @@ def test_cached_generation_matches_full_recompute(tiny_dataset):
         p.data.normal_(0, 0.3)
     attach_pen_deltas(model, st)
     model.eval()
-    x, c, _ = (t[:2] for t in tiny_dataset.batch(range(2)))
+    x, c, _, _ = (t[:2] for t in tiny_dataset.batch(range(2)))
+    w = torch.tensor([1, 2])
     prefix = x[:, :3]
-    cached = model.generate(prefix, c, max_new_tokens=40, do_sample=False)
+    cached = model.generate(prefix, c, max_new_tokens=40, do_sample=False, writer=w)
     full = prefix
     with torch.inference_mode():
         for _ in range(40):
-            logits, _ = model(full, c)
+            logits, _ = model(full, c, writer=w)
             full = torch.cat([full, logits[:, -1].argmax(-1, keepdim=True)], dim=1)
     assert torch.equal(cached, full)
+
+
+def test_mixing_weights_and_single_writer_sequences():
+    cfg = DataConfig(max_seq_length=256, max_text_length=20, max_words=3, grid=0.01, seed=0)
+    bank = [make_word(seed=s) for s in range(8)]
+    texts = ["ab", "cd", "ef", "ga", "bc", "de", "fa", "gb"]
+    writer_ids = [1, 1, 1, 1, 2, 2, 2, 2]
+    weights = [10 / 4] * 4 + [1 / 4] * 4
+    ds = PenDataset(bank, texts, np.arange(8), ScribeTokenizer(grid=0.01), ByteTokenizer(), cfg,
+                    length=400, augment=False, writer_ids=writer_ids, weights=weights, writers=["", "a", "b"])
+    seen = []
+    for i in range(400):
+        _, c, _, w = ds[i]
+        words = ByteTokenizer().decode(c).split()
+        assert {writer_ids[texts.index(t)] for t in words} == {int(w)}
+        seen.append(int(w))
+    assert 0.85 < np.mean(np.array(seen) == 1) < 0.96
+
+
+def test_packed_text_never_exceeds_prompt_length():
+    cfg = DataConfig(max_seq_length=512, max_text_length=12, max_words=8, grid=0.05, seed=0)
+    bank = [make_word(n=10, seed=s) for s in range(8)]
+    texts = ["word" + str(s) for s in range(8)]
+    ds = PenDataset(bank, texts, np.arange(8), ScribeTokenizer(grid=0.05), ByteTokenizer(), cfg,
+                    length=50, augment=False)
+    for i in range(50):
+        text = ByteTokenizer().decode(ds[i][1])
+        assert 0 < len(text.encode()) <= cfg.max_text_length and len(text.split()) >= 1
+
+
+def test_writer_vector_changes_output(tiny_dataset):
+    st, cfg = tiny_dataset.stroke_tok, tiny_dataset.cfg
+    model = PenTransformer(ModelConfig(n_layer=1, n_head=2, n_embd=32, n_writers=3, vocab_size=st.vocab_size,
+                                       block_size=cfg.max_seq_length, context_vocab_size=257,
+                                       context_block_size=cfg.max_text_length))
+    for p in model.parameters():
+        p.data.normal_(0, 0.3)
+    model.eval()
+    x, c, _, _ = (t.unsqueeze(0) for t in tiny_dataset[0])
+    a, _ = model(x, c, writer=torch.tensor([1]))
+    b, _ = model(x, c, writer=torch.tensor([2]))
+    unknown, _ = model(x, c)
+    assert not torch.allclose(a, b) and torch.isfinite(unknown).all()
+
+
+def tiny_ink(path, n, writer_names, text="ab"):
+    rows = [{"text": f"{text}{i % 7}", "strokes": [np.c_[np.linspace(0, 0.3, 20), 0.1 * np.sin(np.linspace(0, 3, 20) + i)].tolist()],
+             "style": "s", "writer": writer_names[i % len(writer_names)], "source": "t", "license": "MIT"} for i in range(n)]
+    save_ink(rows, str(path))
+
+
+def test_create_datasets_mixes_weighted_datasets(tmp_path):
+    tiny_ink(tmp_path / "a.ink.npz", 40, ["sam"])
+    tiny_ink(tmp_path / "b.ink.npz", 200, ["w1", "w2", ""], text="cd")
+    cfg = DataConfig(dataset=f"{tmp_path / 'a.ink.npz'}:9,{tmp_path / 'b.ink.npz'}:1", max_seq_length=256,
+                     max_text_length=20, max_words=3, grid=0.02, n_merges=8, train_size=10, test_size=10)
+    train, test, _, _ = create_datasets(cfg)
+    assert train.writers == ["", "sam", "w1", "w2"]
+    assert len(train.indices) == 38 + 190 and len(test.indices) == 2 + 10
+    sam = [k for k, g in enumerate(train.groups) if train.writer_ids[g[0]] == 1]
+    assert len(sam) == 1 and np.isclose(train.group_p[sam[0]], 0.9)
+
+
+def test_load_for_sampling_and_generate(tmp_path, tiny_dataset):
+    st, cfg = tiny_dataset.stroke_tok, tiny_dataset.cfg
+    model = PenTransformer(ModelConfig(n_layer=1, n_head=2, n_embd=32, n_writers=2, vocab_size=st.vocab_size,
+                                       block_size=cfg.max_seq_length, context_vocab_size=257,
+                                       context_block_size=cfg.max_text_length))
+    attach_pen_deltas(model, st)
+    from dataclasses import asdict
+    save_checkpoint(str(tmp_path / "m.pt"), model, asdict(cfg), st.merges, writers=["", "sam"])
+    loaded, ds, _, _ = load_for_sampling(str(tmp_path / "m.pt"))
+    assert writer_id(ds, "sam") == 1 and writer_id(ds, "") == 0
+    words = generate(loaded, ds, "ab", SampleParams(max_tokens=30, writer="sam"))
+    assert isinstance(words, list)
+
+
+def fake_words(n=60, x_height=0.12, baseline=0.0, text="mann", seed=0):
+    rng = np.random.default_rng(seed)
+    out = []
+    for _ in range(n):
+        t = np.linspace(0, 1, 60)
+        y = baseline - x_height * (0.5 + 0.5 * np.sin(2 * np.pi * 4 * t)) * rng.uniform(0.9, 1.1)
+        out.append({"text": text, "points": np.c_[t * 0.6, y, np.ones(60)]})
+    return out
+
+
+def test_check_data_accepts_style_and_rejects_bad_scale():
+    from pengpt import check_data
+    assert check_data(fake_words(), 0.02)[1] == []
+    assert check_data(fake_words(x_height=0.12 * 1.4), 0.02)[1] == []
+    assert check_data(fake_words(x_height=0.12 * 3), 0.02)[1]
+    assert check_data(fake_words(x_height=0.12 * 0.4), 0.02)[1]
+    assert check_data(fake_words(baseline=0.15), 0.02)[1]
+    caps = fake_words(x_height=0.2, text="MANN")
+    assert check_data(caps, 0.02)[0]["x_height"] is None and check_data(caps, 0.02)[1] == []
+    assert check_data(fake_words(x_height=2.0, text="MANN"), 0.02)[1]
