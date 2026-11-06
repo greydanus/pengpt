@@ -178,7 +178,10 @@
       },
       "Q": {
         "prompt": "Recognize and derender.",
-        "note": "auto: 1 strokes, cover 1.00 vs 12 strokes, cover 1.00 with the text-hint prompt"
+        "note": "user: two strokes, the loop then the tail",
+        "ops": [
+          "split:0,20"
+        ]
       },
       "D": {
         "ops": [
