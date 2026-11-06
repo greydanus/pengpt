@@ -18,7 +18,7 @@ setup)
   $S bash -s <<EOF
 set -e
 mkdir -p $R/tools && mv /root/ink.py /root/inksight.py $R/tools/
-pip install -q --break-system-packages sentencepiece pillow scipy matplotlib
+pip install -q --break-system-packages sentencepiece pillow scipy matplotlib scikit-image
 python3 -m venv /root/tf 2> /dev/null || { apt-get update -qq && apt-get install -y -qq python3-venv && python3 -m venv /root/tf; }
 /root/tf/bin/pip install -q 'tensorflow[and-cuda]==2.20.0' tensorflow-text==2.20.1 tf-keras==2.20.1 'huggingface_hub<1' pillow scipy
 cd $R && [ -f inksight/weights.npz ] || CUDA_VISIBLE_DEVICES= $TFPY -m tools.ink export --out inksight

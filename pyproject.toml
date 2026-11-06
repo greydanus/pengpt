@@ -13,7 +13,7 @@ dependencies = [
 [project.optional-dependencies]
 wandb = ["wandb"]
 dev = ["pytest", "Pillow", "scipy"]
-ink = ["Pillow", "scipy"]
+ink = ["Pillow", "scipy", "scikit-image"]
 
 [tool.setuptools]
 py-modules = ["pengpt", "utils"]

@@ -300,8 +300,8 @@ def detokenize(text):
     return strokes
 
 
-def on_ink(strokes, img, radius=3):
-    ink = ndimage.binary_dilation(np.asarray(img.convert("L")) < INK_LEVEL, iterations=radius)
+def on_ink(strokes, img=None, radius=3, ctx=None):
+    ink = ctx["touch"] if ctx else ndimage.binary_dilation(np.asarray(img.convert("L")) < INK_LEVEL, iterations=radius)
     h, w = ink.shape
     touches = lambda s: any(ink[min(max(int(round(y)), 0), h - 1), min(max(int(round(x)), 0), w - 1)] for x, y in s)
     return [s for s in strokes if touches(s)]
@@ -387,25 +387,31 @@ def resample_path(strokes):
     return np.concatenate(pts) if pts else np.zeros((0, 2))
 
 
-def score(item, cand):
-    gray = np.asarray(Image.open(item["image"]).convert("L"))
-    ink = gray < INK_LEVEL
-    pts = resample_path(cand["strokes"])
+def ink_context(gray):
+    ink = np.asarray(gray) < INK_LEVEL
+    ctx = {"ink": ink, "touch": ndimage.binary_dilation(ink, iterations=3)}
+    if not ink.any():
+        return ctx
+    gap, (ni, nj) = ndimage.distance_transform_edt(~ink, return_indices=True)
+    labels, k = ndimage.label(ink, structure=np.ones((3, 3)))
+    half = max(1.0, 2 * np.median(ndimage.distance_transform_edt(ink)[ink]) - 1)
+    return {**ctx, "half": half, "gap": gap, "ni": ni, "nj": nj, "labels": labels, "k": k,
+            "area": ndimage.sum(ink, labels, np.arange(1, k + 1))}
+
+
+def score(item, cand, ctx=None):
+    c = ctx or ink_context(Image.open(item["image"]).convert("L"))
+    ink, pts = c["ink"], resample_path(cand["strokes"])
     if not ink.any() or not len(pts):
         return {"coverage": 0.0, "precision": 0.0, "length_ratio": 0.0, "min_mark": 0.0, "max_mark_length": 0.0, "retrace": 0.0, "points": 0}
-    half = max(1.0, 2 * np.median(ndimage.distance_transform_edt(ink)[ink]) - 1)
+    half, gap, labels, k, area = c["half"], c["gap"], c["labels"], c["k"], c["area"]
     canvas = np.zeros(ink.shape, bool)
     ij = np.clip(np.rint(pts).astype(int), 0, [ink.shape[1] - 1, ink.shape[0] - 1])
     canvas[ij[:, 1], ij[:, 0]] = True
     path = ndimage.distance_transform_edt(~canvas) <= half + 1
-    near = ndimage.distance_transform_edt(~ink) <= half / 2 + 2
-    labels, k = ndimage.label(ink, structure=np.ones((3, 3)))
-    ids = np.arange(1, k + 1)
-    area = ndimage.sum(ink, labels, ids)
-    marks = ndimage.mean(path, labels, ids)[area >= half ** 2]
-    gap, (ni, nj) = ndimage.distance_transform_edt(~ink, return_indices=True)
+    marks = ndimage.mean(path, labels, np.arange(1, k + 1))[area >= half ** 2]
     on = gap[ij[:, 1], ij[:, 0]] <= half / 2 + 2
-    owner = labels[ni[ij[on, 1], ij[on, 0]], nj[ij[on, 1], ij[on, 0]]]
+    owner = labels[c["ni"][ij[on, 1], ij[on, 0]], c["nj"][ij[on, 1], ij[on, 0]]]
     drawn = np.bincount(owner, minlength=k + 1)[1:] * 2 * half / np.maximum(area, 1)
     pairs = cKDTree(pts).query_pairs(half, output_type="ndarray")
     again = np.zeros(len(pts), bool)
@@ -416,9 +422,24 @@ def score(item, cand):
             "min_mark": float(marks.min()) if len(marks) else 1.0,
             "max_mark_length": float(drawn[area >= 8 * half ** 2].max()) if (area >= 8 * half ** 2).any() else 0.0,
             "retrace": float(retrace[big].max()) if big.any() else 0.0,
-            "precision": float(near[ij[:, 1], ij[:, 0]].mean()),
+            "precision": float((gap[ij[:, 1], ij[:, 0]] <= half / 2 + 2).mean()),
             "length_ratio": float(len(pts) * 2 * half / ink.sum()),
             "points": int(len(pts))}
+
+
+def join_strokes(strokes, ctx):
+    if not strokes or "half" not in ctx:
+        return strokes
+    half, near = ctx["half"], ctx["gap"] <= ctx["half"] / 2 + 2
+    h, w = near.shape
+    out = [np.asarray(strokes[0], float)]
+    for s in map(lambda s: np.asarray(s, float), strokes[1:]):
+        p, q = out[-1][-1], s[0]
+        gap = np.hypot(*(q - p))
+        seg = p + (q - p) * np.linspace(0, 1, max(2, int(gap) + 1))[:, None]
+        ij = np.clip(np.rint(seg).astype(int), 0, [w - 1, h - 1])
+        out[-1:] = [np.vstack([out[-1], s])] if gap <= 6 * half and near[ij[:, 1], ij[:, 0]].all() else [out[-1], s]
+    return [s.tolist() for s in out]
 
 
 def plain(text):
@@ -426,9 +447,13 @@ def plain(text):
     return text.lower().replace("0", "o")
 
 
-def judge(item, cand, args):
-    c = {**cand, "strokes": on_ink(cand["strokes"], Image.open(item["image"]))}
-    q = score(item, c)
+RULES = argparse.Namespace(min_coverage=0.85, min_mark=0.5, min_precision=0.90, max_read_error=0.34, max_length_ratio=1.6,
+                           max_retrace=0.35, max_mark_length=1.95)
+
+
+def judge(item, cand, args=RULES, ctx=None):
+    c = {**cand, "strokes": on_ink(cand["strokes"], None if ctx else Image.open(item["image"]), ctx=ctx)}
+    q = score(item, c, ctx)
     label = plain(item["text"])
     q["read"] = c["read"]
     q["read_error"] = levenshtein(plain(c["read"]), label) / len(label) if c["read"] else None
@@ -567,13 +592,8 @@ def main():
     rules = argparse.ArgumentParser(add_help=False)
     rules.add_argument("--manifest", required=True)
     rules.add_argument("--traces", required=True)
-    rules.add_argument("--min_coverage", type=float, default=0.85)
-    rules.add_argument("--min_mark", type=float, default=0.5, help="every separate ink mark (i-dot, period) this covered")
-    rules.add_argument("--min_precision", type=float, default=0.90)
-    rules.add_argument("--max_read_error", type=float, default=0.34)
-    rules.add_argument("--max_length_ratio", type=float, default=1.6)
-    rules.add_argument("--max_retrace", type=float, default=0.35, help="share of a mark's trace that runs over its own path")
-    rules.add_argument("--max_mark_length", type=float, default=1.95, help="trace length over ink length, per mark")
+    for k, v in vars(RULES).items():
+        rules.add_argument(f"--{k}", type=float, default=v)
     p = sub.add_parser("qc", parents=[rules], help="score traces against the image ink; keep the best passing one")
     p.add_argument("--out", required=True)
     p.add_argument("--sheet", default="")

@@ -22,3 +22,5 @@ data/*.jsonl.gz
 data/raw/
 
 inksight/
+
+.env

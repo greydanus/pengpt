@@ -150,6 +150,11 @@ one scale per recording frame, plus a sheet of samples to eyeball. Sources:
   than the original on a GPU (43 ms/word on an RTX 4090); `export` (needs TensorFlow, once) writes its weights.
   `tools/pod.sh` runs all of this on a RunPod GPU, and `peek` draws traces
   over their images to check quality.
+  For real handwriting, `python -m tools.harvest --manifest m.jsonl --out dir`
+  does it in one streaming, resumable pass: raw, cleaned and monoline image
+  variants, InkSight traces tried until one passes QC (2.7 per word on average),
+  pen lifts joined along continuous ink; it writes `accepted.jsonl` and
+  `rejected.jsonl` with reasons.
 - Fonts: `tools/glyphs.py` traces each of a font's 70 characters once with
   InkSight (cursive letters inside an "n_n" context so their joins come out),
   then assembles any word from those glyphs. `trace --font F` takes about a
