@@ -17,13 +17,9 @@ out/
 data/*.json
 !data/*.json.zip
 
-# Corpora are rebuilt by `python utils.py download` / `rank` / `icons`; the
-# largest are far past the 100 MB file GitHub accepts.
+# Large corpora, rebuilt by tools/.
 data/*.jsonl
 data/*.jsonl.gz
 
-# Source downloads (icon set clones and the like): many GB, all re-fetchable.
+# Source downloads: many GB, all re-fetchable.
 data/raw/
-
-# CLIP image-embedding banks from the pre-consolidation experiments.
-data/*.clipimg.npy

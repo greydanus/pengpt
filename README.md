@@ -1,259 +1,95 @@
 # pengpt
 
-A minimal, general-purpose transformer for pen strokes. Give it a corpus of pen
-trajectories — handwriting, sketches, anything drawn with a stylus or mouse —
-and it learns to generate more of them, conditioned on text.
-
-This is a ground-up rewrite of
-[cursivetransformer](https://github.com/greydanus/cursivetransformer)
-([paper](https://arxiv.org/abs/2504.00051) ·
-[blog post](https://greydanus.github.io/2025/03/30/cursive-transformer/)),
-rebuilt around a representation that is not specific to one writer or one
-dataset.
-
-The paper and this repo share the same skeleton — a small nanoGPT-lineage
-decoder with cross-attention over a character-level encoding of the prompt,
-about 440k parameters there and 400k here — so the difference is almost
-entirely in how ink becomes tokens. The paper turns each pen point into a
-stroke offset and then polar coordinates, spending two tokens per point (a
-220-bin angle, then a 150-bin radius that carries the pen state); this repo
-quantizes absolute position to a grid and encodes motion as a walk — eight
-directions plus pen up/down, compressed by BPE — which is shorter per word
-(99 tokens against 185), reconstructs more accurately, and barely changes
-when the same shape is recorded at a different sampling rate. Because the
-walk carries absolute position, words carry their own height, and the
-machinery the paper's codebase needed on top — per-writer character tables,
-generation seeded with real strokes from the training set, an inter-word
-carriage-jump formula — disappears. Trained head to head at matched wall
-clock, the new representation reached 3.43 bits per pen-point against 7.16,
-which, with a nanochat-style model and the Muon optimizer, shrank a full run
-from 125,000 steps on a rented A100 to 20,000 steps in 15 minutes on a laptop.
+A small transformer that writes handwriting from text. It is a ground-up
+rewrite of [cursivetransformer](https://github.com/greydanus/cursivetransformer)
+([paper](https://arxiv.org/abs/2504.00051)) that trains in about 15 minutes on
+an M-series laptop.
 
 ![hero](static/hero.png)
 
-*One greedy pass from the bundled cursive model, untouched. Seven of these
-nine words never appear in the training data — the corpus is mostly random
-character strings, so spelling is character-level generalization, not recall.*
-
-The whole model lives in one file. `pengpt.py` is the algorithm — tokenizer,
-data pipeline, transformer, training loop, sampling — and `utils.py` holds a
-preset of settled training settings per corpus plus `normalize`, which brings
-outside pen data to the expected conventions. The scripts that build each
-corpus in the first place live in `tools/`. The same
-core algorithm trains on every dataset; only lengths, augmentation, and model
-size move between presets.
-
-## What the trainer shows you
-
-![progress](static/progress.png)
-
-The grid written at every eval, here at the end of a 20,000-step run (14
-minutes). Every column means one thing: the real test drawing (green), the
-greedy sample (blue), then three random samples (black). The top six rows are
-held-out test prompts; the bottom rows are showcase phrases (`--showcase`, set
-per preset), which have no real drawing. Prompts and seeds are fixed, so
-consecutive grids differ only by the model. Several samples per prompt is what
-makes it readable: one sample cannot tell a model ignoring its prompt from a
-model having a bad draw.
+*One greedy pass from the bundled cursive model. Most of these words never
+appear in the training data, which is mostly random character strings.*
 
 ## Quickstart
 
 ```bash
-pip install -e .          # torch, numpy, matplotlib
-pip install -e ".[dev]"   # + pytest
-pytest tests/             # a few seconds
-```
-
-Train — about 15 minutes on an M-series laptop (14.4 on an M3 Pro), no GPU
-rental needed:
-
-```bash
+pip install -e ".[dev]"
+pytest tests/
 python pengpt.py train --preset cursive
-```
-
-The presets are `cursive`, `quickdraw`, and `icons`; each names its
-dataset, lengths, augmentation, and model size, and any explicit flag
-overrides the preset. Each run owns a folder under `out/`:
-
-```
-out/cursive/
-  best.pt        lowest test loss so far
-  last.pt        the most recent eval, for --resume
-  progress/      one grid per eval: test prompts and showcase phrases, 4 samples each
-```
-
-Add `--wandb --wandb_entity you` for Weights & Biases logging (optional).
-Resume with `--resume out/cursive/last.pt` — `last.pt`, not `best.pt`, which
-lags whenever test loss has stopped improving. Resuming rebuilds the tokenizer
-from the checkpoint rather than from the command line, and says so when a data
-flag disagrees: the merges decide what every ink token id means, so a
-re-derived vocabulary would load the weights against ids they were never
-trained on. Prompts are raw UTF-8 bytes, so text ids are the same for every
-dataset.
-
-Each eval logs train and test loss on a fixed set of items, and `text rank`:
-each of 32 test examples is scored under its own prompt and the other 31, and
-the true prompt's mean rank is reported (1 is perfect, 16.5 is chance). It
-catches a model whose loss falls while it ignores the prompt.
-
-Checkpoints from earlier architectures do not load; retrain, or sample with the
-commit that wrote them.
-
-### Drawings rather than handwriting
-
-```bash
-python pengpt.py train --preset quickdraw
-```
-
-The preset is the settings a drawing corpus needs: `--max_words 1` because
-each sample is a single object, `--augment general` because slant presumes a
-baseline, which a sketch doesn't have, and
-`--max_text_length 24 --max_seq_length 192` near the corpus's longest label
-and p99 token count — leaving these at the cursive defaults spends most of
-every sequence on padding.
-
-`quickdraw_balanced_fixed` is `quickdraw_balanced` after repairing a
-delta-detection bug that cumsum'd 24% of drawings into diagonal staircases
-(see `normalize` in `utils.py`). At the repaired token statistics
-(p50 = 39, p99 = 136), a 192-token block covers 99.6% of drawings.
-
-Loss alone will not tell you whether the prompt is being read — a model can
-post a falling loss while drawing the corpus average for every prompt. Measure
-it directly: score each of 32 held-out examples under its own text and the
-other 31, and see where the true text ranks (1 is perfect, 16.5 is chance).
-Training logs this as `text rank` at every eval, on any dataset:
-
-```bash
-python pengpt.py rank --checkpoint out/quickdraw/best.pt
-```
-
-Generate handwriting from a trained model — this is the command behind the
-image at the top of this page:
-
-```bash
 python pengpt.py sample --checkpoint out/cursive/best.pt --greedy --text "The quick brown fox jumps over the lazy dog"
 ```
 
-`--greedy` (temperature 0) spells unfamiliar words markedly better than
-sampling: on that pangram, sampling misspells two or three words at any seed,
-and greedy writes all nine correctly. If a word still comes out wrong, note
-its index (`--show_indices`) and regenerate just that word with `--redo 3,7`
-— without `--greedy`, since a greedy redo deterministically reproduces the
-same word.
+Each run writes to `out/<name>/`: `best.pt` (lowest test loss), `last.pt` (latest
+eval; resume with `--resume out/cursive/last.pt`), and `progress/`, one image
+per eval. Any flag overrides the preset. Add `--wandb` to log to Weights & Biases.
+
+Sampling tips: `--greedy` spells unfamiliar words much better than sampling.
+To regenerate misspelled words, use `--show_indices` to find their index, then
+`--redo 3,7` (without `--greedy`, since greedy gives the same word again).
+`--writer sam` picks a writer's style; leave it out for the unknown-writer style.
+
+![progress](static/progress.png)
+
+*The progress grid: real test word (green), greedy sample (blue), three samples
+(black). The bottom rows are the preset's showcase phrases. Prompts and seeds
+are fixed between evals.*
+
+Each eval also logs `text rank`: 32 test examples are each scored under their
+own prompt and the other 31 prompts, and the mean rank of the true prompt is
+reported (1 is perfect, 16.5 is chance). This catches a model that ignores
+its prompt. `python pengpt.py rank --checkpoint ...` computes it for a
+saved checkpoint.
 
 ## How it works
 
-**Tokenization** is
-[ScribeTokens](https://arxiv.org/abs/2603.02805). Pen coordinates are quantized
-to an integer grid, and motion becomes a walk on that grid: eight compass
-directions plus `DOWN` and `UP`. Movement between grid points is decomposed with
-Bresenham's line algorithm, so any path is representable by ten base symbols.
-Byte pair encoding then merges recurring runs — a common curve becomes a single
-token — which is what keeps sequences short.
+**Tokens** ([ScribeTokens](https://arxiv.org/abs/2603.02805)). Pen points are
+snapped to a grid (`--grid 0.02`). Motion becomes a walk on that grid: eight
+compass directions plus `DOWN` and `UP`, with Bresenham lines filling any
+gaps. BPE (`--n_merges 512`) then merges common runs into single tokens. Each
+word's walk starts from its own origin, so the tokens encode where the ink
+sits relative to the baseline.
 
 ![roundtrip](static/roundtrip.png)
 
-*Grey is the original, red is decoded from tokens. `grid=0.020` is the default:
-reconstruction error stays inside the width of a pen stroke at 99 tokens per word.*
+On the bundled data this beat the paper's polar tokenizer on every measure:
 
-**Model**: a small GPT-style decoder (~400k params at the cursive default)
-with cross-attention over byte embeddings of the text prompt, built the way
-[nanochat](https://github.com/karpathy/nanochat) builds its GPT: rotary
-positions, parameter-free RMSNorm, QK-norm, ReLU² MLPs, no biases, zero-init
-output projections, per-layer residual and input-embedding scalars, and a
-logit soft cap. Attention and MLP matrices train with Muon (momentum, then
-each update orthogonalized); embeddings and the head train with AdamW. The
-learning rate warms up, holds, and decays linearly over the last 40% of steps,
-and the training step is `torch.compile`d. Generation uses a fixed-shape key/value
-cache, so every decoding step has the same tensor shapes.
+| | tokens/word | reconstruction error | vocab |
+|---|---|---|---|
+| polar bins | 185 | 0.0116 | 525 |
+| ScribeTokens | **99** | **0.0061** | **306** |
 
-On the bundled cursive, a full 20,000-step run reaches a test loss of 1.95 in
-14 minutes; the previous LayerNorm + AdamW + cosine recipe reached 1.98 in 51.
-Measured at matched steps (6,000, same seed), the new recipe scores 2.01
-against 2.12. Two heads rather than four lost nothing and cut the step from
-43 ms to 28, because attention on MPS is bound by memory traffic that scales
-with head count, and doubling both learning rates reached the same loss in a
-quarter fewer steps; three layers, wider models, and AdamW alone all lost at
-matched wall clock.
+Trained head to head for the same wall-clock time, ScribeTokens reached 3.43
+bits per pen point against 7.16 for the polar tokenizer.
 
-The prompt reaches the model only through that cross-attention, never as a class
-index, so the same architecture takes a word to write or the name of an object
-to draw, and an unseen label still says something through its characters.
+**Model.** A nanochat-style decoder, about 400k parameters at the default size.
+It uses rotary positions, RMSNorm, QK-norm, ReLU² MLPs, no biases, zero-init
+output projections, a logit soft cap, and cross-attention over the prompt's
+UTF-8 bytes. Block matrices train with Muon and everything else with AdamW.
+The learning rate warms up for 200 steps, then decays linearly over the last
+`--warmdown` fraction of steps (default 0.8). Generation uses a fixed-shape
+key/value cache.
 
-One optional input rides along with the token embeddings: Fourier features of
-the pen's absolute canvas position, computed from a per-token displacement
-table the tokenizer provides (a merged token moves by the sum of its
-children). The tokens themselves are relative motion, so without this the
-model must integrate the whole walk with attention to know whether two strokes
-connect. It is on by default and cheap (one small bias-free linear layer), but
-the measured gain is modest — about 0.02 nats per token on scene sketches,
-less on short drawings — so `--pen_pos_bands 0` turns it off. A random canvas
-offset at training time keeps absolute layout from being memorized.
+The model also gets Fourier features of the pen's position, summed from
+per-token displacements. During training, this position gets a random offset
+of up to ±`--pen_pos_jitter` grid cells, so the features carry position
+within the sequence, not on the page. `--pen_pos_bands 0` turns them off.
 
-**Data**: each example is one word, an `(N, 3)` array of `(x, y, pen)`.
-Training examples pack random words together until the block is full, so a few
-thousand words become effectively unlimited examples and nothing is ever
-truncated mid-word.
+**Batches.** Each training sequence comes from one writer. It packs a random
+1 to `--max_words` words, separated by `WORD` tokens, and never cuts a word in
+half. One augmentation is applied to the whole sequence: slant ±0.1, stretch
+±10%, rotation ±2°, and a shift of up to half a grid cell. Test data is never
+augmented.
 
-## Why ScribeTokens
+**Writers.** Each writer gets a learned style vector that sits in front of the
+prompt. 10% of the time, training swaps in a shared "unknown writer" vector.
 
-The original used polar `(theta, r)` bins, two tokens per pen point. Measured on
-bigbank_3500, ScribeTokens is better on every axis at once:
-
-| | tokens/word | reconstruction error | bits/pen-point | vocab |
-|---|---|---|---|---|
-| polar bins | 185 | 0.0116 | 13.09 | 525 |
-| ScribeTokens | **99** | **0.0061** | **5.94** | **306** |
-
-Trained head to head at matched wall clock, ScribeTokens reached **3.43
-bits/pen-point against the polar tokenizer's 7.16** — a 2.1× advantage, while
-running *fewer* optimizer steps. BPE is doing real work here: at equal block
-sizes, 256 merges scored 1.29 against 2.12 with no merges at all.
-
-Together with a coarser grid and a shorter block, this took a full training run
-from **21.5 hours to under an hour** on an M-series laptop. No rented GPU is
-needed at this scale.
-
-Two properties matter beyond the numbers:
-
-- **Insensitivity to sampling rate.** Recording the same shape more finely
-  changes the tokens little, and changes them not at all once samples are
-  dense enough to land in adjacent grid cells. Point density in raw pen data is
-  an artifact of the recorder, so a mouse, a 100 Hz digitizer, and a
-  preprocessed public dataset land in nearly the same representation. Measured
-  at the default grid, two samplings of one curve reconstruct to within two
-  grid cells of each other; exact token equality needs a coarser grid than the
-  default.
-- **No out-of-vocabulary.** A grid walk always decomposes into base tokens. Bin
-  tables have to be retuned per dataset and silently clip whatever falls
-  outside them.
-
-This also removes machinery the old code needed. Because ScribeTokens encodes
-absolute grid position, words carry their own height and the hardcoded
-`STARTS_AT_BOTTOM` / `STARTS_AT_TOP` character tables — one writer's alphabet,
-meaningless on any other dataset — are gone, along with the inter-word carriage
-jump formula. Generation no longer needs to be seeded with real strokes from the
-training set.
-
-## Writing a paragraph
-
-```bash
-python pengpt.py sample --checkpoint out/cursive/best.pt --greedy --text "Sing, O goddess, the anger of Achilles son of Peleus, that brought countless ills upon the Achaeans."
-```
+**Long text** is written two words per model call and wrapped into lines:
 
 ![iliad](static/iliad.png)
 
-Long text is generated a few words per model call and laid out with wrapping.
-Sixteen of these seventeen words came out right on the first greedy pass; the
-seventeenth ("ills", written "ill") was resampled on its own, which is the
-intended workflow for the occasional miss. All four seeds tried spelled it
-correctly.
+## Your own data
 
-## Training on your own pen data
-
-Datasets are `.ink.npz` files: one record per word, each a text, a list of
-strokes (pen-down polylines of `[x, y]`), and its style, writer, source and
-license. Build one from Python and train on it directly:
+Datasets are `.ink.npz` files, one record per word:
 
 ```python
 from pengpt import save_ink
@@ -262,146 +98,47 @@ save_ink([{"text": "hello", "strokes": [[[0.0, 0.0], [0.01, -0.02], ...], ...],
          "data/mine.ink.npz")
 ```
 
-y grows downward, the baseline sits at y = 0, the x-height (the height of
-letters like a, e, n, o) is 0.12, and points within a stroke are about 0.01
-apart. Every dataset must share this coordinate system, or the model learns
-that one letter comes in several sizes. Check a dataset before training on it:
+Coordinates: y points down, the baseline is y = 0, the x-height is 0.12, and
+points are about 0.01 apart. Check a file before training on it:
 
 ```bash
-python pengpt.py check --dataset data/mine.ink.npz,data/bigbank_3500.ink.npz
+python pengpt.py check --dataset data/mine.ink.npz
 ```
 
-It reports x-height, baseline, point spacing and tokens per character on a
-random sample. Training runs the same check on every dataset it loads and
-refuses one whose x-height is outside 0.6–1.7× of 0.12 or whose baseline is
-off by more than 0.06. Those ranges admit any real handwriting style, print,
-cursive or capitals, and catch the 2× to 1000× errors that wrong units or
-frames produce. Points spaced more than a grid cell apart get a warning:
-resample them to 0.01. Coordinates are stored in steps of 0.001, so a
-word costs a few hundred bytes; BRUSH's 85,349 words fit in 32 MB and load in
-under two seconds. Older JSON files of `{"text", "points": [[x, y, pen], ...]}`
-still load.
+Training runs the same check and refuses a dataset whose x-height is outside
+0.6–1.7× of 0.12, or whose baseline is off by more than 0.06. If your points
+are unevenly spaced, `--spacing 0.01` resamples them.
 
-- **Collect your own**: open `collect.html` in a browser, write with a
-  mouse/trackpad, export JSON. This is how the bundled `bigbank_3500` dataset
-  (3,500 words, one author) was made.
-- **Convert existing datasets**: `normalize` in `utils.py` brings absolute
-  points to the expected scale and baseline; convert delta-encoded data to
-  absolute coordinates first.
-- **Irregular point density?** Set `--spacing 0.02` to resample to uniform arc
-  length. The bundled data does not need this: `collect.html` records a point
-  every time the pen has moved a fixed distance, so its spacing is already
-  uniform at ~0.011 and resampling only discards detail. Time-sampled sources
-  like IAM do need it.
-- The character vocabulary is derived from the data and stored in the
-  checkpoint, along with the BPE merges.
-
-## Pen data that is not handwriting
-
-Nothing in the tokenizer knows about letters or words — it encodes pen motion on
-a grid. Sketches, signatures, diagrams and gestures work with two settings:
+Mix datasets with sampling weights. Each dataset keeps its own fixed
+train/test split:
 
 ```bash
-python pengpt.py train --dataset data/sketches.json --max_words 1 --augment general
+python pengpt.py train --preset cursive --dataset "data/bigbank_3500.ink.npz:3,data/raw/brush/brush.ink.npz:1"
 ```
 
-`--max_words 1` treats each example as one trajectory, which makes the `WORD`
-separator inert. `--augment general` drops the slant jitter, which presumes a
-baseline to slant about. `--augment none` disables augmentation entirely, and
-a larger `--rotate` suits data with no canonical upright.
+Ways to get handwriting:
 
-Ink scale is the one thing to get right. The grid is a fixed distance, so tokens
-per example scale with how large the drawing is; `normalize` in `utils.py`
-rescales to the bundled data's scale, and training warns with a suggested
-`--grid` if a dataset arrives at a different one.
-
-**Augmentation** varies each training sequence a little around the real
-writing: slant ±0.1, horizontal and vertical stretch ±10%, tilt ±2°, and a
-shift of up to half a grid cell, so the same shape is seen at every rounding
-phase. One draw covers a whole sequence, because a sequence holds one writer's
-words. Test data is never augmented. On the bundled cursive, scored on the same
-clean held-out words after 5,000 steps, this reached 0.60 nats per pen move;
-no augmentation overfits within 1,000 steps (0.78 at its best), and an older
-setting that slanted every word the same way did worse than none (0.83).
-
-## Mixing datasets and writers
-
-`--dataset` takes several files with sampling weights, and each training
-sequence is drawn from one dataset, then one writer, in proportion:
-
-```bash
-python pengpt.py train --preset cursive \
-    --dataset "data/bigbank_3500.ink.npz:3,data/raw/brush/brush.ink.npz:1"
-```
-
-Each dataset keeps its own fixed train/test split, so a dataset's held-out
-words never change when it is mixed with others. Every writer gets a learned
-style vector next to the prompt, and 10% of the time training swaps in a shared
-"unknown writer" vector, so the model can also write without one. Pick a hand
-when sampling with `--writer`, e.g. `--writer sam`; leave it out for the
-unknown-writer style. Datasets must share one coordinate system; see `check`
-above.
-
-## Quick, Draw!
-
-[Quick, Draw!](https://github.com/googlecreativelab/quickdraw-dataset) is 50M
-doodles across 345 categories under CC-BY-4.0. Its format is already what pengpt
-expects — strokes with pen lifts at the boundaries — so the converter is thin:
-
-```bash
-python -m tools.quickdraw convert --quickdraw cat.ndjson --out data/cats.json
-python pengpt.py train --dataset data/cats.json --max_words 1 --augment general
-```
-
-Much of it is sloppy, and mean quality matters more than raw count, so
-`tools/quickdraw.py rank` keeps the best fraction of each category:
-
-```bash
-python -m tools.quickdraw download --out_dir qd_raw
-python -m tools.quickdraw rank --raw_dir qd_raw --out data/top25.jsonl --resume
-```
-
-It renders each drawing, embeds it with CLIP, and scores it with a probe
-calibrated on 210 hand-judged drawings (`data/quickdraw_probe.npz`). Held out,
-the quarter it keeps is 83% good-or-better against a 48% base rate, with none
-of the judged junk surviving — a good coarse filter, not a fine ranking.
-Selection is per category so class balance survives, output streams to JSON
-Lines, and `--resume` picks up after a crash. Requires `transformers` and
-`Pillow` (`pip install -e ".[quality]"`).
-
-Throughput is 204 drawings/s here, so the full corpus is about 68 hours; a
-rented GPU does it in one to three, since 92% of the time is CLIP inference.
-
-## Icons
-
-Six open icon sets ship SVGs whose paths are literal pen centerlines — Lucide,
-Tabler outline, Feather, Iconoir regular, Heroicons outline, and Akar.
-`tools/icons.py` aggregates them into one corpus of 8,770 sketchable icons
-across 7,541 compositional labels ("arrow down left from circle"), rejecting
-filled shapes, un-pennable geometry (30+ strokes, dot-by-dot dashes), and
-near-identical renditions that shared ancestry produces (Lucide forked
-Feather). Strokes are greedily reordered to minimize pen-up travel, the way a
-person sketches. Requires `svgelements`.
-
-```bash
-python -m tools.icons --raw_dir data/raw --out data/icons.jsonl
-python pengpt.py train --preset icons
-```
-
-The preset uses a finer grid (0.012 — the default 0.020 is too coarse for
-small icon detail) and `--tremor 0.004`: designer geometry is
-ruler-perfect, and a model trained on it learns a drafting machine's hand, so
-tremor bridges it toward human ink.
+- `collect.html`: write in the browser and export JSON (legacy
+  `{"text", "points"}` JSON still loads). This is how `bigbank_3500` was made:
+  3,500 words from one writer.
+- `python -m tools.datasets brush uji mathwriting` converts those public
+  datasets from `data/raw/<name>/` to `.ink.npz` at the shared scale.
+- `tools/ink.py` turns images into strokes: `render` (from a font) or
+  `segment` (from a page scan) makes word images, `trace` traces them with
+  InkSight, and `qc` keeps traces that match the ink (`pip install -e ".[ink]"`;
+  `trace` also needs TensorFlow). `utils.export_traces`
+  then writes the accepted traces as `.ink.npz`.
+- `utils.normalize` rescales raw absolute `(x, y, pen)` points.
 
 ## Repo map
 
 ```
-pengpt.py            the algorithm: config, ScribeTokens + BPE, data pipeline,
-                     PenTransformer, sampling, and the train/sample/rank commands
-utils.py             per-dataset presets and normalize
-tools/               corpus builders: Quick, Draw! download/convert/rank, icons
-collect.html         self-contained data collection page
-tests/               pytest suite; pins tokenizer, data, and model properties
+pengpt.py     tokenizer, data, model, training, sampling; train/sample/rank/check commands
+utils.py      presets, normalize, export_traces
+tools/        datasets.py (public corpora), ink.py (image tracing)
+collect.html  data collection page
+tests/        pytest suite
+deprecated/   Quick, Draw! and icon tools, not maintained
 ```
 
 By Sam Greydanus. Cursive model and dataset from the cursivetransformer project

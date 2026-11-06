@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 class DataConfig:
     dataset: str = "data/bigbank_3500.ink.npz"
     max_examples: int = 0
+    max_train_words: int = 0
     train_size: int = 500_000
     test_size: int = 3_000
     max_words: int = 8
@@ -65,7 +66,7 @@ class TrainConfig:
     matrix_lr: float = 0.04
     weight_decay: float = 1e-4
     warmup: int = 200
-    warmdown: float = 0.4
+    warmdown: float = 0.8
     grad_clip: float = 1.0
     eval_every: int = 1_000
     showcase: str = ""
@@ -659,7 +660,7 @@ def create_datasets(cfg, merges=None, writers=None):
         weights += [weight / len(examples)] * len(examples)
         perm = np.random.default_rng(cfg.seed).permutation(len(examples)) + offset
         n_test = min(1000, len(examples) // 20)
-        train_ix += list(perm[:len(perm) - n_test])
+        train_ix += list(perm[:len(perm) - n_test][:cfg.max_train_words or None])
         test_ix += list(perm[len(perm) - n_test:])
     if not test_ix:
         raise SystemExit("too few examples to hold out test words; need at least 20 in some dataset")
@@ -1324,7 +1325,7 @@ def main(argv=None):
     train_p = sub.add_parser("train", help="train a model on one or more weighted datasets")
     train_p.add_argument("--preset", type=str, default="",
                          help="per-dataset settings from utils.PRESETS "
-                              "(cursive, quickdraw, icons); "
+                              "(cursive); "
                               "explicit flags override the preset")
     add_config_args(train_p)
 

@@ -276,7 +276,7 @@ def spearman(a, b):
     return float(np.corrcoef(ra, rb)[0, 1])
 
 
-def load_probe(path="data/quickdraw_probe.npz"):
+def load_probe(path="deprecated/quickdraw_probe.npz"):
     data = np.load(path)
     probe = LinearProbe(alpha=float(data["alpha"]))
     probe.weights, probe.mean, probe.std = data["weights"], data["mean"], data["std"]
@@ -438,7 +438,7 @@ def main(argv=None):
     rk.add_argument("--out", type=str, default="data/quickdraw_top25.jsonl")
     rk.add_argument("--fraction", type=float, default=0.25)
     rk.add_argument("--limit_per_class", type=int, default=None)
-    rk.add_argument("--probe", type=str, default="data/quickdraw_probe.npz")
+    rk.add_argument("--probe", type=str, default="deprecated/quickdraw_probe.npz")
     rk.add_argument("--batch_size", type=int, default=256)
     rk.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True,
                     help="half precision embedding; 1.7x faster, same ranking")

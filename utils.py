@@ -12,21 +12,6 @@ PRESETS = {
         showcase_writer="sam",
         out_dir="out/cursive",
     ),
-    "quickdraw": dict(
-        dataset="data/quickdraw_balanced_fixed.jsonl.gz",
-        max_words=1, augment="general",
-        max_text_length=24, max_seq_length=192,
-        n_layer=6, n_embd=128, batch_size=32,
-        out_dir="out/quickdraw",
-    ),
-    "icons": dict(
-        dataset="data/icons.jsonl",
-        max_words=1, augment="general",
-        grid=0.012, max_text_length=36, max_seq_length=128,
-        tremor=0.004,
-        n_layer=4, n_embd=96, batch_size=32,
-        out_dir="out/icons",
-    ),
 }
 
 
