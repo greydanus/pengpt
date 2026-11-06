@@ -184,3 +184,5 @@ p95 distance from decoded strokes to the original ink, as % of x-height, with to
 Decode smoothing can't recover detail below the grid: unsmoothed decoding already sits at about half a cell. 0.0125 is the candidate for traced fonts: its p95 error (~0.005 units) is about one InkSight pixel. Finer grids mostly encode tracer noise. Word score is per base pen move, so it doesn't compare across grids.
 
 Trained on bigbank at 4k steps, grid 0.0125 with block 384 ran at 46.8 ms/step (1.8× the 0.02 grid's 25.6) and wrote greedy pangram 8/9 and Iliad 15/17, against 9/9 and 16/17 at grid 0.02. Corners look slightly cleaner, but on this cursive the finer grid doesn't pay for its cost, so 0.02 stays the default. Revisit when traced fonts join the mix; `--grid` is a data setting and can differ per preset.
+
+Grid 0.015 with block 320 (32.9 ms/step, 1.3×) wrote the pangram 9/9 but the Iliad 13/17 ("goddes", "countles", "il", "supon"). Both finer grids drop the second of a doubled letter, so finer grids cost spelling on this cursive, not just time. If traced fonts need a finer grid, test it at 12k steps with double-letter words in the samples.
