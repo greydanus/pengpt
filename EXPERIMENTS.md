@@ -149,3 +149,7 @@ Fused AdamW cut the AdamW update from 2.0 to 0.2 ms (26.0 vs 27.7 ms/step), now 
 ## Steps (Nov 6)
 
 At the 4-word defaults, 20k steps (10.5 min) scored 0.5943 against 0.5957–0.5986 at 4k steps (~2 min). Test loss flattened after ~12k steps while train loss kept falling (1.84 vs 1.90 at 20k).
+
+## Decode smoothing (Nov 6)
+
+Decoding averages each stroke's grid walk over a few points to hide the 0.02-grid staircase. A 5-point window spans ~0.1 units, close to a full x-height, and visibly rounded corners the real ink has (pointed S tops, angular z, kinks in k). A 3-point window keeps most of that sharpness with slight jaggedness on long straight strokes; it is now the default. This only changes drawing, not training or checkpoints.

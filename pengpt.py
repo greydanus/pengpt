@@ -136,7 +136,7 @@ def _stroke_spans(pen):
     return list(zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)))
 
 
-def _smooth_strokes(points, window=5):
+def _smooth_strokes(points, window=3):
     out = points.copy()
     for start, stop in _stroke_spans(points[:, 2]):
         if stop - start < window:
