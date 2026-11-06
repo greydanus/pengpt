@@ -12,6 +12,7 @@ from tools.ink import file_hash, flatten, ink_context, ink_mask, join_strokes, j
 TEXT, PLAIN = "Derender the ink: {text}", "Recognize and derender."
 ROUNDS = [[("mono", PLAIN)], [("raw", PLAIN), ("clean", TEXT), ("mono", TEXT)]]
 MAX_SIDE, MAX_HEIGHT = 1024, 320
+WEAK, WHITE = float(os.environ.get("HARVEST_WEAK", 0.8)), float(os.environ.get("HARVEST_WHITE", 0.95))
 
 
 def shrink(img):
@@ -24,11 +25,11 @@ def variants(img):
     norm = flatten(img)
     if norm.min() > 0.3:
         norm = (norm - norm.min()) / (1 - norm.min())
-    mask = ink_mask(norm)
+    mask = ink_mask(norm, weak=WEAK)
     if not mask.any():
         raise ValueError("no ink")
     lo = np.percentile(norm[mask], 10)
-    clean = np.where(mask, ((norm - lo) / max(0.75 - lo, 1e-3)).clip(0, 1), 1.0)
+    clean = np.where(mask, ((norm - lo) / max(WHITE - lo, 1e-3)).clip(0, 1), 1.0)
     width = np.median(ndimage.distance_transform_edt(mask)[mask])
     mono = ndimage.distance_transform_edt(~skeletonize(mask)) <= max(1.5, width)
     return {"raw": np.asarray(img), "clean": (clean * 255).astype(np.uint8), "mono": np.where(mono, 0, 255).astype(np.uint8)}
