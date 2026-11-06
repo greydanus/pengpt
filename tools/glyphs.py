@@ -17,16 +17,6 @@ STORE, FIXES = "data/glyphs.json", "tools/glyph_fixes.json"
 SIZE, PAD = 200, 8
 
 
-def thin_font(path, size):
-    font = ImageFont.truetype(path, size)
-    try:
-        axes = font.get_variation_axes()
-        font.set_variation_by_axes([a["minimum"] if a["name"] == b"Weight" else a["default"] for a in axes])
-    except OSError:
-        pass
-    return font
-
-
 def slug(font_path):
     return os.path.splitext(os.path.basename(font_path))[0].lower().replace("-", "_")
 
@@ -36,27 +26,25 @@ def advance(font, text, i):
 
 
 def contexts(c, cursive):
-    if not cursive:
-        return c, 0
-    if c in string.ascii_lowercase:
-        return "n" + c + "n", 1
-    if c in string.ascii_uppercase:
-        return c + "n", 0
-    return c, 0
+    if cursive and c in string.ascii_lowercase:
+        return [("low", "n" + c + "n", 1), ("high", "o" + c + "n", 1)]
+    if cursive and c in string.ascii_uppercase:
+        return [("low", c + "n", 0)]
+    return [("low", c, 0)]
 
 
 def render(font_path, out, cursive, alone=""):
-    font = thin_font(font_path, SIZE)
+    font = ImageFont.truetype(font_path, SIZE)
     os.makedirs(f"{out}/images", exist_ok=True)
     rows = []
     for k, c in enumerate(CHARS):
-        text, pos = contexts(c, cursive and c not in alone)
-        left, top, right, bottom = font.getbbox(text, anchor="ls")
-        img = Image.new("RGB", (right - left + 2 * PAD, bottom - top + 2 * PAD), "white")
-        ImageDraw.Draw(img).text((PAD - left, PAD - top), text, font=font, fill="black", anchor="ls")
-        path = f"{out}/images/{k:02d}.png"
-        img.save(path)
-        rows.append({"image": path, "char": c, "text": text, "pos": pos, "baseline": PAD - top, "x0": PAD - left})
+        for variant, text, pos in contexts(c, cursive and c not in alone):
+            left, top, right, bottom = font.getbbox(text, anchor="ls")
+            img = Image.new("RGB", (right - left + 2 * PAD, bottom - top + 2 * PAD), "white")
+            ImageDraw.Draw(img).text((PAD - left, PAD - top), text, font=font, fill="black", anchor="ls")
+            path = f"{out}/images/{k:02d}{'' if variant == 'low' else '_' + variant}.png"
+            img.save(path)
+            rows.append({"image": path, "char": c, "variant": variant, "text": text, "pos": pos, "baseline": PAD - top, "x0": PAD - left})
     write_jsonl(f"{out}/manifest.jsonl", rows)
     return rows
 
@@ -145,17 +133,18 @@ def apply_ops(strokes, ops):
 def build(font_path, fixes):
     s = slug(font_path)
     out, fix = f"data/raw/glyphs/{s}", fixes.get(s, {})
-    font = thin_font(font_path, SIZE)
+    font = ImageFont.truetype(font_path, SIZE)
     xh = np.median([np.ptp(font.getbbox(c, anchor="ls")[1::2]) for c in SHORT])
     shift = ink_baseline(font)
-    rows = {r["image"]: r for r in read_jsonl(f"{out}/manifest.jsonl")}
+    rows = dict(sorted(((r["image"], r) for r in read_jsonl(f"{out}/manifest.jsonl")), key=lambda kv: kv[1].get("variant") == "high"))
     traces = {(r["image"], r["prompt"]): r for r in read_jsonl(f"{out}/traces.jsonl")}
     glyphs = {}
     for image, row in rows.items():
         c, g = row["char"], fix.get("glyphs", {}).get(row["char"], {})
+        high = row.get("variant") == "high"
         t = traces[(image, g.get("prompt", PROMPTS[0]))]
         strokes = [np.asarray(p, float) for p in on_ink(t["strokes"], Image.open(image)) if len(p)]
-        strokes = apply_ops(cut(row, strokes, font, xh), g.get("ops", []))
+        strokes = cut(row, strokes, font, xh) if high else apply_ops(cut(row, strokes, font, xh), g.get("ops", []))
         lo = row["x0"] + advance(font, row["text"], row["pos"]) if row["pos"] else -1e9
         hi = row["x0"] + advance(font, row["text"], row["pos"] + 1) if row["pos"] + 1 < len(row["text"]) else 1e9
         if c in "ij.!?":
@@ -164,8 +153,11 @@ def build(font_path, fixes):
         strokes = [(p - origin) / xh for p in strokes]
         if fix.get("cursive") and c.islower():
             strokes = [p for p in strokes if len(p) == 1 or np.ptp(p, 0).max() > 0.15 or is_mark(p, c)]
-        marks = g.get("marks", [k for k, p in enumerate(strokes) if is_mark(p, c)])
-        glyphs[c] = {"strokes": [p.round(4).tolist() for p in strokes], "marks": marks}
+        marks = [k for k, p in enumerate(strokes) if is_mark(p, c)] if high else g.get("marks", [k for k, p in enumerate(strokes) if is_mark(p, c)])
+        if high:
+            glyphs[c]["high"] = {"strokes": [p.round(4).tolist() for p in strokes], "marks": marks}
+        else:
+            glyphs[c] = {**glyphs.get(c, {}), "strokes": [p.round(4).tolist() for p in strokes], "marks": marks}
     return {"font": os.path.basename(font_path), "size": SIZE, "xh": float(xh), "cursive": bool(fix.get("cursive")),
             "reviewed": bool(fix.get("reviewed")), "glyphs": glyphs}
 
@@ -184,16 +176,6 @@ def against_grain(entry):
     return out
 
 
-def retrace(p, s, gap=0.25):
-    if len(s) < 3 or np.hypot(*(p - s[0])) < gap:
-        ahead = np.flatnonzero(s[:, 0] >= p[0] - 0.02)
-        walked = np.r_[0, np.cumsum(np.hypot(*np.diff(s, axis=0).T))]
-        return s[ahead[0]:] if len(ahead) and walked[ahead[0]] < 0.2 else s
-    head = s[:max(2, len(s) * 3 // 5)]
-    j = int(np.argmin(np.hypot(*(head - p).T)))
-    return np.vstack([s[j::-1], s[1:]]) if j > 0 else s
-
-
 def curve(a, b, n=8):
     p0, p1 = a[-1], b[0]
     gap = np.hypot(*(p1 - p0))
@@ -205,48 +187,68 @@ def curve(a, b, n=8):
     return (2 * t**3 - 3 * t**2 + 1) * p0 + (t**3 - 2 * t**2 + t) * m0 + (-2 * t**3 + 3 * t**2) * p1 + (t**3 - t**2) * m1
 
 
-def ends(s, reach, last):
-    walked = np.r_[0, np.cumsum(np.hypot(*np.diff(s[::-1] if last else s, axis=0).T))]
-    k = np.flatnonzero(walked <= reach)
-    return len(s) - 1 - k if last else k
-
-
-def settle(tail, start, window=0.6):
-    if tail[-1, 1] > start[1] - 0.2:
-        return tail
-    near = ends(tail, window, True)
-    m = near[np.argmax(tail[near, 1])]
-    return tail[:m + 1] if tail[m, 1] > -0.3 else tail
+def walk(s):
+    return np.r_[0, np.cumsum(np.hypot(*np.diff(s, axis=0).T))]
 
 
 def splice(tail, s, reach=0.6, close=0.08):
-    a, b = ends(tail, reach, True), ends(s, reach, False)
+    a, b = len(tail) - 1 - np.flatnonzero(walk(tail[::-1]) <= reach), np.flatnonzero(walk(s) <= reach)
     d = np.hypot(*(tail[a][:, None] - s[b][None]).transpose(2, 0, 1))
     i, j = np.unravel_index(np.argmin(d), d.shape)
-    return (tail[:a[i] + 1], s[b[j]:]) if d[i, j] < close else None
+    return np.vstack([tail[:a[i] + 1], s[b[j]:]]) if d[i, j] < close else None
 
 
-def compose(entry, text, xs, bridge=1.0):
+def backtrack(tail, q, reach=1.5, close=0.15):
+    k = np.flatnonzero(walk(tail[::-1]) <= reach)[1:]
+    if not len(k):
+        return None
+    d = np.hypot(*(tail[::-1][k] - q).T)
+    i = k[np.argmin(d)]
+    return tail[::-1][1:i + 1] if d.min() < close and i > 2 else None
+
+
+def ride_in(p, s):
+    head = s[:max(2, len(s) * 3 // 5)]
+    j = int(np.argmin(np.hypot(*(head - p).T)))
+    return np.vstack([s[j::-1], s[1:]]) if j > 0 else s
+
+
+def join(tail, s, log=None):
+    log = [] if log is None else log
+    spliced = splice(tail, s)
+    if spliced is not None:
+        log.append(("splice", spliced[len(tail) - 1:len(tail)]))
+        return spliced
+    back = backtrack(tail, s[0])
+    if back is not None:
+        log.append(("backtrack", np.vstack([tail[-1:], back, s[:1]])))
+        return np.vstack([tail, back, s])
+    if s[0, 1] < tail[-1, 1] - 0.4 and len(s) > 3:
+        rode = ride_in(tail[-1], s)
+        if len(rode) > len(s):
+            log.append(("ride in", rode[:len(rode) - len(s) + 1]))
+        s = rode
+    bridge = curve(tail, s)
+    log.append(("bridge", np.vstack([tail[-1:], bridge, s[:1]])))
+    return np.vstack([tail, bridge, s])
+
+
+def compose(entry, text, xs, bridge=1.0, high=-0.55, log=None):
     g = entry["glyphs"]
     out, marks, prev = [], [], None
     for c, x in zip(text, xs):
         if c not in g:
             out, marks, prev = out + marks, [], None
             continue
-        for k, s in enumerate(g[c]["strokes"]):
+        glyph = g[c]["high"] if "high" in g[c] and (prev or "").islower() and out and out[-1][-1, 1] < high else g[c]
+        for k, s in enumerate(glyph["strokes"]):
             s = np.asarray(s) + [x, 0]
-            if k in g[c]["marks"]:
+            if k in glyph["marks"]:
                 (marks if entry["cursive"] else out).append(s)
                 continue
             joined = k > 0 or (prev or "").islower() or ((prev or "").isupper() and np.hypot(*(out[-1][-1] - s[0])) < bridge)
             if entry["cursive"] and c.islower() and out and joined:
-                cut = splice(out[-1], s)
-                if cut:
-                    out[-1] = np.vstack(cut)
-                    continue
-                tail = settle(out[-1], s[0]) if k == 0 else out[-1]
-                s = retrace(tail[-1], s)
-                out[-1] = np.vstack([tail, curve(tail, s), s])
+                out[-1] = join(out[-1], s, log)
             else:
                 out.append(s)
         prev = c
@@ -254,7 +256,7 @@ def compose(entry, text, xs, bridge=1.0):
 
 
 def layout(entry, text, font_dir="data/raw/fonts"):
-    font = thin_font(f"{font_dir}/{entry['font']}", entry["size"])
+    font = ImageFont.truetype(f"{font_dir}/{entry['font']}", entry["size"])
     return [advance(font, text, i) / entry["xh"] for i in range(len(text))]
 
 
