@@ -5,6 +5,7 @@ import json
 import os
 import pickle
 import random
+import unicodedata
 import zipfile
 import zlib
 
@@ -74,6 +75,9 @@ def group_xheight(group):
     letters = [h for s in group for h in s.get("xh", [])]
     if len(letters) >= 5:
         return float(np.median(letters)), "letters"
+    bands = [np.subtract(*core_band(s["strokes"], frac=0.25)[::-1]) for s in group if any(c.islower() for c in s["text"])]
+    if len(bands) >= 3:
+        return float(np.median(bands)), "band"
     return None, "none"
 
 
@@ -140,15 +144,21 @@ def densify(strokes, step):
     return np.concatenate(out)
 
 
-def band_bottom(strokes, bins=40):
+def core_band(strokes, bins=40, frac=0.5):
     y = np.concatenate(strokes)[:, 1]
     y = densify(strokes, max(np.ptp(y), 1e-6) / 200)[:, 1]
     hist, edges = np.histogram(y, bins=bins)
     hist = np.convolve(hist, np.ones(3) / 3, "same")
-    j = top = hist.argmax()
-    while j + 1 < bins and hist[j + 1] >= 0.5 * hist[top]:
-        j += 1
-    return float(edges[j + 1])
+    lo = hi = peak = hist.argmax()
+    while hi + 1 < bins and hist[hi + 1] >= frac * hist[peak]:
+        hi += 1
+    while lo > 0 and hist[lo - 1] >= frac * hist[peak]:
+        lo -= 1
+    return float(edges[lo]), float(edges[hi + 1])
+
+
+def band_bottom(strokes, bins=40):
+    return core_band(strokes, bins)[1]
 
 
 def baseline(strokes, text):
@@ -230,13 +240,27 @@ def load_collect():
     return samples
 
 
-def load_traces(path=f"{RAW}/traces/accepted.jsonl"):
-    samples = []
+def ascii_text(text):
+    text = text.translate(str.maketrans("\u2018\u2019\u201c\u201d\u2013\u2014", "''\"\"--"))
+    text = "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
+    return text if text.isascii() and text.strip() else None
+
+
+def load_traces(path=f"{RAW}/traces/accepted.jsonl", license="unspecified"):
+    samples, skipped = [], 0
     for r in map(json.loads, open(path)):
         strokes = [np.asarray(s, float) for s in r["strokes"] if len(s)]
-        samples.append({"text": r["text"], "strokes": strokes, "baseline": r["baseline"], "frame": r["source"],
-                        "writer": r.get("writer", r["source"]), "style": r["style"], "source": r["source"],
-                        "license": r["license"]})
+        text = ascii_text(r["text"])
+        if not strokes or text is None:
+            skipped += 1
+            continue
+        source = r.get("source") or r.get("set") or "unknown"
+        writer = r.get("writer") or source
+        samples.append({"text": text, "strokes": strokes, "frame": writer, "writer": writer, "source": source,
+                        "style": r.get("style") or writer, "license": r.get("license") or license,
+                        "baseline": r["baseline"] if r.get("baseline") is not None else baseline(strokes, text)})
+    if skipped:
+        print(f"skipped {skipped} rows with no strokes or non-ASCII text")
     return samples
 
 
@@ -323,16 +347,21 @@ def main():
     parser.add_argument("names", nargs="+", choices=sorted(LOADERS) + ["glyphs"])
     parser.add_argument("--fonts", nargs="*", default=[], help="glyphs: store names; default every font signed off in tools/glyph_fixes.json")
     parser.add_argument("--n", type=int, default=3000, help="glyphs: words per font")
+    parser.add_argument("--path", default="", help="traces: accepted.jsonl to convert (from tools/ink.py qc or tools/harvest.py)")
+    parser.add_argument("--out", default="", help="traces: output .ink.npz")
+    parser.add_argument("--license", default="unspecified", help="traces: license for rows that don't carry one")
     args = parser.parse_args()
     if args.names == ["glyphs"]:
         return glyphs_main(args)
     for name in args.names:
-        records = standardize(LOADERS[name]())
-        out = f"{RAW}/{name}/{name}.ink.npz"
-        tmp = f"{RAW}/{name}/{name}.tmp.ink.npz"
+        samples = load_traces(args.path, args.license) if name == "traces" and args.path else LOADERS[name]()
+        records = standardize(samples)
+        out = args.out if name == "traces" and args.out else f"{RAW}/{name}/{name}.ink.npz"
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        tmp = out.replace(".ink.npz", ".tmp.ink.npz")
         save_ink(records, tmp)
         os.replace(tmp, out)
-        sheet(records, f"{RAW}/{name}/{name}_samples.png")
+        sheet(records, out.replace(".ink.npz", "_samples.png"))
         writers = len({r["writer"] for r in records})
         print(f"{name}: {len(records)} samples from {writers} writers -> {out}")
 

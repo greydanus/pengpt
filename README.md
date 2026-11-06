@@ -157,6 +157,10 @@ one scale per recording frame, plus a sheet of samples to eyeball. Sources:
   `rejected.jsonl` with reasons. It first traces 10 words from each source
   (writer or page) and drops sources whose sample mostly fails QC.
   `python -m tools.transcribe` labels unlabeled crops with Claude Sonnet 5.5.
+  `python -m tools.datasets traces --path dir/accepted.jsonl --out x.ink.npz`
+  turns accepted traces into a dataset: one scale per writer (from short
+  words, else the core ink band), baselines estimated when missing,
+  0.01-spaced points, ASCII labels and the writer on every word.
 - Fonts: `tools/glyphs.py` traces each of a font's 70 characters once with
   InkSight (cursive letters inside an "n_n" context so their joins come out),
   then assembles any word from those glyphs. `trace --font F` takes about a

@@ -292,3 +292,15 @@ def test_on_ink_ignores_points_off_the_image():
     img = Image.new("RGB", (100, 40), "white")
     ImageDraw.Draw(img).line([(0, 20), (80, 20)], fill="black", width=3)
     assert on_ink([[(-5, 20)], [(10, 20), (70, 20)]], img) == [[(10, 20), (70, 20)]]
+
+
+def test_harvest_rows_export_with_writer_ascii_text_and_estimated_baseline(tmp_path):
+    from tools.datasets import ascii_text
+    assert ascii_text("don’t") == "don't" and ascii_text("café") == "cafe" and ascii_text("中") is None
+    word = [[x, 100 - 20 * (x % 20 < 10)] for x in range(0, 120, 2)]
+    rows = [{"image": f"{i}.png", "text": t, "writer": "w1", "set": "eval", "strokes": [word]} for i, t in enumerate(["moon", "“none”", "中"])]
+    (tmp_path / "acc.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    samples = load_traces(str(tmp_path / "acc.jsonl"), license="CC0")
+    assert [s["text"] for s in samples] == ["moon", '"none"']
+    assert all(s["writer"] == "w1" and s["source"] == "eval" and s["license"] == "CC0" for s in samples)
+    assert all(np.isclose(s["baseline"], 100, atol=1) for s in samples)
