@@ -102,7 +102,7 @@ def edges(sk):
     return out, nid
 
 
-def strokes_of(sk, bridge=0, tangent_len=25):
+def strokes_of(sk, bridge=0, spur=0, tangent_len=25):
     es, nid = edges(sk)
     closed = [len(e) > 2 and e[0] == e[-1] and not nid[e[0]] for e in es]
     count = {}
@@ -110,25 +110,33 @@ def strokes_of(sk, bridge=0, tangent_len=25):
         if len(e) > 1 and not closed[i]:
             for p in (e[0], e[-1]):
                 count[nid[p]] = count.get(nid[p], 0) + 1
+    def tangent(i, side):
+        pts = np.asarray(es[i] if side == 0 else es[i][::-1], float)
+        v = pts[min(len(pts) - 1, tangent_len)] - pts[0]
+        return v / (np.linalg.norm(v) + 1e-9)
+
+    def along(i):
+        v = np.subtract(es[i][-1], es[i][0]) / (np.linalg.norm(np.subtract(es[i][-1], es[i][0])) + 1e-9)
+        arms = lambda k: [tangent(j, side) for j, f in enumerate(es) if j != i and len(f) > 1 for side, p in ((0, f[0]), (1, f[-1])) if nid[p] == k]
+        return all(max([abs(v @ t) for t in arms(k)] or [0]) > 0.8 for k in (nid[es[i][0]], nid[es[i][-1]]))
+
     root = {}
     find = lambda k: k if root.get(k, k) == k else find(root[k])
-    skip = set()
+    skip, tips = set(), []
     for i, e in enumerate(es):
         a, b = nid[e[0]], nid[e[-1]]
-        if len(e) > 1 and not closed[i] and a and b and count[a] >= 3 and count[b] >= 3 and len(e) <= bridge:
+        if len(e) > 1 and not closed[i] and a and b and count[a] >= 3 and count[b] >= 3 and (len(e) <= bridge / 3 or (len(e) <= bridge and along(i))):
             if find(a) != find(b):
                 root[find(a)] = find(b)
             skip.add(i)
+        elif len(e) > 1 and not closed[i] and len(e) <= spur and min(count.get(a, 1), count.get(b, 1)) == 1 and max(count.get(a, 1), count.get(b, 1)) >= 3:
+            skip.add(i)
+            tips.append((a, e[-1]) if count.get(a, 1) >= 3 else (b, e[0]))
     ends = {}
     for i, e in enumerate(es):
         if len(e) > 1 and not closed[i] and i not in skip:
             ends.setdefault(find(nid[e[0]]), []).append((i, 0))
             ends.setdefault(find(nid[e[-1]]), []).append((i, 1))
-
-    def tangent(i, side):
-        pts = np.asarray(es[i] if side == 0 else es[i][::-1], float)
-        v = pts[min(len(pts) - 1, tangent_len)] - pts[0]
-        return v / (np.linalg.norm(v) + 1e-9)
 
     link = {}
     for node, group in ends.items():
@@ -139,7 +147,12 @@ def strokes_of(sk, bridge=0, tangent_len=25):
                 break
             if a not in link and b not in link:
                 link[a], link[b] = b, a
+        left = [e for e in group if e not in link]
+        if len(left) == 2:
+            link[left[0]], link[left[1]] = left[1], left[0]
     done, out = set(skip), []
+
+    tip = {find(k): p for k, p in tips}
 
     def run(i, side):
         pts = []
@@ -149,7 +162,11 @@ def strokes_of(sk, bridge=0, tangent_len=25):
             pts += seg if not pts else seg[1:]
             if (i, 1 - side) not in link:
                 return pts, False
-            i, side = link[(i, 1 - side)]
+            j, t = link[(i, 1 - side)]
+            node = find(nid[seg[-1]])
+            if node in tip and tangent(i, 1 - side) @ tangent(j, t) > -0.7:
+                pts.append(tip[node])
+            i, side = j, t
             if i in done:
                 return pts, True
     for i, side in [(i, s) for i, e in enumerate(es) if len(e) > 1 and not closed[i] for s in (0, 1)]:
@@ -179,6 +196,31 @@ def dot(p, thick, n=10):
     r = max(1.5, 0.6 * thick[int(round(p[1])), int(round(p[0]))])
     a = np.pi / 2 + np.linspace(0, 2 * np.pi, n + 1)
     return np.column_stack([p[0] + r * np.cos(a), p[1] - r * np.sin(a)])
+
+
+def sharpen(s, thick, w):
+    if len(s) < 2 * w + 1:
+        return s
+    s = s.copy()
+    d = lambda v: v / (np.linalg.norm(v) + 1e-9)
+    turn = np.array([0.0] * w + [1 - d(s[k] - s[k - w]) @ d(s[k + w] - s[k]) for k in range(w, len(s) - w)] + [0.0] * w)
+    r = np.median([thick[int(round(y)), int(round(x))] for x, y in s])
+    for k in range(w, len(s) - w):
+        if turn[k] < 1.0 or turn[k] < turn[k - 1] or turn[k] < turn[k + 1]:
+            continue
+        out = d(d(s[k] - s[k - w]) - d(s[k + w] - s[k]))
+        q = s[k].copy()
+        while True:
+            nxt = q + out
+            y, x = int(round(nxt[1])), int(round(nxt[0]))
+            if not (0 <= y < thick.shape[0] and 0 <= x < thick.shape[1]) or thick[y, x] < 0.75 * r:
+                break
+            q = nxt
+        s[k] = q
+        for j in range(1, w // 2):
+            s[k - j] = s[k - w // 2] + (q - s[k - w // 2]) * (1 - j / (w // 2))
+            s[k + j] = s[k + w // 2] + (q - s[k + w // 2]) * (1 - j / (w // 2))
+    return s
 
 
 def delayed(s, others):
@@ -218,22 +260,27 @@ def glyph_strokes(font, c, fixes=None):
     thick = ndimage.distance_transform_edt(ink)
     width = 2 * np.median(thick[ink])
     sk = prune(thin(ink), int(1.5 * width), thick)
-    raw = [orient(p, closed) if len(p) > 1 else dot(p[0], thick) for p, closed in strokes_of(sk, int(6 * width + 4))]
+    raw = [orient(p, closed) if len(p) > 1 else dot(p[0], thick) for p, closed in strokes_of(sk, int(6 * width + 4), int(2 * width))]
     raw = [s for s in raw if len(s) > 2 or np.ptp(s, 0).max() > 0.08 * XH]
+    raw = [sharpen(s, thick, max(4, int(width))) for s in raw]
     late = [delayed(s, [o for o in raw if o is not s]) for s in raw]
     order = sorted(range(len(raw)), key=lambda i: (late[i], raw[i][0][0]))
     out = [smooth(raw[i]) - [ox, oy] for i in order]
-    for fix in (fixes or {}).get(c, []):
-        op, k = fix.split(":") if ":" in fix else (fix, "0")
-        k = int(k)
+    for fix in (fixes or {}).get(c, {}).get("ops", []):
+        op, arg = fix.split(":")
+        k = [int(a) for a in arg.split(",")]
         if op == "reverse":
-            out[k] = out[k][::-1]
-        elif op == "first":
-            out.insert(0, out.pop(k))
-        elif op == "last":
-            out.append(out.pop(k))
+            out[k[0]] = out[k[0]][::-1]
+        elif op == "order":
+            out = [out[i] for i in k]
         elif op == "drop":
-            out.pop(k)
+            out.pop(k[0])
+        elif op == "join":
+            a, b = out[k[0]], out[k[1]]
+            pairs = [(np.hypot(*(x[-1] - y[0])), x, y) for x in (a, a[::-1]) for y in (b, b[::-1])]
+            _, x, y = min(pairs, key=lambda q: q[0])
+            out[k[0]] = np.vstack([x, y])
+            out.pop(k[1])
     return out, img, (ox, oy)
 
 
