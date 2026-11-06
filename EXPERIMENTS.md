@@ -34,6 +34,38 @@ With current augmentation, BRUSH no longer helps the cursive score. Writer style
 
 The score flattens around 2,000–2,500 words. A 3,325-word run on the old warmdown 0.4 scored 0.602 with 22/25 greedy; the 3,325 score above is from the warmdown 0.8 run (the packing experiment's 8-word run).
 
+Seed check (`--train_seed`, greedy = phrases right of 8):
+
+| Words | Scores | Greedy |
+|---|---|---|
+| 2,000 | 0.608, 0.617 (mean 0.613) | 1, 3 |
+| 3,325 | 0.603, 0.605, 0.605 (mean 0.604) | 5, 6, 3 |
+
+A same-seed rerun differs by 0.003 (MPS nondeterminism). All the words beats 2,000 on both measures, so 2,000 isn't saturated.
+
+## English equivalent of bigbank
+
+Which part of the gain depends on a word's own letters? Per held-out word, the loss across the scaling models is explained by:
+
+| Model | R² |
+|---|---|
+| one curve for every word | 0.172 |
+| exposure to the word's letters | **0.187** |
+| exposure to its letter pairs | 0.161 |
+| letter exposures shuffled across words | 0.143 (95th pct 0.165) |
+
+Most of the gain is shared by all words; letter exposure adds a little and letter pairs nothing. Exposure model: mean over a word's characters of (count + 1)^−β, best β 0.95.
+
+Bigbank is two-thirds random strings over 70 characters. English words are sampled by `wordfreq` frequency; "as written" adds 12% capitals, ~10% trailing punctuation, 1% numbers. English words needed to match 2,000 bigbank words:
+
+| Judged on | β 0.5 | β 0.95 | β 1.5 |
+|---|---|---|---|
+| English as written | 2,030 | **3,555** | 8,480 |
+| English, lowercase | 1,356 | **1,628** | 2,658 |
+| bigbank-style strings | 40,322 | never | never |
+
+Rare capitals, digits and punctuation set the as-written number. Counting ink instead (English words average 4.5 characters, bigbank 5.3), 2,000 bigbank words ≈ 2,350 English words. Rule of thumb: ~3,500 English words for a writer you want reproduced well, plus some bigbank-style strings or synthetic font writers for rare characters. Not modeled: English also teaches whole common words, which only lowers the number.
+
 ## Burn-in generation
 
 Writing two words per call, with the previous word's ink and text carried in as context (`--burn_in 1`): 17/17 Iliad words correct, vs 16/17 without.
