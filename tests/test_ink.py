@@ -277,3 +277,18 @@ def test_glyph_words_export_at_the_shared_scale():
     from pengpt import check_data
     pts = [np.c_[np.concatenate(r["strokes"]), np.ones(sum(map(len, r["strokes"])))] for r in records]
     assert check_data([{"text": r["text"], "points": p} for r, p in zip(records, pts)], 0.02)[1] == []
+
+
+def test_strokes_off_the_image_count_against_precision(tmp_path):
+    img = Image.new("RGB", (200, 80), "white")
+    path = [(20, 60), (60, 20), (100, 60), (140, 20), (180, 60)]
+    ImageDraw.Draw(img).line(path, fill="black", width=4)
+    img.save(tmp_path / "w.png")
+    q = score({"image": str(tmp_path / "w.png")}, {"strokes": [path, [(100, 0), (100, -60)]]})
+    assert q["precision"] < 0.8
+
+
+def test_on_ink_ignores_points_off_the_image():
+    img = Image.new("RGB", (100, 40), "white")
+    ImageDraw.Draw(img).line([(0, 20), (80, 20)], fill="black", width=3)
+    assert on_ink([[(-5, 20)], [(10, 20), (70, 20)]], img) == [[(10, 20), (70, 20)]]

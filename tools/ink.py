@@ -303,7 +303,7 @@ def detokenize(text):
 def on_ink(strokes, img=None, radius=3, ctx=None):
     ink = ctx["touch"] if ctx else ndimage.binary_dilation(np.asarray(img.convert("L")) < INK_LEVEL, iterations=radius)
     h, w = ink.shape
-    touches = lambda s: any(ink[min(max(int(round(y)), 0), h - 1), min(max(int(round(x)), 0), w - 1)] for x, y in s)
+    touches = lambda s: any(0 <= round(x) < w and 0 <= round(y) < h and ink[int(round(y)), int(round(x))] for x, y in s)
     return [s for s in strokes if touches(s)]
 
 
@@ -406,8 +406,10 @@ def score(item, cand, ctx=None):
         return {"coverage": 0.0, "precision": 0.0, "length_ratio": 0.0, "min_mark": 0.0, "max_mark_length": 0.0, "retrace": 0.0, "points": 0}
     half, gap, labels, k, area = c["half"], c["gap"], c["labels"], c["k"], c["area"]
     canvas = np.zeros(ink.shape, bool)
-    ij = np.clip(np.rint(pts).astype(int), 0, [ink.shape[1] - 1, ink.shape[0] - 1])
-    canvas[ij[:, 1], ij[:, 0]] = True
+    raw = np.rint(pts).astype(int)
+    inside = (raw[:, 0] >= 0) & (raw[:, 1] >= 0) & (raw[:, 0] < ink.shape[1]) & (raw[:, 1] < ink.shape[0])
+    ij = np.clip(raw, 0, [ink.shape[1] - 1, ink.shape[0] - 1])
+    canvas[ij[inside, 1], ij[inside, 0]] = True
     path = ndimage.distance_transform_edt(~canvas) <= half + 1
     marks = ndimage.mean(path, labels, np.arange(1, k + 1))[area >= half ** 2]
     on = gap[ij[:, 1], ij[:, 0]] <= half / 2 + 2
@@ -422,7 +424,7 @@ def score(item, cand, ctx=None):
             "min_mark": float(marks.min()) if len(marks) else 1.0,
             "max_mark_length": float(drawn[area >= 8 * half ** 2].max()) if (area >= 8 * half ** 2).any() else 0.0,
             "retrace": float(retrace[big].max()) if big.any() else 0.0,
-            "precision": float((gap[ij[:, 1], ij[:, 0]] <= half / 2 + 2).mean()),
+            "precision": float(((gap[ij[:, 1], ij[:, 0]] <= half / 2 + 2) & inside).mean()),
             "length_ratio": float(len(pts) * 2 * half / ink.sum()),
             "points": int(len(pts))}
 
@@ -455,9 +457,9 @@ def judge(item, cand, args=RULES, ctx=None):
     c = {**cand, "strokes": on_ink(cand["strokes"], None if ctx else Image.open(item["image"]), ctx=ctx)}
     q = score(item, c, ctx)
     label = plain(item["text"])
-    q["read"] = c["read"]
-    q["read_error"] = levenshtein(plain(c["read"]), label) / len(label) if c["read"] else None
-    q["prompt"] = c["prompt"]
+    q["read"] = c.get("read", "")
+    q["read_error"] = levenshtein(plain(q["read"]), label) / len(label) if q["read"] else None
+    q["prompt"] = c.get("prompt", "")
     q["passed"] = (q["coverage"] >= args.min_coverage and q["precision"] >= args.min_precision
                    and q["min_mark"] >= args.min_mark and q["length_ratio"] <= args.max_length_ratio
                    and q["retrace"] <= args.max_retrace and q["max_mark_length"] <= args.max_mark_length
@@ -499,7 +501,7 @@ def peek_command(args):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     items = {file_hash(it["image"]): it for it in read_jsonl(args.manifest)}
-    rows = [r for r in read_jsonl(args.traces) if r.get("hash") in items and r["prompt"].startswith(args.prompt)]
+    rows = [r for r in read_jsonl(args.traces) if r.get("hash") in items and r.get("prompt", "").startswith(args.prompt)]
     if args.worst:
         sign = 1 if args.worst in ("coverage", "precision", "min_mark") else -1
         rows = sorted(rows, key=lambda r: sign * judge(items[r["hash"]], r, args)[1][args.worst])[:args.n]
@@ -510,6 +512,8 @@ def peek_command(args):
     for r, (a, b) in zip(rows, axes):
         item = items[r["hash"]]
         c, q = judge(item, r, args)
+        if "passed" in r.get("qc", {}):
+            q = {**q, **r["qc"]}
         kept = c["strokes"]
         a.imshow(Image.open(item["image"]).convert("L"), cmap="gray", alpha=0.3)
         for s in (s for s in r["strokes"] if s not in kept):
@@ -523,10 +527,10 @@ def peek_command(args):
         b.set_aspect("equal")
         for ax in (a, b):
             ax.axis("off")
-        a.set_title(f"{'PASS' if q['passed'] else 'FAIL'}  {item['text']!r}  read {r['read']!r}", loc="left", fontsize=9,
+        a.set_title(f"{'PASS' if q['passed'] else 'FAIL'}  {item['text']!r}  read {r.get('read', '')!r}", loc="left", fontsize=9,
                     color="darkgreen" if q["passed"] else "firebrick")
         b.set_title(f"{len(kept)} strokes  cov {q['coverage']:.2f}  mark {q['min_mark']:.2f}  prec {q['precision']:.2f}  "
-                    f"len {q['length_ratio']:.2f}  retrace {q['retrace']:.2f}  {r.get('engine', 'tf')}", loc="left", fontsize=8)
+                    f"len {q['length_ratio']:.2f}  retrace {q['retrace']:.2f}  {r.get('candidate') or r.get('engine', 'tf')}", loc="left", fontsize=8)
     fig.subplots_adjust(left=0.01, right=0.99, top=0.98, bottom=0.01, hspace=0.5, wspace=0.05)
     fig.savefig(args.out, dpi=110, bbox_inches="tight")
     print(f"peek: {len(rows)} random traces -> {args.out}")
