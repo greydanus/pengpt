@@ -104,7 +104,7 @@ def edges(sk):
 
 def strokes_of(sk, bridge=0, tangent_len=25):
     es, nid = edges(sk)
-    closed = [len(e) > 2 and e[0] == e[-1] for e in es]
+    closed = [len(e) > 2 and e[0] == e[-1] and not nid[e[0]] for e in es]
     count = {}
     for i, e in enumerate(es):
         if len(e) > 1 and not closed[i]:
@@ -115,8 +115,9 @@ def strokes_of(sk, bridge=0, tangent_len=25):
     skip = set()
     for i, e in enumerate(es):
         a, b = nid[e[0]], nid[e[-1]]
-        if len(e) > 1 and not closed[i] and a and b and a != b and count[a] >= 3 and count[b] >= 3 and len(e) <= bridge:
-            root[find(a)] = find(b)
+        if len(e) > 1 and not closed[i] and a and b and count[a] >= 3 and count[b] >= 3 and len(e) <= bridge:
+            if find(a) != find(b):
+                root[find(a)] = find(b)
             skip.add(i)
     ends = {}
     for i, e in enumerate(es):
@@ -217,7 +218,8 @@ def glyph_strokes(font, c, fixes=None):
     thick = ndimage.distance_transform_edt(ink)
     width = 2 * np.median(thick[ink])
     sk = prune(thin(ink), int(1.5 * width), thick)
-    raw = [orient(p, closed) if len(p) > 1 else dot(p[0], thick) for p, closed in strokes_of(sk, int(4 * width + 4))]
+    raw = [orient(p, closed) if len(p) > 1 else dot(p[0], thick) for p, closed in strokes_of(sk, int(6 * width + 4))]
+    raw = [s for s in raw if len(s) > 2 or np.ptp(s, 0).max() > 0.08 * XH]
     late = [delayed(s, [o for o in raw if o is not s]) for s in raw]
     order = sorted(range(len(raw)), key=lambda i: (late[i], raw[i][0][0]))
     out = [smooth(raw[i]) - [ox, oy] for i in order]
