@@ -259,7 +259,7 @@ class Rails:
         return None if path is None else (self.pts[path[1:-1]] - self.origin) / self.xh
 
 
-def compose(entry, text, xs, bridge=1.0, rails=None, log=None):
+def compose(entry, text, xs, bridge=1.0, detour=2.0, rails=None, log=None):
     g, cursive = entry["glyphs"], entry["cursive"]
     out, prev, end, open_chain = [], None, None, False
     for c, x in zip(text, xs):
@@ -275,10 +275,14 @@ def compose(entry, text, xs, bridge=1.0, rails=None, log=None):
             if rails and cursive and (c.isalpha() or k == 0):
                 s = rails.snap(s)
             if cursive and c.islower() and end is not None and (k > 0 or (prev or "").isalpha()):
-                gap = rails.link(end, s[0]) if rails else None
-                gap = np.zeros((0, 2)) if gap is None else gap
+                gap = rails.link(end, s[0]) if rails else np.zeros((0, 2))
+                if gap is not None and len(s) > 3 and walk(np.vstack([end[None], gap, s[:1]]))[-1] > detour * np.hypot(*(s[0] - end)):
+                    s = s[np.argmin(np.hypot(*(s[:len(s) // 2] - end).T)):]
+                    gap = rails.link(end, s[0])
+                ink = gap is not None
+                gap = gap if ink else np.zeros((0, 2))
                 piece = np.vstack([end[None], gap, s])
-                if k > 0 or (prev or "").islower() or walk(piece[:len(gap) + 2])[-1] < bridge:
+                if k > 0 or (prev or "").islower() or ink and walk(piece[:len(gap) + 2])[-1] < bridge:
                     if log is not None:
                         log.append(piece[:len(gap) + 2])
                     if open_chain:
