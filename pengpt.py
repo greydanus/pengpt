@@ -1,10 +1,10 @@
 import argparse
 import json
-import collections
-import multiprocessing
 import os
+import queue
+import threading
 import time
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, fields
 
 import numpy as np
 import torch
@@ -68,7 +68,7 @@ class TrainConfig:
     print_every: int = 100
     device: str = "auto"
     compile: bool = True
-    workers: int = 4
+    train_seed: int = 0
     out_dir: str = "out/default"
     resume: str = ""
     wandb: bool = False
@@ -127,27 +127,6 @@ def bresenham_steps(x0, y0, x1, y1):
     return np.array(out, dtype=np.int64)
 
 
-def _walk(grid_xy):
-    grid_xy = np.asarray(grid_xy, dtype=np.int64)
-    if len(grid_xy) < 2:
-        return []
-    deltas = np.diff(grid_xy, axis=0)
-    moved = (deltas[:, 0] != 0) | (deltas[:, 1] != 0)
-    deltas = deltas[moved]
-    if not len(deltas):
-        return []
-    if (np.abs(deltas) <= 1).all():
-        return _DIR_LOOKUP[deltas[:, 0] + 1, deltas[:, 1] + 1].tolist()
-    out = []
-    for i in np.flatnonzero(moved):
-        (x0, y0), (x1, y1) = grid_xy[i], grid_xy[i + 1]
-        if abs(x1 - x0) <= 1 and abs(y1 - y0) <= 1:
-            out.append(int(_DIR_LOOKUP[x1 - x0 + 1, y1 - y0 + 1]))
-        else:
-            out.extend(int(t) for t in bresenham_steps(x0, y0, x1, y1))
-    return out
-
-
 def _stroke_spans(pen):
     down = (np.asarray(pen) == 1).astype(np.int8)
     if not down.any():
@@ -204,15 +183,27 @@ class ScribeTokenizer:
 
     def encode_base(self, points):
         points = np.asarray(points, dtype=float)
+        spans = _stroke_spans(points[:, 2])
+        if not spans:
+            return np.zeros(0, dtype=np.int64)
         grid_xy = np.rint(points[:, :2] / self.grid).astype(np.int64)
-        out, previous_end = [], np.array([0, 0], dtype=np.int64)
-        for start, stop in _stroke_spans(points[:, 2]):
-            out.extend(_walk([previous_end, grid_xy[start]]))
-            out.append(DOWN)
-            out.extend(_walk(grid_xy[start:stop]))
-            out.append(UP)
-            previous_end = grid_xy[stop - 1]
-        return np.array(out, dtype=np.int64)
+        d = np.diff(np.vstack([[[0, 0]]] + [grid_xy[a:b] for a, b in spans]), axis=0)
+        first = np.cumsum([0] + [b - a for a, b in spans])
+        hops, lasts = first[:-1], first[1:] - 1
+        n = np.abs(d).max(1)
+        is_hop = np.zeros(len(d), dtype=bool)
+        is_hop[hops] = True
+        size = n + is_hop
+        size[lasts] += 1
+        off = np.cumsum(size) - size
+        out = np.empty(size.sum(), dtype=np.int64)
+        small = n == 1
+        out[off[small]] = _DIR_LOOKUP[d[small, 0] + 1, d[small, 1] + 1]
+        for i in np.flatnonzero(n > 1):
+            out[off[i]:off[i] + n[i]] = bresenham_steps(0, 0, *d[i])
+        out[off[hops] + n[hops]] = DOWN
+        out[off[lasts] + n[lasts] + is_hop[lasts]] = UP
+        return out
 
     def apply_merges(self, tokens):
         if not self._pairs:
@@ -596,31 +587,23 @@ def create_datasets(cfg, merges=None, writers=None):
     return train_dataset, test_dataset, stroke_tok, char_tok
 
 
-_WORKER_DATASET = None
-
-
-def _init_worker(dataset):
-    global _WORKER_DATASET
-    _WORKER_DATASET = dataset
-    torch.set_num_threads(1)
-
-
-def _worker_batch(seeds):
-    return _WORKER_DATASET.batch(seeds)
-
-
-def infinite_batches(dataset, batch_size, seed=0, workers=4):
+def infinite_batches(dataset, batch_size, seed=0, prefetch=4):
     rng = np.random.default_rng(seed)
-    seeds = lambda: rng.integers(0, 2 ** 62, batch_size)
-    if workers == 0:
-        while True:
-            yield dataset.batch(seeds())
-    with multiprocessing.get_context("spawn").Pool(workers, _init_worker, (dataset,)) as pool:
-        pending = collections.deque(pool.apply_async(_worker_batch, (seeds(),)) for _ in range(2 * workers))
-        while True:
-            batch = pending.popleft().get()
-            pending.append(pool.apply_async(_worker_batch, (seeds(),)))
-            yield batch
+    q = queue.Queue(maxsize=prefetch)
+
+    def produce():
+        try:
+            while True:
+                q.put(dataset.batch(rng.integers(0, 2 ** 62, batch_size)))
+        except Exception as e:
+            q.put(e)
+
+    threading.Thread(target=produce, daemon=True).start()
+    while True:
+        item = q.get()
+        if isinstance(item, Exception):
+            raise item
+        yield item
 
 
 def _split_heads(t, n_head):
@@ -918,7 +901,8 @@ class SampleParams:
     top_k: int = None
     do_sample: bool = True
     max_tokens: int = 512
-    n_at_a_time: int = 4
+    n_at_a_time: int = 2
+    burn_in: int = 1
     space_width: float = 0.16
     line_width: float = 8.0
     line_height: float = 0.55
@@ -934,17 +918,23 @@ def writer_id(dataset, name):
     return dataset.writers.index(name) if name else 0
 
 
-def generate(model, dataset, text, params=None):
+def generate(model, dataset, text, params=None, prefix=()):
     params = params or SampleParams()
     st = dataset.stroke_tok
     device = next(model.parameters()).device
     writer = torch.tensor([writer_id(dataset, params.writer)], device=device)
     context = torch.from_numpy(dataset.encode_text(text)).unsqueeze(0).to(device)
-    idx = torch.full((1, 1), st.BOS, dtype=torch.long, device=device)
-    out = model.generate(idx, context, max_new_tokens=params.max_tokens,
+    seq = [st.BOS] + [t for word in prefix for t in [*word, st.WORD, st.WORD]]
+    idx = torch.tensor([seq], dtype=torch.long, device=device)
+    out = model.generate(idx, context, max_new_tokens=params.max_tokens + 1 - len(seq),
                          temperature=params.temperature, top_k=params.top_k,
                          do_sample=params.do_sample, end_token=st.END, pad_token=st.PAD, writer=writer)
-    return st.decode(out[0].cpu().numpy()[1:])
+    new = out[0, len(seq):].cpu().numpy()
+    end = np.flatnonzero(new == st.END)
+    new = new[:end[0]] if end.size else new
+    tokens = [w[w != st.WORD] for w in np.split(new[new != st.PAD], np.flatnonzero(new[new != st.PAD] == st.WORD))]
+    tokens = [t for t in tokens if len(t)]
+    return [st.decode_word(t) for t in tokens], tokens
 
 
 def draw(ax, points, color="b", linewidth=1.3):
@@ -1004,28 +994,21 @@ def plot_paragraph(words, params=None, figsize=(12, 8), dpi=200, show_indices=Fa
 
 def generate_paragraph(model, dataset, text, params=None, words=None, redo=None):
     params = params or SampleParams()
-    fits = max(1, (params.max_tokens - 1) // 120)
-    if params.n_at_a_time > fits:
-        print(f"  n_at_a_time={params.n_at_a_time} likely overflows a "
-              f"{params.max_tokens}-token block; using {fits}")
-        params = replace(params, n_at_a_time=fits)
     torch.manual_seed(params.seed)
     prompt_words = text.strip().split()
-
-    def for_chunk(chunk):
-        out = generate(model, dataset, " ".join(chunk), params)[:len(chunk)]
-        if params.verbose:
-            print(f"  {' '.join(chunk)}")
-        return out + [np.zeros((0, 3))] * (len(chunk) - len(out))
-
-    if words is None:
-        words = []
-        for i in range(0, len(prompt_words), params.n_at_a_time):
-            words += for_chunk(prompt_words[i:i + params.n_at_a_time])
-    else:
+    if words is not None:
         for i in redo or []:
-            if i < len(prompt_words):
-                words[i] = for_chunk([prompt_words[i]])[0]
+            words[i] = (generate(model, dataset, prompt_words[i], params)[0] + [np.zeros((0, 3))])[0]
+        return words
+    words, prior, prior_tokens = [], [], []
+    for i in range(0, len(prompt_words), params.n_at_a_time):
+        chunk = prompt_words[i:i + params.n_at_a_time]
+        if len(" ".join(prior + chunk).encode()) > dataset.cfg.max_text_length:
+            prior, prior_tokens = [], []
+        out, tokens = generate(model, dataset, " ".join(prior + chunk), params, prior_tokens)
+        words += (out + [np.zeros((0, 3))] * len(chunk))[:len(chunk)]
+        complete = params.burn_in and len(tokens) >= len(chunk)
+        prior, prior_tokens = (chunk[-params.burn_in:], tokens[:len(chunk)][-params.burn_in:]) if complete else ([], [])
     return words
 
 
@@ -1107,7 +1090,7 @@ def train(data_cfg, model_cfg, train_cfg):
                   f"(checkpoint value, command-line value)")
         data_cfg = resumed_cfg
 
-    torch.manual_seed(data_cfg.seed)
+    torch.manual_seed(data_cfg.seed + train_cfg.train_seed)
     train_dataset, test_dataset, stroke_tok, char_tok = create_datasets(
         data_cfg, merges=ckpt["merges"] if ckpt else None, writers=ckpt.get("writers") if ckpt else None)
     model_cfg.n_writers = len(train_dataset.writers)
@@ -1137,8 +1120,7 @@ def train(data_cfg, model_cfg, train_cfg):
                          name=train_cfg.wandb_run_name or None,
                          config={**asdict(data_cfg), **asdict(model_cfg), **asdict(train_cfg)})
 
-    batches = infinite_batches(train_dataset, train_cfg.batch_size, seed=data_cfg.seed + step,
-                               workers=train_cfg.workers)
+    batches = infinite_batches(train_dataset, train_cfg.batch_size, seed=data_cfg.seed + step + 10_000 * train_cfg.train_seed)
 
     step_model = torch.compile(model) if train_cfg.compile and device != "cpu" else model
     t_start = t_print = time.time()
@@ -1206,7 +1188,7 @@ def sample_command(args):
     device = resolve_device(args.device)
     model, dataset, cfg, _ = load_for_sampling(args.checkpoint, device)
     params = SampleParams(temperature=args.temperature, top_k=args.top_k,
-                          do_sample=not args.greedy, n_at_a_time=args.n_at_a_time,
+                          do_sample=not args.greedy, n_at_a_time=args.n_at_a_time, burn_in=args.burn_in,
                           max_tokens=cfg.max_seq_length - 1, seed=args.seed, writer=args.writer)
     words = generate_paragraph(model, dataset, args.text, params)
     if args.redo:
@@ -1257,6 +1239,8 @@ def main(argv=None):
     sample_p.add_argument("--top_k", type=int, default=None)
     sample_p.add_argument("--greedy", action="store_true")
     sample_p.add_argument("--n_at_a_time", type=int, default=2)
+    sample_p.add_argument("--burn_in", type=int, default=1,
+                          help="previously written words carried into each next chunk, for a steady hand")
     sample_p.add_argument("--redo", type=str, default="",
                           help="comma-separated word indices to regenerate")
     sample_p.add_argument("--seed", type=int, default=42)

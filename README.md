@@ -83,7 +83,9 @@ it off). Test data is never augmented.
 **Writers.** Each writer gets a learned style vector that sits in front of the
 prompt. 10% of the time, training swaps in a shared "unknown writer" vector.
 
-**Long text** is written two words per model call and wrapped into lines:
+**Long text** is written two words per model call and wrapped into lines.
+Each call continues from the last word already written (`--burn_in 1`), so the
+hand stays steady from chunk to chunk:
 
 ![iliad](static/iliad.png)
 
@@ -138,6 +140,7 @@ utils.py      training presets
 tools/        datasets.py (public corpora), ink.py (image tracing)
 collect.html  data collection page
 tests/        pytest suite
+EXPERIMENTS.md  measured results behind the defaults
 deprecated/   Quick, Draw! and icon tools, not maintained
 ```
 

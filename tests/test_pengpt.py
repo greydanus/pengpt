@@ -7,7 +7,7 @@ from pengpt import (augment_params, DataConfig, ModelConfig, PenTransformer, Pen
                     ScribeTokenizer, ByteTokenizer, learn_merges,
                     IGNORE_INDEX, prepare_word, resample,
                     save_checkpoint, load_checkpoint, attach_pen_deltas,
-                    bresenham_steps, DIRECTIONS, DOWN, UP, _walk)
+                    bresenham_steps, DIRECTIONS, DOWN, UP, _stroke_spans)
 
 
 def make_word(n=40, seed=0):
@@ -342,21 +342,30 @@ def test_checkpoint_roundtrip(tiny_dataset, tmp_path):
     assert torch.allclose(a, b)
 
 
-def _walk_reference(grid_xy):
-    out = []
-    for (x0, y0), (x1, y1) in zip(grid_xy[:-1], grid_xy[1:]):
-        if x0 != x1 or y0 != y1:
-            out.extend(int(t) for t in bresenham_steps(x0, y0, x1, y1))
+def _encode_reference(points, grid):
+    xy = np.rint(points[:, :2] / grid).astype(int)
+    out, prev = [], (0, 0)
+    for start, stop in _stroke_spans(points[:, 2]):
+        path = [prev] + [tuple(p) for p in xy[start:stop]]
+        for i, ((x0, y0), (x1, y1)) in enumerate(zip(path[:-1], path[1:])):
+            if (x0, y0) != (x1, y1):
+                out.extend(int(t) for t in bresenham_steps(x0, y0, x1, y1))
+            if i == 0:
+                out.append(DOWN)
+        out.append(UP)
+        prev = path[-1]
     return out
 
 
 def test_vectorized_tokenizer_matches_reference():
     rng = np.random.default_rng(7)
-    for trial in range(30):
-        steps = rng.integers(-1, 2, size=(rng.integers(2, 60), 2))
-        steps[rng.random(len(steps)) < 0.1] *= rng.integers(2, 9)
-        grid = np.cumsum(steps, axis=0)
-        assert _walk(grid) == _walk_reference(grid), trial
+    st = ScribeTokenizer(grid=0.02)
+    for trial in range(200):
+        k = rng.integers(1, 60)
+        steps = rng.integers(-1, 2, size=(k, 2)) * 0.02
+        steps[rng.random(k) < 0.1] *= rng.integers(2, 9)
+        points = np.c_[np.cumsum(steps, axis=0), rng.random(k) < 0.8]
+        assert st.encode_base(points).tolist() == _encode_reference(points, st.grid), trial
 
 
 def test_token_deltas_track_pen_position():
@@ -500,8 +509,12 @@ def test_load_for_sampling_and_generate(tmp_path, tiny_dataset):
     save_checkpoint(str(tmp_path / "m.pt"), model, asdict(cfg), st.merges, writers=["", "sam"])
     loaded, ds, _, _ = load_for_sampling(str(tmp_path / "m.pt"))
     assert writer_id(ds, "sam") == 1 and writer_id(ds, "") == 0
-    words = generate(loaded, ds, "ab", SampleParams(max_tokens=30, writer="sam"))
-    assert isinstance(words, list)
+    words, tokens = generate(loaded, ds, "ab", SampleParams(max_tokens=30, writer="sam"))
+    assert isinstance(words, list) and len(words) == len(tokens)
+    from pengpt import generate_paragraph
+    para = generate_paragraph(loaded, ds, "ab cd ef ga bc", SampleParams(max_tokens=200, writer="sam", verbose=False,
+                                                                         n_at_a_time=1, burn_in=1))
+    assert len(para) == 5
 
 
 def fake_words(n=60, x_height=0.12, baseline=0.0, text="mann", seed=0):
@@ -524,15 +537,3 @@ def test_check_data_accepts_style_and_rejects_bad_scale():
     caps = fake_words(x_height=0.2, text="MANN")
     assert check_data(caps, 0.02)[0]["x_height"] is None and check_data(caps, 0.02)[1] == []
     assert check_data(fake_words(x_height=2.0, text="MANN"), 0.02)[1]
-
-
-def test_worker_batches_match_single_process():
-    from pengpt import infinite_batches
-    cfg = DataConfig(max_seq_length=256, max_words=2, max_text_length=20)
-    words = [make_word(seed=s) for s in range(20)]
-    st = ScribeTokenizer(grid=0.02)
-    ds = PenDataset(words, [f"w{s}" for s in range(20)], np.arange(20), st, ByteTokenizer(), cfg, length=100)
-    inline, pooled = infinite_batches(ds, 4, seed=7, workers=0), infinite_batches(ds, 4, seed=7, workers=2)
-    for _ in range(6):
-        assert all((a == b).all() for a, b in zip(next(inline), next(pooled)))
-    pooled.close()
