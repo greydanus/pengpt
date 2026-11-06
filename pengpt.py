@@ -54,7 +54,7 @@ class ModelConfig:
 
 @dataclass
 class TrainConfig:
-    steps: int = 20_000
+    steps: int = 12_000
     batch_size: int = 32
     learning_rate: float = 6e-3
     matrix_lr: float = 0.04

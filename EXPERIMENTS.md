@@ -167,7 +167,7 @@ The 4k schedule (200-step warmup, linear decay to 0 over the last 80%) repeated 
 | 20k | 1.8531 | 1.8664 | 0.5891 |
 | 24k | 1.8424 | 1.8717 | 0.5904 |
 
-Held-out scores bottom out after three cycles (12k steps, ~6.5 min) and rise for three cycles after, while train loss keeps falling: overfitting starts around 12k steps at these defaults. Three cycles beat the single 20k-step run (0.5943) by 0.008. Not yet tested: a single 12k-step decay, to tell whether the restarts or just the length did it.
+Held-out scores bottom out after three cycles (12k steps, ~6.5 min) and rise for three cycles after, while train loss keeps falling: overfitting starts around 12k steps at these defaults. Three cycles beat the single 20k-step run (0.5943) by 0.008. A single 12k-step run with one decay did better still: test loss 1.8551, score **0.5849**, in 6.1 min. The length mattered, not the restarts, so the default is now 12,000 steps; `--steps 4000` stays the quick-experiment setting.
 
 ## Grid resolution (Nov 6)
 

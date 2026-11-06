@@ -2,7 +2,7 @@
 
 A small transformer that writes handwriting from text. It is a ground-up
 rewrite of [cursivetransformer](https://github.com/greydanus/cursivetransformer)
-([paper](https://arxiv.org/abs/2504.00051)) that trains in about 10 minutes on
+([paper](https://arxiv.org/abs/2504.00051)) that trains in about 6 minutes on
 an M-series laptop.
 
 ![hero](static/hero.png)
@@ -22,6 +22,10 @@ python pengpt.py sample --checkpoint out/cursive/best.pt --greedy --text "The qu
 Each run writes to `out/<name>/`: `best.pt` (lowest test loss), `last.pt` (latest
 eval; resume with `--resume out/cursive/last.pt`), and `progress/`, one image
 every `--sample_every` steps and at the end. Any flag overrides the preset. Add `--wandb` to log to Weights & Biases.
+
+The default 12,000 steps is the full run: held-out scores bottom out there and
+get worse with longer training. For quick experiments, `--steps 4000` (~2
+minutes) gets most of the way there; the A/B tests in EXPERIMENTS.md use it.
 
 Sampling tips: `--greedy` spells unfamiliar words much better than sampling.
 To regenerate misspelled words, use `--show_indices` to find their index, then
