@@ -128,7 +128,7 @@ python pengpt.py sample --checkpoint sketch.pt --text "a cat|a bicycle" --n 8
 | `cpu` | `cursive`, 4,000 steps, not compiled | Quick, Draw!, 4 layers, 128 wide, 2,000 steps (not measured) |
 | `m5` | `cursive`: one writer, 400k parameters, about 6 minutes | Quick, Draw!, 8 layers, 256 wide, 6,000 steps (not measured) |
 | `a100` | `mix`: seven sources, 5.2M parameters, 60,000 steps, 25 minutes | `quickdraw`: 12 layers, 384 wide, 28.9M parameters, 14,400 steps |
-| `8xa100` | `mix` on eight GPUs, about 5 minutes; the released model adds `--n_embd 208 --steps 45000` (6.1M parameters) | `sketch`: every source, told SigLIP 2 vectors, 54M parameters, 18,000 steps, 73 minutes: the released model |
+| `8xa100` | `mix` on eight GPUs, about 5 minutes; the released model adds `--n_embd 208 --steps 45000` (6.1M parameters) and takes about 8 minutes | `sketch`: every source, told SigLIP 2 vectors, 54M parameters, 18,000 steps, about 34 minutes: the released model, kept at step 16,500 (31 minutes) |
 | `h100`, `8xh100` | as `a100` and `8xa100` | as `a100` and `8xa100` |
 
 
