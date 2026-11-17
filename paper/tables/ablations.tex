@@ -1,0 +1,39 @@
+Graves-style LSTM, our tokens & 0.745 & $+0.029$ & 0.806 & 2.2 & 49\% \\
+\textbf{PenGPT (base)} & \textbf{0.716{\tiny$\,\pm$0.001}} &  & \textbf{0.786{\tiny$\,\pm$0.001}} & \textbf{1.9{\tiny$\,\pm$0.1}} & \textbf{54\%{\tiny$\,\pm$1}} \\
+\midrule
+no BPE merges & 0.706 & $-0.010$ & 0.791 & -- & 55\% \\
+ScribeTokens BPE (60x tokens, 3x params, 4x mem) & 0.714 & $-0.001$ & 0.792 & 1.9 & 53\% \\
+no pen position & 0.716 & $+0.001$ & 0.786 & 1.9 & 52\% \\
+no augmentation & 0.744 & $+0.028$ & 0.804 & 2.0 & 52\% \\
+no writer vectors & 0.768 & $+0.053$ & 0.787 & 1.8 & 54\% \\
+one word a sequence & 0.724 & $+0.009$ & 1.157 & 6.0 & 52\% \\
+\midrule
+1.9M param. (63\% smaller) & 0.732 & $+0.016$ & 0.793 & 2.0 & 50\% \\
+11.2M param. (114\% larger) & 0.712 & $-0.004$ & 0.786 & 1.9 & 55\% \\
+a tenth of the words & 0.765 & $+0.050$ & 0.826 & 3.0 & 47\% \\
+without CSAFE & 0.729 & $+0.011$ & 0.813 & 2.2 & 50\% \\
+\midrule
+real held-out ink &  &  &  &  & 66\% \\
+\bottomrule
+\toprule
+\textbf{Drawings} & Score & $\Delta$ & Loss & Labels & Captions \\
+\midrule
+LSTM decoder, our tokens & 0.640 & $+0.049$ & 2.940 & 40.3\% & 19.8\% \\
+\textbf{PenGPT (base)} & \textbf{0.591{\tiny$\,\pm$0.001}} &  & \textbf{2.712{\tiny$\,\pm$0.004}} & \textbf{75.6\%{\tiny$\,\pm$0.6}} & \textbf{43.3\%{\tiny$\,\pm$0.4}} \\
+\midrule
+no pen position & 0.599 & $+0.008$ & 2.747 & 73.9\% & 40.3\% \\
+added pen position only & 0.593 & $+0.002$ & 2.720 & 75.7\% & 44.7\% \\
+rotary pen position only & 0.592 & $+0.001$ & 2.716 & 76.2\% & 40.8\% \\
+no augmentation & 0.604 & $+0.013$ & 2.753 & 3.9\% & 6.2\% \\
+no stroke-order alterations & 0.596 & $+0.005$ & 2.735 & 75.2\% & 42.2\% \\
+no label dropout & 0.591 & $0.000$ & 2.712 & 57.7\%$^\ddagger$ & 32.7\%$^\ddagger$ \\
+no ink and stroke hints & 0.590 & $0.000$ & 2.710 & 76.2\% & 43.5\% \\
+\midrule
+label bytes, no vectors & 0.597 & $+0.006$ & 2.742 & 74.1\% & 0.5\% \\
+picture vectors only & 0.580 & $-0.011$ & 2.659 & 6.1\% & 4.3\% \\
+picture and label vectors & 0.596 & $+0.005$ & 2.737 & 77.5\% & 9.5\% \\
+\midrule
+8 layers, 384 wide & 0.599 & $+0.008$ & 2.750 & 71.0\% & 35.8\% \\
+6 layers, 256 wide & 0.612 & $+0.022$ & 2.813 & 62.2\% & 30.8\% \\
+Quick, Draw! only & 0.522 & $+0.002$ & 2.808 & 73.5\% & 36.7\% \\
+\bottomrule

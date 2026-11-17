@@ -1,0 +1,25 @@
+[project]
+name = "pengpt"
+version = "0.2.0"
+description = "A small transformer that holds a pen: it writes by hand and it draws"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.9"
+dependencies = ["torch>=2.4", "numpy", "matplotlib", "pyarrow"]
+
+[project.optional-dependencies]
+wandb = ["wandb"]
+dev = ["pytest", "Pillow>=10.1", "scipy"]
+words = ["transformers"]
+photo = ["Pillow>=10.1", "scipy", "scikit-image", "anthropic", "sentencepiece"]
+interp = ["umap-learn", "scipy"]
+eval = ["transformers", "Pillow>=10.1"]
+
+[tool.setuptools]
+py-modules = ["pengpt", "graves", "polar", "strokes", "vectors", "utils"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

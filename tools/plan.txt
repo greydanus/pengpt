@@ -1,0 +1,3 @@
+cursive --preset cursive
+mix --preset mix
+quickdraw --preset quickdraw
