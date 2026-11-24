@@ -36,7 +36,7 @@
   svg { display: block; width: 100%; height: auto; }
   svg path { fill: none; stroke-linecap: round; stroke-linejoin: round; }
   #write path { stroke: var(--ink); stroke-width: 0.0135; }
-  #write line { stroke: #e3e9f1; stroke-width: 0.006; }
+  #write line { stroke: #bccadb; stroke-width: 0.008; }
   #draw path { stroke: #111; stroke-width: 0.011; }
   footer { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 10px; color: var(--muted); font-size: 14.5px; }
   footer a { color: var(--link); text-decoration: none; }
@@ -819,7 +819,7 @@ if (typeof document !== 'undefined') {
       make()
     })
     $('save').addEventListener('click', () => {
-      const css = 'line{stroke:#e3e9f1;stroke-width:.006}path{fill:none;stroke:' + ink(hand.value) + ';stroke-width:.0135;stroke-linecap:round;stroke-linejoin:round}'
+      const css = 'line{stroke:#bccadb;stroke-width:.008}path{fill:none;stroke:' + ink(hand.value) + ';stroke-width:.0135;stroke-linecap:round;stroke-linejoin:round}'
       const [, , w, h] = page.getAttribute('viewBox').split(' ').map(Number)
       const out = page.outerHTML.replace('>', ` width="${Math.round(w * 160)}" height="${Math.round(h * 160)}"><style>${css}</style>`)
       const a = Object.assign(document.createElement('a'), {href: URL.createObjectURL(new Blob([out], {type: 'image/svg+xml'})), download: 'hand.svg'})
