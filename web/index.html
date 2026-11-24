@@ -40,6 +40,12 @@
   #draw path { stroke: var(--black); stroke-width: 0.011; }
   footer { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 12px; color: var(--muted); font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; }
   footer a { color: inherit; }
+  main { transition: opacity 0.3s; }
+  main.waiting { opacity: 0.25; }
+  #wait { position: fixed; inset: 0; display: grid; place-content: center; justify-items: center; gap: 18px; pointer-events: none; font-style: italic; }
+  #wait i { width: 44px; height: 44px; border: 3px solid #cfc7b6; border-top-color: var(--ink); border-radius: 50%; animation: turn 0.9s linear infinite; }
+  @keyframes turn { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { #wait i { animation-duration: 4s; } }
 </style>
 <main>
   <header>
@@ -64,6 +70,7 @@
   <div id="draw" data-mode="draw"></div>
   <footer><span id="status"></span><a href="https://github.com/greydanus/pengpt">github.com/greydanus/pengpt</a></footer>
 </main>
+<div id="wait" role="status" hidden><i></i><span id="eta"></span></div>
 <script type="module">
   import {spans} from './pen.js'
 
@@ -165,6 +172,12 @@ a snowman with antlers|a turtle with a castle on its back|a duck wearing a top h
                         guidance: +$('guidance').value, ink: +$('ink').value || null})
   }
 
+  function wait(on, said = 'Downloading model weights') {
+    $('wait').hidden = !on
+    document.querySelector('main').classList.toggle('waiting', on)
+    $('eta').textContent = said
+  }
+
   function go(next) {
     if (mode) MODES[mode].text = text.value
     mode = next
@@ -173,23 +186,27 @@ a snowman with antlers|a turtle with a castle on its back|a duck wearing a top h
     for (const a of document.querySelectorAll('nav a')) a.toggleAttribute('aria-current', a.hash === '#' + mode)
     Object.assign(text, {value: MODES[mode].text, placeholder: MODES[mode].ask, ariaLabel: MODES[mode].ask})
     $('about').textContent = MODES[mode].about
+    wait(!MODES[mode].ready)
     if (MODES[mode].ready) return make()
-    status.textContent = 'loading the model…'
+    status.textContent = ''
     if (!MODES[mode].asked) worker.postMessage({...MODES[mode].files, id: mode})
-    MODES[mode].asked = true
+    MODES[mode].asked = MODES[mode].asked || performance.now()
+    MODES[mode].told = 0
   }
 
   worker.onmessage = ({data: m}) => {
     if (m.progress) {
       const owner = Object.values(MODES).find(o => Object.values(o.files).includes(m.progress))
       owner.got = {...owner.got, [m.progress]: [m.got, m.total]}
-      const [got, total] = Object.values(MODES[mode].got || {}).reduce(([a, b], [c, d]) => [a + c, b + d], [0, 0])
-      if (!MODES[mode].ready && total) status.textContent = `loading the model: ${(got / 1e6).toFixed(1)} of ${(total / 1e6).toFixed(1)} MB`
-      return
+      const now = performance.now(), M = MODES[mode], [got, total] = Object.values(M.got || {}).reduce(([a, b], [c, d]) => [a + c, b + d], [0, 0])
+      if (M.ready || !total || now - M.told < 2000 || now - M.asked < 500) return
+      M.told = now
+      return wait(true, `Downloading model weights (takes ~${Math.max(1, Math.round((total - got) / got * (now - M.asked) / 1000))}s)`)
     }
-    if (m.error) return status.textContent = `could not run the model: ${m.error}`
+    if (m.error) return wait(false, status.textContent = `could not run the model: ${m.error}`)
     if (m.ready) {
       MODES[m.id].ready = true
+      if (m.id === mode) wait(false)
       fast = m.fast
       if (m.id === 'write') for (const w of ['sam', ...m.writers.filter(w => w !== 'sam')]) hand.add(new Option(w, w))
       return m.id === mode && make()
