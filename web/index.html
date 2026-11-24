@@ -4,46 +4,45 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PenGPT in your browser</title>
 <style>
-  :root { --paper: #f7f2e8; --edge: #e6dfd0; --rule: #d9e0ea; --ink: #1a237e; --black: #16150f; --text: #2b2a27; --muted: #8a8477; }
+  :root { --ink: #1a237e; --text: #000; --muted: #666; --line: #e8e8e8; --edge: #bbb; --link: #2a7ae2; }
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
-  html { background: #ece6d9; }
-  body { margin: 0; padding: clamp(12px, 4vw, 48px); color: var(--text); font: 16px/1.4 "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif; }
-  main { max-width: 1000px; margin: 0 auto; }
-  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }
-  h1 { font-size: 22px; font-weight: 600; letter-spacing: 0.01em; margin: 0; }
-  header span { color: var(--muted); font-style: italic; }
-  nav { margin-left: auto; display: flex; gap: 16px; font-variant: small-caps; letter-spacing: 0.06em; }
-  nav a { color: var(--muted); text-decoration: none; padding-bottom: 1px; border-bottom: 1.5px solid transparent; }
-  nav a[aria-current] { color: var(--text); border-bottom-color: var(--text); }
-  #text { width: 100%; border: 0; border-bottom: 1.5px solid var(--text); background: transparent; color: var(--text); font: inherit; font-size: 20px;
-          padding: 8px 2px; outline: none; border-radius: 0; }
-  #text:focus { border-bottom-color: var(--ink); }
-  #text::placeholder { color: var(--muted); font-style: italic; }
-  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 22px; margin: 14px 0 18px; font-size: 14px; }
-  label { display: flex; align-items: center; gap: 8px; color: var(--muted); font-variant: small-caps; letter-spacing: 0.06em; }
-  select, button { font: inherit; font-size: 14px; color: var(--text); background: transparent; border: 1px solid #bdb5a4; border-radius: 3px; padding: 4px 10px; }
-  select { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px; padding: 5px 6px; }
-  button { cursor: pointer; }
-  button:hover, select:hover { border-color: var(--text); }
-  a:focus-visible, button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
-  input[type=range] { width: 110px; accent-color: var(--ink); }
-  .sheet { background: var(--paper); border: 1px solid var(--edge); box-shadow: 0 1px 0 #fff inset, 0 10px 30px -18px rgba(60, 45, 20, 0.45); }
-  #write .sheet { padding: clamp(6px, 2vw, 18px); min-height: 220px; }
+  body { margin: 0; padding: clamp(12px, 4vw, 40px); background: #fff; color: var(--text); font: 300 17.5px/1.5 "Roboto", Helvetica, Arial, sans-serif; }
+  .embed body { padding: 1px; }
+  .embed h1, .embed footer a { display: none; }
+  main { max-width: 1000px; margin: 0 auto; transition: opacity 0.3s; }
+  main.waiting { opacity: 0.25; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  h1 { font-size: 30px; font-weight: 300; line-height: 1.1; margin: 0; }
+  header span { color: var(--muted); font-size: 14.5px; }
+  nav { margin-left: auto; display: flex; gap: 6px; }
+  nav a, button, select { font: inherit; font-size: 13px; color: #444; background: #f5f5f5; border: 1px solid var(--edge); border-radius: 4px; padding: 5px 14px;
+                          text-transform: uppercase; text-decoration: none; cursor: pointer; }
+  nav a:hover, button:hover, select:hover { background: var(--line); border-color: #999; }
+  nav a[aria-current] { background: #232323; border-color: #232323; color: #fff; }
+  select { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px; text-transform: none; padding: 6px; }
+  #text { width: 100%; border: 1px solid var(--edge); border-radius: 4px; background: #fff; color: var(--text); font: inherit; padding: 9px 12px; outline: none; }
+  #text:focus { border-color: var(--link); }
+  #text::placeholder { color: #999; }
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 20px; margin: 12px 0 14px; }
+  label { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 14.5px; }
+  a:focus-visible, button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+  input[type=range] { width: 110px; accent-color: var(--link); }
+  .sheet { background: #fff; border: 1px solid #ccc; border-radius: 4px; }
+  #write .sheet { padding: clamp(6px, 2vw, 18px); min-height: 200px; }
   #draw { display: grid; grid-template-columns: repeat(4, 1fr); gap: clamp(8px, 1.6vw, 16px); }
   @media (max-width: 640px) { #draw { grid-template-columns: repeat(2, 1fr); } }
   #draw .sheet { aspect-ratio: 1; }
   svg { display: block; width: 100%; height: auto; }
   svg path { fill: none; stroke-linecap: round; stroke-linejoin: round; }
   #write path { stroke: var(--ink); stroke-width: 0.0135; }
-  #write line { stroke: var(--rule); stroke-width: 0.006; }
-  #draw path { stroke: var(--black); stroke-width: 0.011; }
-  footer { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 12px; color: var(--muted); font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; }
-  footer a { color: inherit; }
-  main { transition: opacity 0.3s; }
-  main.waiting { opacity: 0.25; }
-  #wait { position: fixed; inset: 0; display: grid; place-content: center; justify-items: center; gap: 18px; pointer-events: none; font-style: italic; }
-  #wait i { width: 44px; height: 44px; border: 3px solid #cfc7b6; border-top-color: var(--ink); border-radius: 50%; animation: turn 0.9s linear infinite; }
+  #write line { stroke: #e3e9f1; stroke-width: 0.006; }
+  #draw path { stroke: #111; stroke-width: 0.011; }
+  footer { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 10px; color: var(--muted); font-size: 14.5px; }
+  footer a { color: var(--link); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  #wait { position: fixed; inset: 0; display: grid; place-content: center; justify-items: center; gap: 16px; pointer-events: none; color: #444; }
+  #wait i { width: 44px; height: 44px; border: 3px solid var(--line); border-top-color: var(--link); border-radius: 50%; animation: turn 0.9s linear infinite; }
   @keyframes turn { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { #wait i { animation-duration: 4s; } }
 </style>
@@ -98,7 +97,7 @@ function npy(b) {
 }
 
 async function fetched(url, report = () => {}, range = '') {
-  const r = await fetch(url, range ? {headers: {Range: 'bytes=' + range}} : {}), total = +r.headers.get('content-length') || 0, chunks = []
+  const r = await fetch(url, range ? {headers: {Range: 'bytes=' + range}, cache: 'no-store'} : {}), total = +r.headers.get('content-length') || 0, chunks = []
   if (!r.ok) throw new Error(`${url.split('/').pop()} is not there (${r.status})`)
   for (let reader = r.body.getReader(), got = 0; ;) {
     const {done, value} = await reader.read()
@@ -143,6 +142,17 @@ export async function npz(buffer) {
 
 const tails = {}
 
+async function kept(key, make) {
+  const store = await caches.open('pengpt').catch(() => null), hit = store && await store.match(key)
+  if (hit) return new Uint8Array(await hit.arrayBuffer())
+  const bytes = await make()
+  if (store) {
+    for (const old of await store.keys()) if (old.url.split('=')[0] === new URL(key).href.split('=')[0]) await store.delete(old)
+    store.put(key, new Response(bytes)).catch(() => {})
+  }
+  return bytes
+}
+
 export async function part(url, name, report) {
   const tail = await (tails[url] = tails[url] || fetched(url, (got, total) => total > 65536 && report(got, total), '-65536'))
   const d = directory(tail.bytes), start = tail.size - tail.bytes.length
@@ -150,7 +160,7 @@ export async function part(url, name, report) {
   const list = listing(whole, d.count), mine = list.filter(e => e.name.startsWith(name + '/')), last = Math.max(...mine.map(e => e.at))
   if (!tail.size) return unpack(tail.bytes, 0, mine)
   const from = Math.min(...mine.map(e => e.at)), to = Math.min(d.at, ...list.filter(e => e.at > last).map(e => e.at))
-  return unpack((await fetched(url, report, `${from}-${to - 1}`)).bytes, from, mine)
+  return unpack(await kept(`${url}?${name}=${from}-${to}-${tail.size}`, async () => (await fetched(url, report, `${from}-${to - 1}`)).bytes), from, mine)
 }
 
 export const backend = {
@@ -809,7 +819,7 @@ if (typeof document !== 'undefined') {
       make()
     })
     $('save').addEventListener('click', () => {
-      const css = 'line{stroke:#d9e0ea;stroke-width:.006}path{fill:none;stroke:' + ink(hand.value) + ';stroke-width:.0135;stroke-linecap:round;stroke-linejoin:round}'
+      const css = 'line{stroke:#e3e9f1;stroke-width:.006}path{fill:none;stroke:' + ink(hand.value) + ';stroke-width:.0135;stroke-linecap:round;stroke-linejoin:round}'
       const [, , w, h] = page.getAttribute('viewBox').split(' ').map(Number)
       const out = page.outerHTML.replace('>', ` width="${Math.round(w * 160)}" height="${Math.round(h * 160)}"><style>${css}</style>`)
       const a = Object.assign(document.createElement('a'), {href: URL.createObjectURL(new Blob([out], {type: 'image/svg+xml'})), download: 'hand.svg'})
@@ -822,6 +832,10 @@ if (typeof document !== 'undefined') {
     })
     addEventListener('hashchange', () => go(location.hash === '#draw' ? 'draw' : 'write'))
 
+    if (self !== top) {
+      document.documentElement.classList.add('embed')
+      new ResizeObserver(() => parent.postMessage({pengpt: Math.ceil(document.body.getBoundingClientRect().height)}, '*')).observe(document.body)
+    }
     requestAnimationFrame(frame)
     go(location.hash === '#draw' ? 'draw' : 'write')
 }
