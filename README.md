@@ -201,11 +201,16 @@ JavaScript, reading the same `.npz` files, with one 37-line WebAssembly kernel (
 tokens the numpy pen gives. Handwriting takes about a millisecond a token on a laptop and a drawing about ten.
 
 ```bash
-cd web && for f in hand.npz sketch.npz; do curl -LO https://github.com/greydanus/pengpt/releases/download/models-2026-11-16/$f; done
+cd web && for f in hand.npz sketch.npz words.npz; do curl -LO https://github.com/greydanus/pengpt/releases/download/models-2026-11-16/$f; done
 python -m http.server                                                # then open localhost:8000 to write, localhost:8000/draw.html to draw
 ```
 
-`draw.html` draws the prompts in `prompts.npz`, whose SigLIP 2 vectors were worked out ahead of time.
+`draw.html` draws what is typed. The drawing model is told a SigLIP 2 vector, and SigLIP 2's text half is 375 MB, so the page reads
+typed words with a small stand-in, `words.npz` (26 MB) run by `words.js`: the text tower of TinyCLIP (19M parameters, MIT licence)
+with a linear layer on top, tuned to give SigLIP 2's vector on 100,000 prompts. On prompts held out of that tuning its vector is
+nearest SigLIP 2's own for the same prompt 96% of the time, among 5,500. The 193 prompts in `prompts.npz` carry SigLIP 2's own
+vectors and are used as they are. `tools/words.py` makes the file: `label` works out SigLIP 2's vectors for a file of prompts, `fit`
+tunes the small tower to them (23 minutes on a laptop) and `pack` writes `words.npz`.
 
 ## Packing a model
 
@@ -230,6 +235,7 @@ graves.py     a Graves-style LSTM, the recurrent baseline
 polar.py      the Cursive Transformer's polar tokenizer, for comparison
 inference/    pen.py (both packed models, numpy only), words.py (typed words to a vector), hand.py and tracing.py (a photo to your hand)
 tools/        pack.py, interp.py and figures.py (the figures above), hero.py (the first picture), photo_hands.py, styles.py (48 hands);
+              words.py (the small reader of typed words the browser uses);
               ablate.py, transfer.py, legible.py, guidance.py and captions.py (the paper's measurements);
               train_cloud.sh, train_node.sh, gcp.sh, steptime.py
 paper/        the paper: pengpt.tex, its figures and the numbers behind its tables (paper/README.md); render.sh builds the PDF
