@@ -18,7 +18,9 @@ console.log(JSON.stringify([plain, wanted.map(draw)]))
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="needs node")
-def test_the_browser_pen_draws_the_same_tokens_as_the_numpy_pen_with_and_without_its_wasm_kernel():
-    out = subprocess.run(["node", "--input-type=module", "-e", SCRIPT % os.path.abspath("web/pen.js")], capture_output=True, text=True, check=True)
+def test_the_browser_pen_draws_the_same_tokens_as_the_numpy_pen_with_and_without_its_wasm_kernel(tmp_path):
+    page = open("web/index.html", encoding="utf-8").read()
+    (tmp_path / "pen.mjs").write_text(page[page.index('id="pen">') + 9:page.index("</script>")], encoding="utf-8")
+    out = subprocess.run(["node", "--input-type=module", "-e", SCRIPT % (tmp_path / "pen.mjs")], capture_output=True, text=True, check=True)
     wanted = [w["tokens"] for w in json.load(open("tests/fixtures/tiny.model.json"))]
     assert json.loads(out.stdout) == [wanted, wanted]

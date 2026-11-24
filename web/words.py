@@ -238,11 +238,18 @@ def pack(args):
     print(f"{args.out}: {os.path.getsize(args.out) / 1e6:.1f} MB")
 
 
+def bundle(args):
+    from pen import fetch
+    arrays = {f"{name}/{k}": v for name in ("hand", "sketch", "words") for z in [np.load(fetch(getattr(args, name)))] for k, v in z.items()}
+    np.savez_compressed(args.out, **arrays)
+    print(f"{args.out}: {os.path.getsize(args.out) / 1e6:.1f} MB")
+
+
 def main():
     p = argparse.ArgumentParser(description="a small reader of typed words for the browser: a TinyCLIP text tower taught to give the SigLIP 2 vector a drawing model is "
                                             "told. prompts writes a file of prompts, a line each: half from templates over a list of things and the ways a drawing "
                                             "is asked for, half captions by people; label works out the big model's vectors for them; fit teaches the small one "
-                                            "to match them; pack writes the file pen.js reads")
+                                            "to match them; pack writes words.npz; bundle puts it in one file with the two pens, which is what the page reads")
     sub = p.add_subparsers(dest="command", required=True)
     a = sub.add_parser("prompts")
     a.add_argument("--n", type=int, default=100_000)
@@ -267,9 +274,13 @@ def main():
     a.add_argument("--bits", type=int, default=6)
     a.add_argument("--table", type=int, default=4, help="bits for the table of token vectors, most of the file")
     a.add_argument("--out", default="words.npz")
+    a = sub.add_parser("bundle")
+    for name in ("hand", "sketch", "words"):
+        a.add_argument(f"--{name}", default=f"{name}.npz", help="downloaded from the GitHub release if it is not there")
+    a.add_argument("--out", default="web/pengpt.npz")
     args = p.parse_args()
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    {"prompts": corpus, "label": label, "fit": fit, "pack": pack}[args.command](args)
+    {"prompts": corpus, "label": label, "fit": fit, "pack": pack, "bundle": bundle}[args.command](args)
 
 
 if __name__ == "__main__":
