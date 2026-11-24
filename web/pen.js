@@ -23,6 +23,17 @@ function npy(b) {
   return {data: descr === '<i8' ? Int32Array.from(data, Number) : data, shape}
 }
 
+async function fetched(url, report = () => {}) {
+  const r = await fetch(url), total = +r.headers.get('content-length') || 0, chunks = []
+  if (!r.ok) throw new Error(`${url.split('/').pop()} is not there (${r.status})`)
+  for (let reader = r.body.getReader(), got = 0; ;) {
+    const {done, value} = await reader.read()
+    if (done) return new Blob(chunks).arrayBuffer()
+    chunks.push(value)
+    report(got += value.length, total)
+  }
+}
+
 export async function npz(buffer) {
   const b = new Uint8Array(buffer), v = new DataView(buffer), out = {}
   let end = b.length - 22
@@ -72,6 +83,7 @@ export async function accelerate(pen) {
     bytes.set(W.q, W.p = p)
     floats.set(W.s, (W.sp = (p + W.q.length + 3) & ~3) >> 2)
     p = W.sp + 4 * W.r
+    delete W.q
   }
   const js = backend.js = backend.js || backend.matvec
   backend.matvec = (W, x) => {
@@ -87,8 +99,8 @@ export async function accelerate(pen) {
 const matvec = (W, x) => backend.matvec(W, x)
 
 function row(W, i) {
-  const out = new Float32Array(W.c), o = i * W.c
-  for (let j = 0; j < W.c; j++) out[j] = W.q[o + j] * W.s[i]
+  const q = W.q ? W.q.subarray(i * W.c, (i + 1) * W.c) : new Int8Array(simd.memory.buffer, W.p + i * W.c, W.c), out = new Float32Array(W.c)
+  for (let j = 0; j < W.c; j++) out[j] = q[j] * W.s[i]
   return out
 }
 
@@ -164,8 +176,8 @@ const tick = () => new Promise(done => {
 
 export class Pen {
 
-  static async load(url) {
-    const pen = new Pen(await npz(await (await fetch(url)).arrayBuffer()))
+  static async load(url, report) {
+    const pen = new this(await npz(await fetched(url, report)))
     return accelerate(pen).catch(() => pen)
   }
 
@@ -398,61 +410,127 @@ export function spans(p) {
   return out
 }
 
-export function layout(words, lineWidth = 8, lineHeight = 0.55, space = 0.16) {
-  const placed = []
-  let x = 0, y = 0
-  for (const p of words) {
-    if (!p.length) continue
-    let lo = Infinity, hi = -Infinity
-    for (let i = 0; i < p.length; i += 3) {
-      lo = Math.min(lo, p[i])
-      hi = Math.max(hi, p[i])
-    }
-    if (x > 0 && x + hi - lo > lineWidth) [x, y] = [0, y + lineHeight]
-    placed.push(p.map((u, i) => i % 3 === 0 ? u - lo + x : i % 3 === 1 ? u + y : u))
-    x += hi - lo + space
-  }
-  return placed
+const SPLIT = /'s|'t|'re|'ve|'m|'ll|'d|\p{L}+|\p{N}|[^\s\p{L}\p{N}]+/gu
+const BYTES = (() => {
+  const seen = [...Array(256).keys()].filter(b => (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || b >= 174)
+  let n = 0
+  return Array.from({length: 256}, (_, b) => String.fromCharCode(seen.includes(b) ? b : 256 + n++))
+})()
+
+function erf(x) {
+  const t = 1 / (1 + 0.3275911 * Math.abs(x))
+  const y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x)
+  return x < 0 ? -y : y
 }
 
-export function svg(words, scale = 160, pad = 0.3, stroke = 2.2, color = '#1a237e') {
-  let lo = [Infinity, Infinity], hi = [-Infinity, -Infinity]
-  for (const p of words) for (let i = 0; i < p.length; i += 3) for (const k of [0, 1]) {
-    lo[k] = Math.min(lo[k], p[i + k] - pad)
-    hi[k] = Math.max(hi[k], p[i + k] + pad)
+function norm(x, weight, bias, eps) {
+  const n = x.length, out = new Float32Array(n)
+  let mean = 0, v = 0
+  for (let i = 0; i < n; i++) mean += x[i] / n
+  for (let i = 0; i < n; i++) v += (x[i] - mean) ** 2 / n
+  const k = 1 / Math.sqrt(v + eps)
+  for (let i = 0; i < n; i++) out[i] = (x[i] - mean) * k * weight[i] + bias[i]
+  return out
+}
+
+export class Words {
+
+  static load = Pen.load
+
+  constructor(z) {
+    Object.assign(this, JSON.parse(z.meta.data[0]))
+    const w = this.w = {}, t = JSON.parse(new TextDecoder().decode(z.tokenizer.data))
+    for (const [k, a] of Object.entries(z)) {
+      if (['meta', 'tokenizer'].includes(k) || k.endsWith('.scale')) continue
+      w[k] = a.shape.length === 2 ? {q: a.data, s: z[k + '.scale'].data, r: a.shape[0], c: a.shape[1]} : a.data
+    }
+    this.ids = new Map(t.vocab.map((token, i) => [token, i]))
+    this.ranks = new Map(t.merges.map((pair, i) => [pair, i]))
   }
-  const paths = words.flatMap(p => spans(p).map(([a, b]) => {
-    const xy = Array.from({length: b - a}, (_, i) => [(p[3 * (a + i)] - lo[0]) * scale, (p[3 * (a + i) + 1] - lo[1]) * scale])
-    if (b - a === 1) xy.push([xy[0][0] + 0.01, xy[0][1] + 0.01])
-    return '<path d="M' + xy.map(([u, v]) => `${u.toFixed(1)} ${v.toFixed(1)}`).join(' L') + '"/>'
-  }))
-  const [W, H] = [0, 1].map(k => ((hi[k] - lo[k]) * scale).toFixed(0))
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}"><rect width="100%" height="100%" fill="white"/>` +
-    `<g fill="none" stroke="${color}" stroke-width="${stroke}" stroke-linecap="round" stroke-linejoin="round">${paths.join('')}</g></svg>`
+
+  tokens(text) {
+    const out = [this.bos]
+    for (const word of text.normalize('NFC').replace(/\s+/g, ' ').toLowerCase().match(SPLIT) || []) {
+      const s = [...new TextEncoder().encode(word)].map(b => BYTES[b])
+      s[s.length - 1] += '</w>'
+      for (;;) {
+        let best = Infinity, at = -1
+        for (let i = 0; i < s.length - 1; i++) {
+          const r = this.ranks.get(s[i] + ' ' + s[i + 1])
+          if (r < best) [best, at] = [r, i]
+        }
+        if (at < 0) break
+        const [a, b] = [s[at], s[at + 1]]
+        for (let i = 0; i < s.length - 1; i++) if (s[i] === a && s[i + 1] === b) s.splice(i, 2, a + b)
+      }
+      out.push(...s.map(u => this.ids.get(u) ?? this.eos))
+    }
+    return [...out.slice(0, this.positions - 1), this.eos]
+  }
+
+  linear(name, x) {
+    const out = matvec(this.w[name + '.weight'], x), b = this.w[name + '.bias']
+    for (let i = 0; i < out.length; i++) out[i] += b[i]
+    return out
+  }
+
+  encode(text) {
+    const w = this.w, ids = this.tokens(text), C = this.width, H = this.n_head, hd = C / H
+    let x = ids.map((id, t) => {
+      const e = row(w['embeddings.token_embedding.weight'], id)
+      add(e, row(w['embeddings.position_embedding.weight'], t))
+      return e
+    })
+    for (let l = 0; l < this.n_layer; l++) {
+      const p = `encoder.layers.${l}.`
+      const h = x.map(u => norm(u, w[p + 'layer_norm1.weight'], w[p + 'layer_norm1.bias'], this.eps))
+      const [q, k, v] = ['q', 'k', 'v'].map(n => h.map(u => this.linear(`${p}self_attn.${n}_proj`, u)))
+      x = x.map((u, t) => {
+        const a = new Float32Array(C)
+        for (let j = 0; j < H; j++) {
+          const s = Float32Array.from({length: t + 1}, (_, i) => {
+            let dot = 0
+            for (let d = j * hd; d < (j + 1) * hd; d++) dot += q[t][d] * k[i][d]
+            return dot * hd ** -0.5
+          })
+          const top = Math.max(...s)
+          let total = 0
+          for (let i = 0; i <= t; i++) total += s[i] = Math.exp(s[i] - top)
+          for (let i = 0; i <= t; i++) for (let d = j * hd; d < (j + 1) * hd; d++) a[d] += s[i] / total * v[i][d]
+        }
+        const y = this.linear(p + 'self_attn.out_proj', a).map((o, d) => o + u[d])
+        const m = this.linear(p + 'mlp.fc1', norm(y, w[p + 'layer_norm2.weight'], w[p + 'layer_norm2.bias'], this.eps))
+        for (let d = 0; d < m.length; d++) m[d] *= 0.5 * (1 + erf(m[d] / Math.SQRT2))
+        return this.linear(p + 'mlp.fc2', m).map((o, d) => o + y[d])
+      })
+    }
+    const out = this.linear('head', norm(x[x.length - 1], w['final_layer_norm.weight'], w['final_layer_norm.bias'], this.eps))
+    const length = Math.hypot(...out)
+    return out.map(u => u / length)
+  }
 }
 
 if (typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScope) {
-  let pen, job = 0
+  const held = {}, said = new Map()
+  let job = 0
+  const load = (url, Kind) => held[url] = held[url] || Kind.load(url, (got, total) => postMessage({progress: url, got, total}))
   self.onmessage = async ({data: m}) => {
-    if (m.load) {
-      pen = await Pen.load(m.load)
-      postMessage({ready: true, writers: pen.writers.slice(1), vector: pen.vector, fast: !!simd})
-      const words = m.words && await (await import('./words.js')).Words.load(m.words).catch(() => null), said = new Map()
-      if (words) {
-        pen.encoder = text => said.get(text) || said.set(text, words.encode(text)).get(text)
-        postMessage({words: true})
+    try {
+      const id = ++job, [pen, words] = await Promise.all([load(m.model, Pen), m.words && load(m.words, Words)])
+      if (words) pen.encoder = text => said.get(text) || said.set(text, words.encode(text)).get(text)
+      if (m.text === undefined) return postMessage({id: m.id, ready: true, writers: pen.writers.slice(1), fast: !!simd})
+      const t0 = performance.now(), rng = mulberry(m.seed || 0)
+      for (let k = 0; k < (m.draw || 1); k++) {
+        const made = m.draw ? pen.draw(m.text, m.source, m.temperature, m.topK, rng, m.guidance, m.ink, m.strokes)
+          : pen.write(m.text, m.writer, m.temperature, m.topK, m.seed)
+        for await (const points of made) {
+          if (id !== job) return
+          postMessage({id: m.id, k, points}, [points.buffer])
+        }
       }
-      return
+      postMessage({id: m.id, done: true, ms: performance.now() - t0})
+    } catch (e) {
+      postMessage({id: m.id, error: e.message})
     }
-    const id = ++job, t0 = performance.now(), rng = mulberry(m.seed || 0)
-    for (let k = 0; k < (m.draw || 1); k++) {
-      const made = m.draw ? pen.draw(m.text, m.source, m.temperature, m.topK, rng, m.guidance, m.ink, m.strokes)
-        : pen.write(m.text, m.writer, m.temperature, m.topK, m.seed)
-      for await (const points of made) {
-        if (id !== job) return
-        postMessage({id: m.id, k, points}, [points.buffer])
-      }
-    }
-    postMessage({id: m.id, done: true, ms: performance.now() - t0})
   }
 }

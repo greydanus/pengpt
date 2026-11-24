@@ -2,16 +2,20 @@
 <html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PenGPT: handwriting in your browser</title>
+<title>PenGPT in your browser</title>
 <style>
-  :root { --paper: #f7f2e8; --edge: #e6dfd0; --rule: #d9e0ea; --ink: #1a237e; --text: #2b2a27; --muted: #8a8477; }
+  :root { --paper: #f7f2e8; --edge: #e6dfd0; --rule: #d9e0ea; --ink: #1a237e; --black: #16150f; --text: #2b2a27; --muted: #8a8477; }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   html { background: #ece6d9; }
   body { margin: 0; padding: clamp(12px, 4vw, 48px); color: var(--text); font: 16px/1.4 "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif; }
   main { max-width: 1000px; margin: 0 auto; }
   header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }
   h1 { font-size: 22px; font-weight: 600; letter-spacing: 0.01em; margin: 0; }
   header span { color: var(--muted); font-style: italic; }
+  nav { margin-left: auto; display: flex; gap: 16px; font-variant: small-caps; letter-spacing: 0.06em; }
+  nav a { color: var(--muted); text-decoration: none; padding-bottom: 1px; border-bottom: 1.5px solid transparent; }
+  nav a[aria-current] { color: var(--text); border-bottom-color: var(--text); }
   #text { width: 100%; border: 0; border-bottom: 1.5px solid var(--text); background: transparent; color: var(--text); font: inherit; font-size: 20px;
           padding: 8px 2px; outline: none; border-radius: 0; }
   #text:focus { border-bottom-color: var(--ink); }
@@ -22,38 +26,68 @@
   select { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px; padding: 5px 6px; }
   button { cursor: pointer; }
   button:hover, select:hover { border-color: var(--text); }
-  button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
-  input[type=range] { width: 120px; accent-color: var(--ink); }
-  .sheet { background: var(--paper); border: 1px solid var(--edge); box-shadow: 0 1px 0 #fff inset, 0 10px 30px -18px rgba(60, 45, 20, 0.45); padding: clamp(6px, 2vw, 18px); min-height: 220px; }
+  a:focus-visible, button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+  input[type=range] { width: 110px; accent-color: var(--ink); }
+  .sheet { background: var(--paper); border: 1px solid var(--edge); box-shadow: 0 1px 0 #fff inset, 0 10px 30px -18px rgba(60, 45, 20, 0.45); }
+  #write .sheet { padding: clamp(6px, 2vw, 18px); min-height: 220px; }
+  #draw { display: grid; grid-template-columns: repeat(4, 1fr); gap: clamp(8px, 1.6vw, 16px); }
+  @media (max-width: 640px) { #draw { grid-template-columns: repeat(2, 1fr); } }
+  #draw .sheet { aspect-ratio: 1; }
   svg { display: block; width: 100%; height: auto; }
-  svg .rule { stroke: var(--rule); stroke-width: 0.006; }
-  svg .ink { fill: none; stroke: var(--ink); stroke-width: 0.0135; stroke-linecap: round; stroke-linejoin: round; }
-  footer { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 10px; color: var(--muted); font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; }
+  svg path { fill: none; stroke-linecap: round; stroke-linejoin: round; }
+  #write path { stroke: var(--ink); stroke-width: 0.0135; }
+  #write line { stroke: var(--rule); stroke-width: 0.006; }
+  #draw path { stroke: var(--black); stroke-width: 0.011; }
+  footer { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 12px; color: var(--muted); font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; }
   footer a { color: inherit; }
 </style>
 <main>
   <header>
     <h1>PenGPT</h1>
-    <span>a 6 MB transformer writing by hand, on your device</span>
+    <span id="about"></span>
+    <nav><a href="#write">write</a><a href="#draw">draw</a></nav>
   </header>
-  <input id="text" value="The quick brown fox jumps over the lazy dog" placeholder="type something to write" maxlength="600" autocomplete="off" spellcheck="false" aria-label="text to write">
-  <div class="controls">
+  <input id="text" maxlength="600" autocomplete="off" spellcheck="false">
+  <div class="controls" data-mode="write">
     <label>hand <select id="hand" aria-label="hand"></select></label>
     <button id="another" type="button">another hand</button>
     <label>neat <input id="loose" type="range" min="0" max="0.7" step="0.05" value="0" aria-label="how loose the writing is"> loose</label>
     <button id="save" type="button">save svg</button>
   </div>
-  <div class="sheet"><svg id="page" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="handwriting"></svg></div>
-  <footer><span id="status">loading the model…</span><span><a href="https://github.com/greydanus/pengpt">github.com/greydanus/pengpt</a></span></footer>
+  <div class="controls" data-mode="draw">
+    <button id="again" type="button">draw again</button>
+    <button id="surprise" type="button">surprise me</button>
+    <label>loose <input id="guidance" type="range" min="1" max="4" step="0.5" value="2" aria-label="how closely the drawing follows the words"> literal</label>
+    <label>sparse <input id="ink" type="range" min="0" max="14" step="1" value="0" aria-label="how much ink to use; leftmost lets the model choose"> dense</label>
+  </div>
+  <div id="write" data-mode="write"><div class="sheet"><svg id="page" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="handwriting"></svg></div></div>
+  <div id="draw" data-mode="draw"></div>
+  <footer><span id="status"></span><a href="https://github.com/greydanus/pengpt">github.com/greydanus/pengpt</a></footer>
 </main>
 <script type="module">
   import {spans} from './pen.js'
 
-  const $ = id => document.getElementById(id), NS = 'http://www.w3.org/2000/svg'
-  const page = $('page'), text = $('text'), hand = $('hand'), loose = $('loose'), status = $('status')
+  const $ = id => document.getElementById(id), NS = 'http://www.w3.org/2000/svg', file = name => new URL(name, import.meta.url).href
+  const MODES = {
+    write: {files: {model: file('hand.npz')}, text: 'The quick brown fox jumps over the lazy dog', ask: 'type something to write',
+            about: 'a 6 MB transformer writing by hand, on your device'},
+    draw: {files: {model: file('sketch.npz'), words: file('words.npz')}, text: 'a penguin wearing a top hat', ask: 'what should it draw?',
+           about: 'a 50 MB transformer drawing what you ask, on your device'},
+  }
+  const IDEAS = `a cat|a rabbit|a castle|a bicycle|a sunflower|a tennis racket|a teapot with a face|a snail on wheels|an elephant with wings
+a mushroom house|a pumpkin with cat ears|an owl wearing glasses|a whale on wheels|a lighthouse|a sailboat|a pickup truck|a cactus with legs
+a snowman with antlers|a turtle with a castle on its back|a duck wearing a top hat|a rocket|a giraffe|a windmill|a robot|a dragon`.split(/[|\n]/)
+  const INKS = [[26, 35, 126], [15, 76, 92], [27, 67, 50], [95, 15, 64], [107, 45, 15], [43, 42, 39]]
+  const PAD = 0.25, TOP = 0.42, LINE = 0.55, SPACE = 0.16, N = 4
+  const page = $('page'), text = $('text'), hand = $('hand'), status = $('status')
   const worker = new Worker(new URL('./pen.js', import.meta.url), {type: 'module'})
-  const PAD = 0.25, TOP = 0.42, LINE = 0.55, SPACE = 0.16
-  let run = 0, shown = [], before = [], queue = [], x = 0, row = 0, width = 8, fast = false, timer = 0, last = 0
+  const sheets = Array.from({length: N}, () => {
+    const div = $('draw').appendChild(Object.assign(document.createElement('div'), {className: 'sheet'}))
+    div.innerHTML = '<svg viewBox="-0.62 -0.62 1.24 1.24" role="img"></svg>'
+    return div.firstChild
+  })
+  let mode, run = 0, seed = 0, timer = 0, last = 0, fast = false
+  let shown = [], before = [], queue = [], x = 0, row = 0, width = 8
 
   function el(name, attrs, parent = page) {
     const e = document.createElementNS(NS, name)
@@ -61,20 +95,28 @@
     return parent.appendChild(e)
   }
 
+  function path(points) {
+    return 'M' + points.map(([u, v]) => `${u.toFixed(3)} ${v.toFixed(3)}`).join(' L') + (points.length === 1 ? ' l0.001 0' : '')
+  }
+
+  function strokes(p, dx = 0, dy = 0) {
+    return spans(p).map(([a, b]) => Array.from({length: b - a}, (_, i) => [p[3 * (a + i)] + dx, p[3 * (a + i) + 1] + dy]))
+  }
+
+  function ink(writer) {
+    let h = 0
+    for (const c of writer) h = (h * 31 + c.charCodeAt(0)) % 9973
+    const t = h / 9973 * INKS.length, a = INKS[t | 0], b = INKS[((t | 0) + 1) % INKS.length]
+    return `rgb(${a.map((u, i) => Math.round(u + (b[i] - u) * (t % 1)))})`
+  }
+
   function rule(k) {
-    el('line', {class: 'rule', x1: -PAD, x2: width + PAD, y1: k * LINE, y2: k * LINE})
+    el('line', {x1: -PAD, x2: width + PAD, y1: k * LINE, y2: k * LINE})
     page.setAttribute('viewBox', `${-PAD} ${-TOP} ${width + 2 * PAD} ${TOP + Math.max(k, 2) * LINE + 0.3}`)
   }
 
-  function clear() {
-    width = Math.max(3.2, Math.min(8, page.parentElement.clientWidth / 118))
-    page.replaceChildren()
-    ;[before, shown, queue, x, row] = [shown, [], [], 0, 0]
-    for (let k = 0; k < 3; k++) rule(k)
-  }
-
-  function path(points) {
-    return 'M' + points.map(([u, v]) => `${u.toFixed(3)} ${v.toFixed(3)}`).join(' L') + (points.length === 1 ? ' l0.001 0' : '')
+  function fits() {
+    return Math.max(3.2, Math.min(8, page.parentElement.clientWidth / 118))
   }
 
   function place(p) {
@@ -85,9 +127,8 @@
     for (let i = 0; i < p.length; i += 3) [lo, hi] = [Math.min(lo, p[i]), Math.max(hi, p[i])]
     if (x > 0 && x + hi - lo > width) [x, row] = [0, row + 1]
     if (row > 2 && !page.querySelector(`[y1="${row * LINE}"]`)) rule(row)
-    for (const [a, b] of spans(p)) {
-      const points = Array.from({length: b - a}, (_, i) => [p[3 * (a + i)] - lo + x, p[3 * (a + i) + 1] + row * LINE])
-      const stroke = el('path', {class: 'ink', d: same ? path(points) : ''})
+    for (const points of strokes(p, x - lo, row * LINE)) {
+      const stroke = el('path', {d: same ? path(points) : ''})
       if (!same) queue.push({stroke, points, n: 0})
     }
     x += hi - lo + SPACE
@@ -107,38 +148,76 @@
     requestAnimationFrame(frame)
   }
 
-  function write() {
-    clear()
-    status.textContent = 'writing…'
-    worker.postMessage({id: ++run, text: text.value, writer: hand.value, temperature: +loose.value, seed: 0})
+  function make() {
+    const asked = text.value.trim()
+    if (!MODES[mode].ready || !asked) return
+    status.textContent = mode === 'write' ? 'writing…' : 'drawing…'
+    if (mode === 'write') {
+      width = fits()
+      page.style.setProperty('--ink', ink(hand.value))
+      page.replaceChildren()
+      ;[before, shown, queue, x, row] = [shown, [], [], 0, 0]
+      for (let k = 0; k < 3; k++) rule(k)
+      return worker.postMessage({...MODES.write.files, id: ++run, text: asked, writer: hand.value, temperature: +$('loose').value, seed: 0})
+    }
+    for (const svg of sheets) svg.innerHTML = ''
+    worker.postMessage({...MODES.draw.files, id: ++run, draw: N, text: asked.toLowerCase(), source: '', temperature: 0.6, seed: seed++,
+                        guidance: +$('guidance').value, ink: +$('ink').value || null})
+  }
+
+  function go(next) {
+    if (mode) MODES[mode].text = text.value
+    mode = next
+    run++
+    for (const e of document.querySelectorAll('[data-mode]')) e.hidden = e.dataset.mode !== mode
+    for (const a of document.querySelectorAll('nav a')) a.toggleAttribute('aria-current', a.hash === '#' + mode)
+    Object.assign(text, {value: MODES[mode].text, placeholder: MODES[mode].ask, ariaLabel: MODES[mode].ask})
+    $('about').textContent = MODES[mode].about
+    if (MODES[mode].ready) return make()
+    status.textContent = 'loading the model…'
+    if (!MODES[mode].asked) worker.postMessage({...MODES[mode].files, id: mode})
+    MODES[mode].asked = true
   }
 
   worker.onmessage = ({data: m}) => {
+    if (m.progress) {
+      const owner = Object.values(MODES).find(o => Object.values(o.files).includes(m.progress))
+      owner.got = {...owner.got, [m.progress]: [m.got, m.total]}
+      const [got, total] = Object.values(MODES[mode].got || {}).reduce(([a, b], [c, d]) => [a + c, b + d], [0, 0])
+      if (!MODES[mode].ready && total) status.textContent = `loading the model: ${(got / 1e6).toFixed(1)} of ${(total / 1e6).toFixed(1)} MB`
+      return
+    }
+    if (m.error) return status.textContent = `could not run the model: ${m.error}`
     if (m.ready) {
+      MODES[m.id].ready = true
       fast = m.fast
-      for (const w of ['sam', ...m.writers.filter(w => w !== 'sam')]) hand.add(new Option(w, w))
-      requestAnimationFrame(frame)
-      return write()
+      if (m.id === 'write') for (const w of ['sam', ...m.writers.filter(w => w !== 'sam')]) hand.add(new Option(w, w))
+      return m.id === mode && make()
     }
     if (m.id !== run) return
-    if (m.points) return place(m.points)
-    const words = shown.filter(p => p.length).length
-    status.textContent = `${words} word${words === 1 ? '' : 's'} in ${(m.ms / 1000).toFixed(2)} s · ${hand.length.toLocaleString()} hands · ${fast ? 'WebAssembly SIMD' : 'plain JavaScript'}, no server`
+    if (m.points) return mode === 'write' ? place(m.points) : sheets[m.k].innerHTML = strokes(m.points).map(s => `<path d="${path(s)}"/>`).join('')
+    const how = `${fast ? 'WebAssembly SIMD' : 'plain JavaScript'}, no server`, words = shown.filter(p => p.length).length
+    status.textContent = mode === 'write' ? `${words} word${words === 1 ? '' : 's'} in ${(m.ms / 1000).toFixed(2)} s · ${hand.length.toLocaleString()} hands · ${how}`
+      : `${N} drawings in ${(m.ms / 1000).toFixed(1)} s · ${how}`
   }
   worker.onerror = e => status.textContent = `could not start the model: ${e.message || 'this browser cannot run it'}`
 
   text.addEventListener('input', () => {
     clearTimeout(timer)
-    timer = setTimeout(write, 250)
+    timer = setTimeout(make, mode === 'write' ? 250 : 700)
   })
-  hand.addEventListener('change', write)
-  loose.addEventListener('change', write)
+  for (const id of ['hand', 'loose', 'guidance', 'ink']) $(id).addEventListener('change', make)
+  $('again').addEventListener('click', make)
   $('another').addEventListener('click', () => {
     hand.selectedIndex = Math.floor(Math.random() * hand.length)
-    write()
+    make()
+  })
+  $('surprise').addEventListener('click', () => {
+    text.value = IDEAS[Math.floor(Math.random() * IDEAS.length)]
+    make()
   })
   $('save').addEventListener('click', () => {
-    const css = '.rule{stroke:#d9e0ea;stroke-width:.006}.ink{fill:none;stroke:#1a237e;stroke-width:.0135;stroke-linecap:round;stroke-linejoin:round}'
+    const css = 'line{stroke:#d9e0ea;stroke-width:.006}path{fill:none;stroke:' + ink(hand.value) + ';stroke-width:.0135;stroke-linecap:round;stroke-linejoin:round}'
     const [, , w, h] = page.getAttribute('viewBox').split(' ').map(Number)
     const out = page.outerHTML.replace('>', ` width="${Math.round(w * 160)}" height="${Math.round(h * 160)}"><style>${css}</style>`)
     const a = Object.assign(document.createElement('a'), {href: URL.createObjectURL(new Blob([out], {type: 'image/svg+xml'})), download: 'hand.svg'})
@@ -147,9 +226,11 @@
   })
   addEventListener('resize', () => {
     clearTimeout(timer)
-    timer = setTimeout(() => Math.abs(Math.max(3.2, Math.min(8, page.parentElement.clientWidth / 118)) - width) > 0.3 && write(), 300)
+    timer = setTimeout(() => mode === 'write' && Math.abs(fits() - width) > 0.3 && make(), 300)
   })
+  addEventListener('hashchange', () => go(location.hash === '#draw' ? 'draw' : 'write'))
 
-  worker.postMessage({load: new URL('./hand.npz', import.meta.url).href})
+  requestAnimationFrame(frame)
+  go(location.hash === '#draw' ? 'draw' : 'write')
 </script>
 </html>
