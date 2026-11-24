@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PenGPT: drawings in your browser</title>
+<style>
+  :root { --paper: #f7f2e8; --edge: #e6dfd0; --ink: #16150f; --text: #2b2a27; --muted: #8a8477; --accent: #1a237e; }
+  * { box-sizing: border-box; }
+  html { background: #ece6d9; }
+  body { margin: 0; padding: clamp(12px, 4vw, 48px); color: var(--text); font: 16px/1.4 "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif; }
+  main { max-width: 1000px; margin: 0 auto; }
+  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }
+  h1 { font-size: 22px; font-weight: 600; letter-spacing: 0.01em; margin: 0; }
+  header span { color: var(--muted); font-style: italic; }
+  header a { color: var(--muted); margin-left: auto; font-size: 14px; }
+  #text { width: 100%; border: 0; border-bottom: 1.5px solid var(--text); background: transparent; color: var(--text); font: inherit; font-size: 20px;
+          padding: 8px 2px; outline: none; border-radius: 0; }
+  #text:focus { border-bottom-color: var(--accent); }
+  #text::placeholder { color: var(--muted); font-style: italic; }
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 22px; margin: 14px 0 18px; font-size: 14px; }
+  label { display: flex; align-items: center; gap: 8px; color: var(--muted); font-variant: small-caps; letter-spacing: 0.06em; }
+  select, button { font: inherit; font-size: 14px; color: var(--text); background: transparent; border: 1px solid #bdb5a4; border-radius: 3px; padding: 4px 10px; }
+  button { cursor: pointer; }
+  button:hover, select:hover { border-color: var(--text); }
+  button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  input[type=range] { width: 110px; accent-color: var(--accent); }
+  .sheets { display: grid; grid-template-columns: repeat(4, 1fr); gap: clamp(8px, 1.6vw, 16px); }
+  @media (max-width: 640px) { .sheets { grid-template-columns: repeat(2, 1fr); } }
+  .sheet { background: var(--paper); border: 1px solid var(--edge); box-shadow: 0 1px 0 #fff inset, 0 10px 30px -18px rgba(60, 45, 20, 0.45); aspect-ratio: 1; }
+  svg { display: block; width: 100%; height: 100%; }
+  svg path { fill: none; stroke: var(--ink); stroke-width: 0.011; stroke-linecap: round; stroke-linejoin: round; }
+  footer { margin-top: 12px; color: var(--muted); font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; }
+</style>
+<main>
+  <header>
+    <h1>PenGPT</h1>
+    <span>a 50 MB transformer drawing what you ask, on your device</span>
+    <a href="./">handwriting</a>
+  </header>
+  <input id="text" list="known" placeholder="what should it draw?" maxlength="120" autocomplete="off" spellcheck="false" aria-label="what to draw">
+  <datalist id="known"></datalist>
+  <div class="controls">
+    <button id="again" type="button">draw again</button>
+    <button id="surprise" type="button">surprise me</button>
+    <label>loose <input id="guidance" type="range" min="1" max="4" step="0.5" value="2" aria-label="how closely the drawing follows the words"> literal</label>
+    <label>sparse <input id="ink" type="range" min="0" max="14" step="1" value="0" aria-label="how much ink to use; leftmost lets the model choose"> dense</label>
+  </div>
+  <div class="sheets" id="sheets"></div>
+  <footer id="status">loading the model…</footer>
+</main>
+<script type="module">
+  import {npz, spans} from './pen.js'
+
+  const $ = id => document.getElementById(id), N = 4
+  const text = $('text'), status = $('status')
+  const worker = new Worker(new URL('./pen.js', import.meta.url), {type: 'module'})
+  const sheets = Array.from({length: N}, () => {
+    const div = $('sheets').appendChild(Object.assign(document.createElement('div'), {className: 'sheet'}))
+    div.innerHTML = '<svg viewBox="-0.62 -0.62 1.24 1.24" role="img"></svg>'
+    return div.firstChild
+  })
+  let run = 0, seed = 0, ready = false, words = false, timer = 0, bank = new Map()
+
+  function show(svg, p) {
+    svg.innerHTML = spans(p).map(([a, b]) => {
+      const xy = Array.from({length: b - a}, (_, i) => `${p[3 * (a + i)].toFixed(3)} ${p[3 * (a + i) + 1].toFixed(3)}`)
+      return `<path d="M${xy.join(' L')}${b - a === 1 ? ' l0.001 0' : ''}"/>`
+    }).join('')
+  }
+
+  function draw() {
+    const asked = text.value.trim().toLowerCase(), vector = bank.get(asked) || (words && asked)
+    if (!ready || !asked) return
+    if (!vector) return status.textContent = 'pick a prompt from the list: typed prompts need words.npz, which is not here or still loading'
+    for (const svg of sheets) svg.innerHTML = ''
+    status.textContent = 'drawing…'
+    worker.postMessage({id: ++run, draw: N, text: vector, source: '', temperature: 0.6, seed: seed++, guidance: +$('guidance').value, ink: +$('ink').value || null})
+  }
+
+  worker.onmessage = ({data: m}) => {
+    if (m.ready) {
+      ready = true
+      status.textContent = 'ready'
+      return draw()
+    }
+    if (m.words) {
+      words = true
+      return bank.has(text.value.trim().toLowerCase()) || draw()
+    }
+    if (m.id !== run) return
+    if (m.points) return show(sheets[m.k], m.points)
+    status.textContent = `${N} drawings in ${(m.ms / 1000).toFixed(1)} s · WebAssembly, no server`
+  }
+  worker.onerror = e => status.textContent = `could not start the model: ${e.message || 'this browser cannot run it'}`
+
+  text.addEventListener('input', () => {
+    clearTimeout(timer)
+    timer = setTimeout(draw, 600)
+  })
+  text.addEventListener('change', draw)
+  for (const id of ['again', 'guidance', 'ink']) $(id).addEventListener(id === 'again' ? 'click' : 'change', draw)
+  $('surprise').addEventListener('click', () => {
+    text.value = [...bank.keys()][Math.floor(Math.random() * bank.size)]
+    draw()
+  })
+
+  const z = await npz(await (await fetch(new URL('./prompts.npz', import.meta.url))).arrayBuffer()), D = z.vectors.shape[1]
+  z.texts.data.forEach((t, i) => bank.set(t, Float32Array.from(z.vectors.data.subarray(i * D, (i + 1) * D), q => q * z['vectors.scale'].data[i])))
+  $('known').innerHTML = [...bank.keys()].map(t => `<option value="${t.replace(/"/g, '&quot;')}">`).join('')
+  text.value = 'a penguin wearing a top hat'
+  worker.postMessage({load: new URL('./sketch.npz', import.meta.url).href, words: new URL('./words.npz', import.meta.url).href})
+</script>
+</html>

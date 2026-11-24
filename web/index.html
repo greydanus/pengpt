@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PenGPT: handwriting in your browser</title>
+<style>
+  :root { --paper: #f7f2e8; --edge: #e6dfd0; --rule: #d9e0ea; --ink: #1a237e; --text: #2b2a27; --muted: #8a8477; }
+  * { box-sizing: border-box; }
+  html { background: #ece6d9; }
+  body { margin: 0; padding: clamp(12px, 4vw, 48px); color: var(--text); font: 16px/1.4 "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif; }
+  main { max-width: 1000px; margin: 0 auto; }
+  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }
+  h1 { font-size: 22px; font-weight: 600; letter-spacing: 0.01em; margin: 0; }
+  header span { color: var(--muted); font-style: italic; }
+  #text { width: 100%; border: 0; border-bottom: 1.5px solid var(--text); background: transparent; color: var(--text); font: inherit; font-size: 20px;
+          padding: 8px 2px; outline: none; border-radius: 0; }
+  #text:focus { border-bottom-color: var(--ink); }
+  #text::placeholder { color: var(--muted); font-style: italic; }
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 22px; margin: 14px 0 18px; font-size: 14px; }
+  label { display: flex; align-items: center; gap: 8px; color: var(--muted); font-variant: small-caps; letter-spacing: 0.06em; }
+  select, button { font: inherit; font-size: 14px; color: var(--text); background: transparent; border: 1px solid #bdb5a4; border-radius: 3px; padding: 4px 10px; }
+  select { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px; padding: 5px 6px; }
+  button { cursor: pointer; }
+  button:hover, select:hover { border-color: var(--text); }
+  button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+  input[type=range] { width: 120px; accent-color: var(--ink); }
+  .sheet { background: var(--paper); border: 1px solid var(--edge); box-shadow: 0 1px 0 #fff inset, 0 10px 30px -18px rgba(60, 45, 20, 0.45); padding: clamp(6px, 2vw, 18px); min-height: 220px; }
+  svg { display: block; width: 100%; height: auto; }
+  svg .rule { stroke: var(--rule); stroke-width: 0.006; }
+  svg .ink { fill: none; stroke: var(--ink); stroke-width: 0.0135; stroke-linecap: round; stroke-linejoin: round; }
+  footer { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 10px; color: var(--muted); font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; }
+  footer a { color: inherit; }
+</style>
+<main>
+  <header>
+    <h1>PenGPT</h1>
+    <span>a 6 MB transformer writing by hand, on your device</span>
+  </header>
+  <input id="text" value="The quick brown fox jumps over the lazy dog" placeholder="type something to write" maxlength="600" autocomplete="off" spellcheck="false" aria-label="text to write">
+  <div class="controls">
+    <label>hand <select id="hand" aria-label="hand"></select></label>
+    <button id="another" type="button">another hand</button>
+    <label>neat <input id="loose" type="range" min="0" max="0.7" step="0.05" value="0" aria-label="how loose the writing is"> loose</label>
+    <button id="save" type="button">save svg</button>
+  </div>
+  <div class="sheet"><svg id="page" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="handwriting"></svg></div>
+  <footer><span id="status">loading the model…</span><span><a href="https://github.com/greydanus/pengpt">github.com/greydanus/pengpt</a></span></footer>
+</main>
+<script type="module">
+  import {spans} from './pen.js'
+
+  const $ = id => document.getElementById(id), NS = 'http://www.w3.org/2000/svg'
+  const page = $('page'), text = $('text'), hand = $('hand'), loose = $('loose'), status = $('status')
+  const worker = new Worker(new URL('./pen.js', import.meta.url), {type: 'module'})
+  const PAD = 0.25, TOP = 0.42, LINE = 0.55, SPACE = 0.16
+  let run = 0, shown = [], before = [], queue = [], x = 0, row = 0, width = 8, fast = false, timer = 0, last = 0
+
+  function el(name, attrs, parent = page) {
+    const e = document.createElementNS(NS, name)
+    for (const k in attrs) e.setAttribute(k, attrs[k])
+    return parent.appendChild(e)
+  }
+
+  function rule(k) {
+    el('line', {class: 'rule', x1: -PAD, x2: width + PAD, y1: k * LINE, y2: k * LINE})
+    page.setAttribute('viewBox', `${-PAD} ${-TOP} ${width + 2 * PAD} ${TOP + Math.max(k, 2) * LINE + 0.3}`)
+  }
+
+  function clear() {
+    width = Math.max(3.2, Math.min(8, page.parentElement.clientWidth / 118))
+    page.replaceChildren()
+    ;[before, shown, queue, x, row] = [shown, [], [], 0, 0]
+    for (let k = 0; k < 3; k++) rule(k)
+  }
+
+  function path(points) {
+    return 'M' + points.map(([u, v]) => `${u.toFixed(3)} ${v.toFixed(3)}`).join(' L') + (points.length === 1 ? ' l0.001 0' : '')
+  }
+
+  function place(p) {
+    const old = before[shown.length], same = old && old.length === p.length && old.every((u, i) => u === p[i])
+    shown.push(p)
+    if (!p.length) return
+    let lo = Infinity, hi = -Infinity
+    for (let i = 0; i < p.length; i += 3) [lo, hi] = [Math.min(lo, p[i]), Math.max(hi, p[i])]
+    if (x > 0 && x + hi - lo > width) [x, row] = [0, row + 1]
+    if (row > 2 && !page.querySelector(`[y1="${row * LINE}"]`)) rule(row)
+    for (const [a, b] of spans(p)) {
+      const points = Array.from({length: b - a}, (_, i) => [p[3 * (a + i)] - lo + x, p[3 * (a + i) + 1] + row * LINE])
+      const stroke = el('path', {class: 'ink', d: same ? path(points) : ''})
+      if (!same) queue.push({stroke, points, n: 0})
+    }
+    x += hi - lo + SPACE
+  }
+
+  function frame(now) {
+    const waiting = queue.reduce((n, s) => n + s.points.length - s.n, 0), ms = Math.min(now - last, 100)
+    let budget = Math.ceil(ms * Math.max(0.35, waiting / 700))
+    last = now
+    while (budget > 0 && queue.length) {
+      const s = queue[0], take = Math.min(budget, s.points.length - s.n)
+      s.n += take
+      budget -= take
+      s.stroke.setAttribute('d', path(s.points.slice(0, s.n)))
+      if (s.n === s.points.length) queue.shift()
+    }
+    requestAnimationFrame(frame)
+  }
+
+  function write() {
+    clear()
+    status.textContent = 'writing…'
+    worker.postMessage({id: ++run, text: text.value, writer: hand.value, temperature: +loose.value, seed: 0})
+  }
+
+  worker.onmessage = ({data: m}) => {
+    if (m.ready) {
+      fast = m.fast
+      for (const w of ['sam', ...m.writers.filter(w => w !== 'sam')]) hand.add(new Option(w, w))
+      requestAnimationFrame(frame)
+      return write()
+    }
+    if (m.id !== run) return
+    if (m.points) return place(m.points)
+    const words = shown.filter(p => p.length).length
+    status.textContent = `${words} word${words === 1 ? '' : 's'} in ${(m.ms / 1000).toFixed(2)} s · ${hand.length.toLocaleString()} hands · ${fast ? 'WebAssembly SIMD' : 'plain JavaScript'}, no server`
+  }
+  worker.onerror = e => status.textContent = `could not start the model: ${e.message || 'this browser cannot run it'}`
+
+  text.addEventListener('input', () => {
+    clearTimeout(timer)
+    timer = setTimeout(write, 250)
+  })
+  hand.addEventListener('change', write)
+  loose.addEventListener('change', write)
+  $('another').addEventListener('click', () => {
+    hand.selectedIndex = Math.floor(Math.random() * hand.length)
+    write()
+  })
+  $('save').addEventListener('click', () => {
+    const css = '.rule{stroke:#d9e0ea;stroke-width:.006}.ink{fill:none;stroke:#1a237e;stroke-width:.0135;stroke-linecap:round;stroke-linejoin:round}'
+    const [, , w, h] = page.getAttribute('viewBox').split(' ').map(Number)
+    const out = page.outerHTML.replace('>', ` width="${Math.round(w * 160)}" height="${Math.round(h * 160)}"><style>${css}</style>`)
+    const a = Object.assign(document.createElement('a'), {href: URL.createObjectURL(new Blob([out], {type: 'image/svg+xml'})), download: 'hand.svg'})
+    a.click()
+    URL.revokeObjectURL(a.href)
+  })
+  addEventListener('resize', () => {
+    clearTimeout(timer)
+    timer = setTimeout(() => Math.abs(Math.max(3.2, Math.min(8, page.parentElement.clientWidth / 118)) - width) > 0.3 && write(), 300)
+  })
+
+  worker.postMessage({load: new URL('./hand.npz', import.meta.url).href})
+</script>
+</html>
