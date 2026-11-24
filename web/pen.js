@@ -265,22 +265,27 @@ export class Pen {
     })
   }
 
-  *raw(text, writer = '', prefix = [], temperature = 0, topK = null, rng = Math.random, guidance = null, ink = null, strokes = null) {
-    const w = this.w, C = this.C, H = this.n_head
-    guidance = guidance ?? (this.label_drop ? 2 : 1)
-    if (guidance !== 1 && !this.label_drop) throw new Error('guidance needs a model trained with --label_drop; this one was not')
+  *raw(text, writer = '', prefix = [], temperature = 0, topK = null, rng = Math.random, guidance = null, ink = null, strokes = null, live = null) {
+    const w = this.w, C = this.C, H = this.n_head, set = live || {guidance, ink, strokes}, pushed = () => set.guidance ?? (this.label_drop ? 2 : 1)
+    if (pushed() !== 1 && !this.label_drop) throw new Error('guidance needs a model trained with --label_drop; this one was not')
     const clip = n => n == null ? null : Math.min(99, Math.max(0, Math.round(n)))
-    const asked = this.hint ? [clip(ink == null ? null : 2 * ink), clip(strokes)] : []
-    const digits = asked.flatMap(n => n == null ? [null, null] : [Math.floor(n / 10), n % 10])
-    const hints = digits.map((d, k) => [this.max_text_length + this.text_end - 4 + k, 258 + 10 * k + d]).filter((_, k) => digits[k] != null)
     const v = this.style(writer)
     const seq = [this.BOS, ...prefix.flatMap(word => [...word, this.WORD, this.WORD])], given = seq.length
     const n = Math.min(this.max_seq_length, this.block_size)
-    const cross = (guidance === 1 ? [text] : [text, '']).map(t => this.context(t, v, hints)), S = cross.length
-    const K = this.layers.map(() => cross.map(() => new Float32Array(n * C))), V = this.layers.map(() => cross.map(() => new Float32Array(n * C)))
+    const texts = (live ? this.label_drop : pushed() !== 1) ? [text, ''] : [text], S = texts.length
+    const K = this.layers.map(() => texts.map(() => new Float32Array(n * C))), V = this.layers.map(() => texts.map(() => new Float32Array(n * C)))
+    let cross, asked
+    const told = () => {
+      const want = this.hint ? [clip(set.ink == null ? null : 2 * set.ink), clip(set.strokes)] : []
+      if (String(want) === asked) return
+      const digits = want.flatMap(n => n == null ? [null, null] : [Math.floor(n / 10), n % 10])
+      const hints = digits.map((d, k) => [this.max_text_length + this.text_end - 4 + k, 258 + 10 * k + d]).filter((_, k) => digits[k] != null)
+      ;[cross, asked] = [texts.map(t => this.context(t, v, hints)), String(want)]
+    }
     const feats = new Float32Array(4 * this.bands)
     let px = 0, py = 0
     for (let t = 0; t < n - 1; t++) {
+      told()
       px += this.deltas[seq[t]][0]
       py += this.deltas[seq[t]][1]
       const e = row(w['tok_emb.weight'], seq[t])
@@ -320,7 +325,7 @@ export class Pen {
         for (let i = 0; i < l.length; i++) total += Math.exp(l[i] - top)
         return l.map(u => u - top - Math.log(total))
       })
-      const mixed = S === 1 ? logp[0] : logp[1].map((u, i) => u + guidance * (logp[0][i] - u))
+      const mixed = S === 1 ? logp[0] : logp[1].map((u, i) => u + pushed() * (logp[0][i] - u))
       let next = 0
       if (temperature > 0) {
         const floor = topK ? Float32Array.from(mixed).sort()[mixed.length - topK] : -Infinity
@@ -369,9 +374,9 @@ export class Pen {
     return out
   }
 
-  async *draw(text, source = '', temperature = 0.6, topK = null, rng = Math.random, guidance = null, ink = null, strokes = null, every = 8) {
+  async *draw(text, source = '', temperature = 0.6, topK = null, rng = Math.random, guidance = null, ink = null, strokes = null, live = null, every = 8) {
     const tokens = []
-    for (const t of this.raw(text, source, [], temperature, topK, rng, guidance, ink, strokes)) {
+    for (const t of this.raw(text, source, [], temperature, topK, rng, guidance, ink, strokes, live)) {
       if (t < this.PAD) tokens.push(t)
       if (tokens.length % every === 0) {
         yield this.decode(tokens)
@@ -511,17 +516,18 @@ export class Words {
 }
 
 if (typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScope) {
-  const held = {}, said = new Map()
+  const held = {}, said = new Map(), live = {}
   let job = 0
   const load = (url, Kind) => held[url] = held[url] || Kind.load(url, (got, total) => postMessage({progress: url, got, total}))
   self.onmessage = async ({data: m}) => {
     try {
+      if (!m.model) return Object.assign(live, m.tune)
       const id = ++job, [pen, words] = await Promise.all([load(m.model, Pen), m.words && load(m.words, Words)])
       if (words) pen.encoder = text => said.get(text) || said.set(text, words.encode(text)).get(text)
       if (m.text === undefined) return postMessage({id: m.id, ready: true, writers: pen.writers.slice(1), fast: !!simd})
       const t0 = performance.now(), rng = mulberry(m.seed || 0)
       for (let k = 0; k < (m.draw || 1); k++) {
-        const made = m.draw ? pen.draw(m.text, m.source, m.temperature, m.topK, rng, m.guidance, m.ink, m.strokes)
+        const made = m.draw ? pen.draw(m.text, m.source, m.temperature, m.topK, rng, null, null, null, Object.assign(live, m.tune))
           : pen.write(m.text, m.writer, m.temperature, m.topK, m.seed)
         for await (const points of made) {
           if (id !== job) return

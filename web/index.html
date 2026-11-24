@@ -93,7 +93,7 @@ a snowman with antlers|a turtle with a castle on its back|a duck wearing a top h
     div.innerHTML = '<svg viewBox="-0.62 -0.62 1.24 1.24" role="img"></svg>'
     return div.firstChild
   })
-  let mode, run = 0, seed = 0, timer = 0, last = 0, fast = false
+  let mode, run = 0, drawing = 0, seed = 0, timer = 0, last = 0, fast = false
   let shown = [], before = [], queue = [], x = 0, row = 0, width = 8
 
   function el(name, attrs, parent = page) {
@@ -168,8 +168,11 @@ a snowman with antlers|a turtle with a castle on its back|a duck wearing a top h
       return worker.postMessage({...MODES.write.files, id: ++run, text: asked, writer: hand.value, temperature: +$('loose').value, seed: 0})
     }
     for (const svg of sheets) svg.innerHTML = ''
-    worker.postMessage({...MODES.draw.files, id: ++run, draw: N, text: asked.toLowerCase(), source: '', temperature: 0.6, seed: seed++,
-                        guidance: +$('guidance').value, ink: +$('ink').value || null})
+    worker.postMessage({...MODES.draw.files, id: drawing = ++run, draw: N, text: asked.toLowerCase(), source: '', temperature: 0.6, seed: seed++, tune: tune()})
+  }
+
+  function tune() {
+    return {guidance: +$('guidance').value, ink: +$('ink').value || null}
   }
 
   function wait(on, said = 'Downloading model weights') {
@@ -213,6 +216,7 @@ a snowman with antlers|a turtle with a castle on its back|a duck wearing a top h
     }
     if (m.id !== run) return
     if (m.points) return mode === 'write' ? place(m.points) : sheets[m.k].innerHTML = strokes(m.points).map(s => `<path d="${path(s)}"/>`).join('')
+    drawing = 0
     const how = `${fast ? 'WebAssembly SIMD' : 'plain JavaScript'}, no server`, words = shown.filter(p => p.length).length
     status.textContent = mode === 'write' ? `${words} word${words === 1 ? '' : 's'} in ${(m.ms / 1000).toFixed(2)} s · ${hand.length.toLocaleString()} hands · ${how}`
       : `${N} drawings in ${(m.ms / 1000).toFixed(1)} s · ${how}`
@@ -223,7 +227,8 @@ a snowman with antlers|a turtle with a castle on its back|a duck wearing a top h
     clearTimeout(timer)
     timer = setTimeout(make, mode === 'write' ? 250 : 700)
   })
-  for (const id of ['hand', 'loose', 'guidance', 'ink']) $(id).addEventListener('change', make)
+  for (const id of ['hand', 'loose']) $(id).addEventListener('change', make)
+  for (const id of ['guidance', 'ink']) $(id).addEventListener('input', () => drawing === run ? worker.postMessage({tune: tune()}) : make())
   $('again').addEventListener('click', make)
   $('another').addEventListener('click', () => {
     hand.selectedIndex = Math.floor(Math.random() * hand.length)
