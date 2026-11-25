@@ -4,7 +4,7 @@ import os
 import shutil
 
 HAND = [("graves", "Graves-style LSTM, our tokens"), ("base", "PenGPT (base)"), (None, None),
-        ("no_bpe", "no BPE merges"), ("st_vocab", "ScribeTokens BPE (60x tokens, 3x params, 4x mem)"), ("no_pen_pos", "no pen position"),
+        ("no_bpe", "no BPE merges ($\\sim$2x compute)"), ("st_vocab", "ScribeTokens BPE (60x tokens, 3x params, 4x mem)"), ("no_pen_pos", "no pen position"),
         ("no_augment", "no augmentation"), ("no_writer", "no writer vectors"), ("one_word", "one word a sequence"), (None, None),
         ("small", "1.9M param. (63\\% smaller)"), ("big", "11.2M param. (114\\% larger)"), ("tenth", "a tenth of the words"), ("no_csafe", "without CSAFE")]
 SKETCH = [("rnn", "LSTM decoder, our tokens"), ("base", "PenGPT (base)"), (None, None), ("no_pen_pos", "no pen position"),
