@@ -31,7 +31,7 @@ def make(out, n=40, seed=0, model="sketch.npz"):
     cells = []
     for k, (source, text) in enumerate(captions(n, rng)):
         p = pen.draw(text, temperature=0.4, rng=np.random.default_rng([seed, k]))
-        cells.append(dict(text=text, source=source, drawing=np.rint(p * [240, 240, 1]).astype(int).tolist()))
+        cells.append(dict(text=text, source=source, drawing=np.round(p * [240, 240, 1], 2).tolist()))
         print(k, source, text, flush=True)
     json.dump(cells, open(out + ".json", "w"))
 

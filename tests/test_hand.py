@@ -73,6 +73,28 @@ def test_encode_decode_roundtrip():
     assert d.min(1).mean() < 3 * st.grid
 
 
+def test_decoded_strokes_are_curves_that_keep_their_points_their_ends_and_their_sharp_tips():
+    from inference import pen as mini
+    from pengpt import _smooth_strokes
+    from strokes import curves
+    st, rng = ScribeTokenizer(grid=0.02), np.random.default_rng(0)
+    for _ in range(30):
+        tokens = np.concatenate([[DOWN, *(np.cumsum(rng.choice([-1, 0, 0, 0, 1], rng.integers(0, 60))) % 8), UP, 0, 0] for _ in range(5)])
+        raw, out = st.decode_word(tokens, smooth=False), st.decode_word(tokens)
+        assert out.shape == raw.shape and (out[:, 2] == raw[:, 2]).all() and np.abs(out[:, :2] - raw[:, :2]).max() < 6 * st.grid
+        for a, b in _stroke_spans(raw[:, 2]):
+            assert np.allclose(out[[a, b - 1], :2], raw[[a, b - 1], :2]) or np.hypot(*(raw[a, :2] - raw[b - 1, :2])) < st.grid
+        assert np.array_equal(out, mini.curves(_smooth_strokes(raw), st.grid))
+    stem = st.decode_word([DOWN, *[6] * 10, *[2] * 10, UP])
+    assert np.ptp(stem[:, 1]) > 9.3 * st.grid and np.abs(stem[:, 0]).max() < 1e-9
+    ring = [d for d in (0, 1, 2, 3, 4, 5, 6, 7) for _ in range(4)]
+    oval = st.decode_word([DOWN, *ring, UP])[:-1, :2]
+    turn = np.diff(np.unwrap(np.arctan2(*np.diff(oval, axis=0).T[::-1])))
+    assert np.abs(turn).max() < 0.5 and np.allclose(oval[0], oval[-1])
+    dot = np.array([[0.1, 0.2, 1], [0.1, 0.2, 0]])
+    assert np.array_equal(curves(dot, 0.02), dot)
+
+
 def test_baseline_height_survives_roundtrip():
     st = ScribeTokenizer(grid=0.01)
     high = make_word(seed=1)

@@ -176,7 +176,9 @@ file's rows three times as likely.
 
 **Tokens.** Pen points are snapped to a grid and motion becomes a walk on it: eight compass directions plus `DOWN` and `UP`. BPE
 merges common runs into single tokens, so one token is a short stroke. Handwriting learns 512 merges on a 0.02 grid; drawings share
-1,024 merges on a grid of 80 cells (`data/sketch_tokens.json`).
+1,024 merges on a grid of 80 cells (`data/sketch_tokens.json`). Read back, a stroke is drawn as the
+curve its walk stands for: the corners of the walk, found within half a grid step, shape a smooth curve that keeps sharp turns and
+the stroke's ends and number of points. The numpy pen, the training code and the browser all do this as they decode.
 
 ![roundtrip](static/roundtrip.png)
 

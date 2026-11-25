@@ -45,7 +45,7 @@ def fresh(name, model, n, seed):
     pen, cells = mini.Pen(mini.fetch(model)), []
     for i, cell in enumerate(ASKED[name]):
         drawings = [pen.draw(cell["text"], temperature=0.4, rng=np.random.default_rng([seed, i, s]), ink=cell.get("ink")) for s in range(n)]
-        cells.append(dict(cell, mirrored=False, pick=0, drawings=[np.rint(p * [UNIT, UNIT, 1]).astype(int).tolist() for p in drawings]))
+        cells.append(dict(cell, mirrored=False, pick=0, drawings=[np.round(p * [UNIT, UNIT, 1], 2).tolist() for p in drawings]))
         print(f"{i + 1}/{len(ASKED[name])} {cell['text']}", flush=True)
     return cells
 

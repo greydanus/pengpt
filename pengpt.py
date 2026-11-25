@@ -15,7 +15,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.nn import functional as F
 
-from strokes import Strokes, grid, held_out, plot, stem, to_points, to_strokes
+from strokes import Strokes, curves, grid, held_out, plot, stem, to_points, to_strokes
 
 
 @dataclass
@@ -296,7 +296,7 @@ class ScribeTokenizer:
             return np.zeros((0, 3))
         out = np.array(points, dtype=float)
         out[:, :2] *= self.grid
-        return _smooth_strokes(out) if smooth else out
+        return curves(_smooth_strokes(out), self.grid) if smooth else out
 
     def expand(self, tokens):
         out = list(np.asarray(tokens).ravel())

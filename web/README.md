@@ -17,7 +17,7 @@ sends the whole file once and the page takes what it needs from it.
 
 | | In `pengpt.npz` | Download |
 |---|---|---|
-| The page | | 42 KB (15 KB gzipped) |
+| The page | | 45 KB (16 KB gzipped) |
 | To write | the handwriting model | 5.8 MB |
 | To draw | the drawing model 49.8 MB, the reader of typed words 25.9 MB | 75.7 MB |
 | Both | | 81.5 MB |
@@ -29,6 +29,7 @@ for what is active. It opens on the first line of the Iliad in the hand `sam`.
 
 - **Write.** Type anything; pick one of the 1,192 hands or press *another hand*; slide from neat to loose. Each hand writes in an ink
   of its own, taken from a hash of its name along six inks. *Save svg* keeps what is on the page.
+  Strokes are smoothed into curves as they are decoded, the same way the numpy pen does it, so the saved file holds curves too.
 - **Draw.** Type what to draw, or press *surprise me*, for four drawings. *Literal* is how hard a drawing is pushed towards its words
   and *dense* how much ink it is asked for. Moving either while a drawing is being made changes the strokes still to come and leaves
   the ones already drawn.
@@ -67,5 +68,5 @@ Draw!, TU-Berlin and SEVA as `--labels`.
 index.html    the page and its code: both models, the reader of typed words, and the worker they run in
 matvec.wat    the WebAssembly kernel, kept in index.html as base64
 words.py      makes the reader of typed words and pengpt.npz
-test_web.py   the page's pen against the numpy pen, under node
+test_web.py   the page's pen against the numpy pen, under node: the same tokens, and the same curves from them
 ```

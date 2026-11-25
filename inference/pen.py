@@ -29,6 +29,81 @@ def strokes(points):
     return zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1))
 
 
+def corners(s, tol):
+    keep, todo = {0, len(s) - 1}, [(0, len(s) - 1)]
+    while todo:
+        i, j = todo.pop()
+        if j - i < 2:
+            continue
+        d, p = s[j] - s[i], s[i + 1:j] - s[i]
+        L2 = d[0] * d[0] + d[1] * d[1]
+        t = np.clip((p[:, 0] * d[0] + p[:, 1] * d[1]) / L2, 0, 1) if L2 else np.zeros(len(p))
+        ex, ey = p[:, 0] - t * d[0], p[:, 1] - t * d[1]
+        far = np.sqrt(ex * ex + ey * ey)
+        k = int(far.argmax())
+        if far[k] > tol:
+            keep.add(i + 1 + k)
+            todo += [(i, i + 1 + k), (i + 1 + k, j)]
+    return sorted(keep)
+
+
+def chaikin(c, closed=False, times=4):
+    for _ in range(times):
+        if len(c) < 3:
+            break
+        a, b = (c, np.roll(c, -1, 0)) if closed else (c[:-1], c[1:])
+        cut = np.stack([0.75 * a + 0.25 * b, 0.25 * a + 0.75 * b], 1).reshape(-1, 2)
+        if not closed:
+            cut[0], cut[-1] = c[0], c[-1]
+        c = cut
+    return np.concatenate([c, c[:1]]) if closed else c
+
+
+def lengths(c):
+    d = np.diff(c, axis=0)
+    return np.concatenate([[0], np.cumsum(np.sqrt(d[:, 0] * d[:, 0] + d[:, 1] * d[:, 1]))])
+
+
+def resample(c, n):
+    L = lengths(c)
+    t = L[-1] * np.arange(n + 1) / n
+    i = np.minimum(np.searchsorted(L[1:], t), len(c) - 2)
+    span = L[i + 1] - L[i]
+    f = np.where(span > 0, np.minimum(1, (t - L[i]) / np.where(span > 0, span, 1)), 0)
+    return c[i] + f[:, None] * (c[i + 1] - c[i])
+
+
+def curve(s, grid):
+    u = s[np.concatenate([[True], (np.diff(s, axis=0) != 0).any(1)])]
+    if not grid or len(u) < 3:
+        return s
+    c = u[corners(u, grid / 2)]
+    m = len(c)
+    a, b = c[1:-1] - c[:-2], c[2:] - c[1:-1]
+    sharp = lambda a, b: a[..., 0] * b[..., 0] + a[..., 1] * b[..., 1] <= -0.5 * np.sqrt((a[..., 0] * a[..., 0] + a[..., 1] * a[..., 1]) * (b[..., 0] * b[..., 0] + b[..., 1] * b[..., 1]))
+    cuts = [0, *(1 + np.flatnonzero(sharp(a, b))), m - 1]
+    gap = c[-1] - c[0]
+    if m > 4 and len(cuts) == 2 and np.sqrt(gap[0] * gap[0] + gap[1] * gap[1]) < grid and not sharp(c[0] - c[-2], c[1] - c[0]):
+        pieces = [chaikin(c[:-1], True)]
+    else:
+        pieces = [chaikin(c[i:j + 1]) for i, j in zip(cuts[:-1], cuts[1:])]
+    ends = np.cumsum([lengths(q)[-1] for q in pieces])
+    if not ends[-1]:
+        return s
+    n = np.maximum(np.diff(np.concatenate([[0], np.floor(ends / ends[-1] * (len(s) - 1) + 0.5)])).astype(int), 1)
+    while n.sum() > len(s) - 1:
+        n[n.argmax()] -= 1
+    return np.concatenate([resample(q, k)[1 if i else 0:] for i, (q, k) in enumerate(zip(pieces, n))])
+
+
+def curves(points, grid):
+    out = np.array(points, float).reshape(-1, 3)
+    edges = np.diff(np.r_[0, out[:, 2] == 1, 0])
+    for a, b in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
+        out[a:b, :2] = curve(out[a:b, :2], grid)
+    return out
+
+
 def export(checkpoint, out, bits=8):
     import torch
     c = torch.load(checkpoint, map_location="cpu", weights_only=True)
@@ -211,7 +286,7 @@ class Pen:
         for a, b in strokes(out):
             if b - a >= 3:
                 out[a + 1:b - 1, :2] = (out[a:b - 2, :2] + out[a + 1:b - 1, :2] + out[a + 2:b, :2]) / 3
-        return out
+        return curves(out, self.grid)
 
     def draw(self, text, source="", temperature=0.6, top_k=None, rng=None, guidance=None, ink=None, strokes=None):
         new, _ = self.raw(text, source, (), temperature, top_k, rng, guidance, ink, strokes)

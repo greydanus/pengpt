@@ -88,7 +88,7 @@ def trace(st, seq, paths, gap=6):
             cur[1].extend([t] * len(paths[tok]))
         elif cur and tok in (st.UP, st.WORD, st.END):
             if len(cur[0]) > 1:
-                strokes.append((P._smooth_strokes(np.c_[cur[0], np.ones(len(cur[0]))])[:, :2], np.array(cur[1])))
+                strokes.append((P.curves(P._smooth_strokes(np.c_[cur[0], np.ones(len(cur[0]))]), 1)[:, :2], np.array(cur[1])))
             cur = None
     return pos, down, strokes
 
