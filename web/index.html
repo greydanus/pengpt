@@ -644,7 +644,7 @@ if (typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScop
       if (!m.model) return Object.assign(live, m.tune)
       const id = ++job, [pen, words] = await Promise.all([load(m.file, m.model, Pen), m.words && load(m.file, m.words, Words)])
       if (words) pen.encoder = text => said.get(text) || said.set(text, words.encode(text)).get(text)
-      if (m.text === undefined) return postMessage({id: m.id, ready: true, writers: pen.writers.slice(1), fast: !!simd})
+      if (m.text === undefined) return postMessage({id: m.id, ready: true, writers: pen.writers.slice(1), fast: !!simd, grid: pen.grid})
       const t0 = performance.now(), rng = mulberry(m.seed || 0)
       for (let k = 0; k < (m.draw || 1); k++) {
         const made = m.draw ? pen.draw(m.text, m.source, m.temperature, m.topK, rng, null, null, null, Object.assign(live, m.tune))
@@ -695,8 +695,68 @@ if (typeof document !== 'undefined') {
       return 'M' + points.map(([u, v]) => `${u.toFixed(3)} ${v.toFixed(3)}`).join(' L') + (points.length === 1 ? ' l0.001 0' : '')
     }
 
-    function strokes(p, dx = 0, dy = 0) {
-      return spans(p).map(([a, b]) => Array.from({length: b - a}, (_, i) => [p[3 * (a + i)] + dx, p[3 * (a + i) + 1] + dy]))
+    function strokes(p, grid, dx = 0, dy = 0) {
+      return spans(p).map(([a, b]) => smooth(Array.from({length: b - a}, (_, i) => [p[3 * (a + i)] + dx, p[3 * (a + i) + 1] + dy]), grid))
+    }
+
+    // The pen moves on a lattice, a step of `grid` in one of 8 directions, so even after decode()'s 3-point average a curve
+    // comes out as straight runs with corners (an o is an octagon some 6 by 10 steps) and a slanted line as a staircase. A
+    // stroke is drawn as the curve it stands for: its corners, found with Douglas-Peucker at half a step (which also swallows
+    // the staircases of all but the flattest lines), are the control polygon of a quadratic B-spline (Chaikin's corner
+    // cutting), which runs through the middle of every straight run and along it. So an octagon becomes an oval, and the
+    // rounding scales with each run, which keeps small loops open. Turns sharper than 120°, such as the tip of a stem drawn up
+    // and down again, stay corners and the ends stay put; a stroke that ends where it began, with no such turn, is smoothed as
+    // a closed curve. The curve gets as many points as the stroke had, so it is written at the same pace as before.
+    function smooth(s, grid) {
+      s = s.filter((q, i) => !i || q[0] !== s[i - 1][0] || q[1] !== s[i - 1][1])
+      if (!grid || s.length < 3) return s
+      const c = corners(s, grid / 2), m = c.length
+      const sharp = (a, b, d) => (b[0] - a[0]) * (d[0] - b[0]) + (b[1] - a[1]) * (d[1] - b[1]) <= -0.5 * Math.hypot(b[0] - a[0], b[1] - a[1]) * Math.hypot(d[0] - b[0], d[1] - b[1])
+      const cuts = [0]
+      for (let k = 1; k < m - 1; k++) if (sharp(c[k - 1], c[k], c[k + 1])) cuts.push(k)
+      const loop = m > 4 && cuts.length === 1 && Math.hypot(c[0][0] - c[m - 1][0], c[0][1] - c[m - 1][1]) < grid && !sharp(c[m - 2], c[0], c[1])
+      const pieces = loop ? [chaikin(c.slice(0, -1), 4, true)] : cuts.concat(m - 1).slice(1).map((k, i) => chaikin(c.slice(cuts[i], k + 1)))
+      const length = q => q.reduce((L, u, i) => i ? L + Math.hypot(u[0] - q[i - 1][0], u[1] - q[i - 1][1]) : 0, 0)
+      const step = pieces.reduce((L, q) => L + length(q), 0) / (s.length - 1)
+      return pieces.flatMap((q, i) => resample(q, step).slice(i ? 1 : 0))
+    }
+
+    function corners(s, tol, i = 0, j = s.length - 1) {
+      const [a, b] = [s[i], s[j]], dx = b[0] - a[0], dy = b[1] - a[1], L2 = dx * dx + dy * dy
+      let far = tol, at = -1
+      for (let k = i + 1; k < j; k++) {
+        const px = s[k][0] - a[0], py = s[k][1] - a[1], t = L2 ? Math.max(0, Math.min(1, (px * dx + py * dy) / L2)) : 0
+        const d = Math.hypot(px - t * dx, py - t * dy)
+        if (d > far) [far, at] = [d, k]
+      }
+      return at < 0 ? [a, b] : [...corners(s, tol, i, at), ...corners(s, tol, at, j).slice(1)]
+    }
+
+    function chaikin(c, times = 4, closed = false) {
+      for (let n = 0; n < times && c.length > 2; n++) {
+        const out = closed ? [] : [c[0]], edges = closed ? c.length : c.length - 1
+        for (let i = 0; i < edges; i++) {
+          const [a, b] = [c[i], c[(i + 1) % c.length]]
+          if (closed || i > 0) out.push([0.75 * a[0] + 0.25 * b[0], 0.75 * a[1] + 0.25 * b[1]])
+          if (closed || i + 1 < edges) out.push([0.25 * a[0] + 0.75 * b[0], 0.25 * a[1] + 0.75 * b[1]])
+        }
+        if (!closed) out.push(c[c.length - 1])
+        c = out
+      }
+      return closed ? [...c, c[0]] : c
+    }
+
+    function resample(c, step) {
+      const len = [0]
+      for (let i = 1; i < c.length; i++) len.push(len[i - 1] + Math.hypot(c[i][0] - c[i - 1][0], c[i][1] - c[i - 1][1]))
+      const n = Math.max(1, Math.round(len[len.length - 1] / step)), out = []
+      for (let k = 0, i = 0; k <= n; k++) {
+        const t = len[len.length - 1] * k / n
+        while (i < c.length - 2 && len[i + 1] < t) i++
+        const f = len[i + 1] > len[i] ? Math.min(1, (t - len[i]) / (len[i + 1] - len[i])) : 0
+        out.push([c[i][0] + f * (c[i + 1][0] - c[i][0]), c[i][1] + f * (c[i + 1][1] - c[i][1])])
+      }
+      return out
     }
 
     function ink(writer) {
@@ -723,7 +783,7 @@ if (typeof document !== 'undefined') {
       for (let i = 0; i < p.length; i += 3) [lo, hi] = [Math.min(lo, p[i]), Math.max(hi, p[i])]
       if (x > 0 && x + hi - lo > width) [x, ln] = [0, ln + 1]
       if (ln > 2 && !page.querySelector(`[y1="${ln * LINE}"]`)) rule(ln)
-      for (const points of strokes(p, x - lo, ln * LINE)) {
+      for (const points of strokes(p, MODES.write.grid, x - lo, ln * LINE)) {
         const stroke = el('path', {d: same ? path(points) : ''})
         if (!same) queue.push({stroke, points, n: 0})
       }
@@ -806,13 +866,14 @@ if (typeof document !== 'undefined') {
       if (m.error) return wait(false, status.textContent = `could not run the model: ${m.error}`)
       if (m.ready) {
         MODES[m.id].ready = true
+        MODES[m.id].grid = m.grid
         if (m.id === mode) wait(false)
         fast = m.fast
         if (m.id === 'write') for (const w of ['sam', ...m.writers.filter(w => w !== 'sam')]) hand.add(new Option(w, w))
         return m.id === mode && make()
       }
       if (m.id !== run) return
-      if (m.points) return mode === 'write' ? place(m.points) : sheets[m.k].innerHTML = strokes(m.points).map(s => `<path d="${path(s)}"/>`).join('')
+      if (m.points) return mode === 'write' ? place(m.points) : sheets[m.k].innerHTML = strokes(m.points, MODES.draw.grid).map(s => `<path d="${path(s)}"/>`).join('')
       drawing = 0
       const how = `${fast ? 'WebAssembly SIMD' : 'plain JavaScript'}, no server`, words = shown.filter(p => p.length).length
       status.textContent = mode === 'write' ? `${words} word${words === 1 ? '' : 's'} in ${(m.ms / 1000).toFixed(2)} s · ${hand.length.toLocaleString()} hands · ${how}`
