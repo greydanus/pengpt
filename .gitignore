@@ -31,3 +31,8 @@ paper/*_before_cut.tex
 paper/figures/*.pkl
 paper/figures/*_candidates.*
 !paper/figures/heads.npz
+
+# lora fine-tuning
+raw/
+lora/ocr
+summary.json
